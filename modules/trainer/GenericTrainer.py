@@ -742,6 +742,8 @@ class GenericTrainer(BaseTrainer):
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                             self.model.optimizer.step()
+                            if hasattr(self.model.deltas, "_delta_cache_by_prefix"):
+                                self.model.deltas._delta_cache_by_prefix.clear()                        
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
@@ -867,3 +869,4 @@ class GenericTrainer(BaseTrainer):
 
         for handle in self.grad_hook_handles:
             handle.remove()
+        torch_gc()

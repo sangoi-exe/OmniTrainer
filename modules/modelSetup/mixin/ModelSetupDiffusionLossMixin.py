@@ -511,10 +511,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
-                self.tensorboard.add_scalar("delta/loss_b4_delta", losses.mean().item(), self.progress.global_step)
+                tensorboard.add_scalar("delta/loss_b4_delta", losses.mean().item(), self.progress.global_step)
                 losses += penalty  # Adiciona o escalar à loss de cada item do batch
-                self.tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
-                self.tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
+                tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
+                tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
 
               except Exception as e:
                     print(f"[DeltaPattern] Erro ao calcular/aplicar penalidade: {e}")

@@ -423,142 +423,48 @@ class DeltaPatternRegularizer:
             # initial_norm = self._calculate_total_norm(self.initial_weights_run1)
             # print(f"[DeltaPattern] Norma L2 total dos pesos iniciais (Run 1): {initial_norm:.4f}")
 
-    def capture_initial_weights_run2(self):
-        """Captura os pesos iniciais da Run 2 (usado para cálculo da penalidade) e armazena em CPU."""
-        self.initial_weights_run2 = {}  # Limpa antes de capturar
-        count = 0
-        try:
-            for key, param, _ in self._iterate_params():
-                self.initial_weights_run2[key] = (
-                    param.detach().clone().cpu()
-                )  # Armazena em CPU
-                count += 1
-        except Exception as e:
-            print(f"[DeltaPattern] Erro durante capture_initial_weights_run2: {e}")
-            traceback.print_exc()
-            raise
-
-        if count == 0:
-            print(
-                "[DeltaPattern] capture_initial_weights_run2 não encontrou parâmetros treináveis."
-            )
-        else:
-            print(
-                f"[DeltaPattern] Capturou pesos iniciais (Run 2) para {count} parâmetros treináveis."
-            )
-            # Opcional: Calcular e logar norma inicial aqui se desejado
-            # initial_norm_run2 = self._calculate_total_norm(self.initial_weights_run2)
-            # print(f"[DeltaPattern] Norma L2 total dos pesos iniciais (Run 2): {initial_norm_run2:.4f}")
-
-    def load_reference_pattern(self, pattern_path: str):
-        """Carrega o padrão de delta de referência de um arquivo JSON."""
-        self.reference_deltas = {}
-        self.reference_delta_norm = None
-
-        if not os.path.isfile(pattern_path):
-            print(f"[DeltaPattern] Arquivo JSON não encontrado: {pattern_path}")
-            return
-
-        try:
-            with open(pattern_path, "r", encoding="utf-8") as f:
-                json_data = json.load(f)
-
-            flat_dict = {}
-            for epoch_key, metrics in json_data.items():
-                for param_name, value in metrics.items():
-                    full_key = f"{epoch_key}/{param_name}"
-                    flat_dict[full_key] = torch.tensor(
-                        value, dtype=torch.float32, device="cpu"
-                    )
-
-            if flat_dict:
-                self.reference_deltas = flat_dict
-                self.reference_delta_norm = self._calculate_total_norm(
-                    self.reference_deltas
-                )
-                epoch_numbers = [
-                    int(k.split("/")[0].replace("epoch_", ""))
-                    for k in flat_dict.keys()
-                    if k.startswith("epoch_")
-                ]
-                self.max_epoch_loaded = max(epoch_numbers) if epoch_numbers else None
-                print(
-                    f"[DeltaPattern] JSON '{pattern_path}' carregado com {len(flat_dict)} deltas."
-                )
-                print(
-                    f"[DeltaPattern] Último epoch registrado no JSON: {self.max_epoch_loaded}"
-                )
-                print(
-                    f"[DeltaPattern] Norma L2 total do delta de referência: {self.reference_delta_norm:.4f}"
-                )
-            else:
-                print("[DeltaPattern] JSON estava vazio ou mal formatado.")
-        except Exception as e:
-            print(f"[DeltaPattern] Falha ao carregar JSON de deltas: {e}")
-            traceback.print_exc()
-            self.reference_deltas = {}
-
     def compute_penalty(self, lambda_weight: float) -> torch.Tensor:
         """
-        Calcula penalidade entre delta atual (por módulo) e delta de referência.
-        Métrica definida em `self.penalty_metric` ("mse" ou "cosine").
+        Calcula a penalidade λ · dist(Δ_run2, Δ_ref) com gradientes navegáveis.
+        Suporta "mse" ou "cosine" (self.penalty_metric).
+
+        • Se não houver referência ou pesos iniciais da Run 2 → penalidade = 0.
+        • Otimizado: sem cópias para CPU, sem loops custosos por passo.
         """
-        import warnings
+        device = next(self.model.parameters()).device
+        dtype  = next(self.model.parameters()).dtype
 
-        # ── descobrir device/dtype ───────────────────────────────────────────
-        try:
-            first_param = next(iter(self.param_collection.parameters()))
-            target_device, target_dtype = first_param.device, first_param.dtype
-        except StopIteration:
-            target_device, target_dtype = torch.device("cpu"), torch.float32
-            warnings.warn("[DeltaPattern] Parâmetros vazios; usando CPU/float32.")
-
-        # ── early‑exit se epoch > padrão carregado ───────────────────────────
-        if hasattr(self, "max_epoch_loaded") and hasattr(self.model, "train_progress"):
-            if self.max_epoch_loaded is not None and self.model.train_progress.epoch > self.max_epoch_loaded:
-                return torch.tensor(0.0, device=target_device, dtype=target_dtype)
-
-        # ── pré‑condições ────────────────────────────────────────────────────
         if not self.reference_deltas or not self.initial_weights_run2:
-            self.current_total_delta_norm = None
-            return torch.tensor(0.0, device=target_device, dtype=target_dtype)
+            return torch.tensor(0.0, device=device, dtype=dtype)
 
-        try:
-            # ── preparar dict referência → módulo ────────────────────────────
-            ref_mod: Dict[str, torch.Tensor] = {}
-            for full_key, val in self.reference_deltas.items():
-                module_key = full_key.split("/", 1)[-1]  # remove "epoch_x/" se houver
-                ref_mod[module_key] = val.to(
-                    device=target_device, dtype=target_dtype, non_blocking=True
-                )
+        # ---------- Construir vetores de delta atuais e de referência ----------
+        cur_vecs, ref_vecs = [], []
 
-            # ── deltas atuais por módulo ─────────────────────────────────────
-            cur_mod = self._get_current_module_deltas(target_device, target_dtype)
+        for prefix, ref_delta_cpu in self.reference_deltas.items():
+            # delta atual concatenado para o mesmo prefixo
+            if prefix not in self._delta_cache_by_prefix:              # cache opcional
+                self._delta_cache_by_prefix = self._get_current_module_deltas(device, dtype)
+            if prefix not in self._delta_cache_by_prefix:
+                continue
 
-            common_keys = [k for k in ref_mod if k in cur_mod]
-            if not common_keys:
-                self.current_total_delta_norm = 0.0
-                return torch.tensor(0.0, device=target_device, dtype=target_dtype)
+            cur_vecs.append(self._delta_cache_by_prefix[prefix])
+            ref_vecs.append(ref_delta_cpu.to(device=device, dtype=dtype, non_blocking=True))
 
-            ref_vec = torch.stack([ref_mod[k].float() for k in common_keys])
-            cur_vec = torch.stack([cur_mod[k].float() for k in common_keys])
+        if not cur_vecs:
+            return torch.tensor(0.0, device=device, dtype=dtype)
 
-            # ─────────── INÍCIO ALTERAÇÃO CHATGPT ───────────
-            if self.penalty_metric == "cosine":
-                cos_sim = torch.nn.functional.cosine_similarity(cur_vec, ref_vec, dim=0, eps=1e-8)
-                penalty = 1.0 - cos_sim  # distância angular
-            else:  # "mse"
-                penalty = torch.nn.functional.mse_loss(cur_vec, ref_vec)
-            # ──────────── FIM ALTERAÇÃO CHATGPT ────────────
+        cur_vec = torch.cat(cur_vecs)
+        ref_vec = torch.cat(ref_vecs)
 
-            self.current_total_delta_norm = torch.norm(cur_vec, p=2).item()
-            return (lambda_weight * penalty).to(dtype=target_dtype)
+        # ------------------- distância escolhida -------------------------------
+        if self.penalty_metric == "cosine":
+            # similaridade → distância angular
+            penalty_val = 1.0 - torch.nn.functional.cosine_similarity(cur_vec, ref_vec, dim=0, eps=1e-8)
+        else:  # "mse"
+            penalty_val = torch.mean((cur_vec - ref_vec) ** 2)
 
-        except Exception as e:
-            print(f"[DeltaPattern] Erro compute_penalty: {e}")
-            traceback.print_exc()
-            self.current_total_delta_norm = None
-            return torch.tensor(0.0, device=target_device, dtype=target_dtype)
+        return lambda_weight * penalty_val
+
 
 
 
@@ -639,28 +545,32 @@ class DeltaPatternRegularizer:
 
     # ────────────── INÍCIO INSERÇÃO CHATGPT ──────────────
     def _get_current_module_deltas(
-        self, target_device: torch.device, target_dtype: torch.dtype
+        self,
+        target_device: torch.device,
+        target_dtype: torch.dtype,
     ) -> Dict[str, torch.Tensor]:
         """
-        Calcula e retorna {prefixo_módulo: norma_L2_delta_atual} no device/dtype alvos.
+        Retorna um dicionário {prefixo_do_módulo: delta_tensor_flatten}
+        com gradiente ativo (sem .detach()).
+        Cada valor é um vetor 1‑D contendo TODAS as diferenças de peso daquele módulo.
         """
-        deltas_sq: Dict[str, torch.Tensor] = {}
+        deltas_by_prefix: Dict[str, list[torch.Tensor]] = {}
 
-        for name, current_param, _ in self._iterate_params():
+        for name, cur_param, _ in self._iterate_params():
             if name not in self.initial_weights_run2:
                 continue
-            prefix = name.split(".")[0]
 
-            initial = self.initial_weights_run2[name].to(
+            prefix = name.split(".")[0]                                # agrupa por bloco
+            init_w = self.initial_weights_run2[name].to(               # já no device correto
                 device=target_device, dtype=target_dtype, non_blocking=True
             )
-            delta = (current_param.detach().to(dtype=target_dtype) - initial).float()
-            deltas_sq.setdefault(
-                prefix,
-                torch.tensor(0.0, device=target_device, dtype=torch.float32),
-            )
-            deltas_sq[prefix] += torch.norm(delta, p=2).pow(2)
+            delta = (cur_param.to(dtype=target_dtype) - init_w).view(-1)  # mantém gradiente
+            deltas_by_prefix.setdefault(prefix, []).append(delta)
 
-        return {k: torch.sqrt(v) for k, v in deltas_sq.items()}
+        # concatena todos os tensores de cada prefixo num único vetor
+        return {
+            pfx: torch.cat(vec_list) for pfx, vec_list in deltas_by_prefix.items()
+        }
+
     # ─────────────── FIM INSERÇÃO CHATGPT ───────────────
 
