@@ -130,9 +130,12 @@ class LoraTab:
         components.switch(master, 3, 4, self.ui_state, "delta_pattern_use_it")
 
         # lora weight dtype
-        # Movido para linha 4
         components.label(master, 4, 0, f"{name} Weight Data Type",
-                         tooltip=f"The {name} weight data type. Can reduce memory, but reduces precision")
+                         tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision")
+        components.options_kv(master, 4, 1, [
+            ("float32", DataType.FLOAT_32),
+            ("bfloat16", DataType.BFLOAT_16),
+        ], self.ui_state, "lora_weight_dtype")
 
         # For use with additional embeddings.
         # Save Delta Pattern (Novo) - Inserido na linha 4, colunas 3 e 4
