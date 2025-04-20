@@ -499,48 +499,52 @@ class DeltaPatternRegularizer:
             self.reference_deltas = {}            
 
     def compute_penalty(self, lambda_weight: float) -> torch.Tensor:
-        """
-        λ · dist(Δ_run2, Δ_ref) – com gradiente ativo.
-        """
-        # -----------------------------------------------------------
-        # 1) obter um tensor qualquer para descobrir device/dtype
-        # -----------------------------------------------------------
+        # 1) device / dtype
         try:
-            first_param = next(
-                p for p in self.param_collection.parameters() if p is not None
-            )
-        except StopIteration:                       # não há parâmetros treináveis
-            return torch.tensor(0.0)
-
+            first_param = next(p for p in self.param_collection.parameters()
+                              if p is not None)
+        except StopIteration:
+            return torch.tensor(0.0)                       # nada treinável
         device, dtype = first_param.device, first_param.dtype
 
+        # 2) early‑exit
         if not self.reference_deltas or not self.initial_weights_run2:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        # ---------- Construir vetores de delta atuais e de referência ----------
+        # 3) constrói/pega o cache uma ÚNICA vez
+        if not self._delta_cache_by_prefix:                # vazio → calcula
+            self._delta_cache_by_prefix = self._get_current_module_deltas(
+                device, dtype
+            )
+
         cur_vecs, ref_vecs = [], []
 
-        for prefix, ref_delta_cpu in self.reference_deltas.items():
-            # delta atual concatenado para o mesmo prefixo
-            if prefix not in self._delta_cache_by_prefix:              # cache opcional
-                self._delta_cache_by_prefix = self._get_current_module_deltas(device, dtype)
-            if prefix not in self._delta_cache_by_prefix:
+        for full_key, ref_delta_cpu in self.reference_deltas.items():
+            # Remove o prefixo 'epoch_XX/' da chave do JSON
+            if "/" not in full_key:
                 continue
+            _, prefix = full_key.split("/", 1)  # separa 'epoch_XX', 'prefixo'
 
-            cur_vecs.append(self._delta_cache_by_prefix[prefix])
-            ref_vecs.append(ref_delta_cpu.to(device=device, dtype=dtype, non_blocking=True))
+            if prefix not in self._delta_cache_by_prefix:
+                continue  # skip se não há nesse passo
 
-        if not cur_vecs:
+            cur_vecs.append(self._delta_cache_by_prefix[prefix].view(1))
+            ref_vecs.append(ref_delta_cpu.to(device=device, dtype=dtype, non_blocking=True).view(1))
+
+
+        if not cur_vecs:                                   # nada em comum
+            print("[DELTAS DEBUG] Nenhum match entre cur_vecs e ref_vecs.")
             return torch.tensor(0.0, device=device, dtype=dtype)
 
         cur_vec = torch.cat(cur_vecs)
         ref_vec = torch.cat(ref_vecs)
 
-        # ------------------- distância escolhida -------------------------------
+        # 4) distância
         if self.penalty_metric == "cosine":
-            # similaridade → distância angular
-            penalty_val = 1.0 - torch.nn.functional.cosine_similarity(cur_vec, ref_vec, dim=0, eps=1e-8)
-        else:  # "mse"
+            penalty_val = 1.0 - torch.nn.functional.cosine_similarity(
+                cur_vec, ref_vec, dim=0, eps=1e-8
+            )
+        else:                                              # mse
             penalty_val = torch.mean((cur_vec - ref_vec) ** 2)
 
         return lambda_weight * penalty_val
@@ -623,27 +627,39 @@ class DeltaPatternRegularizer:
     def _get_current_module_deltas(
         self,
         target_device: torch.device,
-        target_dtype: torch.dtype,
-    ) -> Dict[str, torch.Tensor]:
+        target_dtype : torch.dtype,
+    ) -> dict[str, torch.Tensor]:
         """
-        Retorna um dicionário {prefixo_do_módulo: delta_tensor_flatten}
-        com gradiente ativo (sem .detach()).
-        Cada valor é um vetor 1‑D contendo TODAS as diferenças de peso daquele módulo.
+        Retorna {prefixo: escalar_norma_L2_delta} para TODOS os prefixos presentes
+        no wrapper LoRA do UNet.  Mantém gradiente.
+
+        • prefixo = até o 1º “.” no nome do tensor
+          (ex.:  "lora_unet_up_blocks_0"  ←  "lora_unet_up_blocks_0.resnets_2.conv1.weight")
+
+        • O valor é **norma L2 total** do delta daquele prefixo.
+          (Mesmo formato que o JSON salvo na Run 1.)
         """
-        deltas_by_prefix: Dict[str, list[torch.Tensor]] = {}
+
+        # Acumula soma dos quadrados por prefixo
+        l2_sq_by_prefix: dict[str, torch.Tensor] = {}
 
         for name, cur_param, _ in self._iterate_params():
-            if name not in self.initial_weights_run2:
+            if name not in self.initial_weights_run2:          # peso não existia no snapshot
                 continue
 
-            prefix = name.split(".")[0]                                # agrupa por bloco
-            init_w = self.initial_weights_run2[name].to(               # já no device correto
+            prefix   = name.split('.', 1)[0]                   # mesmo recorte usado no JSON
+            init_w   = self.initial_weights_run2[name].to(
                 device=target_device, dtype=target_dtype, non_blocking=True
             )
-            delta = (cur_param.to(dtype=target_dtype) - init_w).view(-1)  # mantém gradiente
-            deltas_by_prefix.setdefault(prefix, []).append(delta)
 
-        # concatena todos os tensores de cada prefixo num único vetor
-        return {
-            pfx: torch.cat(vec_list) for pfx, vec_list in deltas_by_prefix.items()
-        }
+            delta    = (cur_param.to(dtype=target_dtype) - init_w).float()
+            delta_sq = delta.pow(2).sum()                      # escalar
+
+            # soma incremental da L2‑norm²
+            if prefix in l2_sq_by_prefix:
+                l2_sq_by_prefix[prefix] = l2_sq_by_prefix[prefix] + delta_sq
+            else:
+                l2_sq_by_prefix[prefix] = delta_sq
+
+        # Raiz para obter norma L2 final por prefixo
+        return {pfx: torch.sqrt(val) for pfx, val in l2_sq_by_prefix.items()}

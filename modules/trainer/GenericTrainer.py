@@ -659,6 +659,7 @@ class GenericTrainer(BaseTrainer):
                 total=current_epoch_length,
                 initial=train_progress.epoch_step,
             )
+            delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
             for batch in step_tqdm:
                 if self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
                     self.__enqueue_sample_during_training(
@@ -742,8 +743,8 @@ class GenericTrainer(BaseTrainer):
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                             self.model.optimizer.step()
-                            if hasattr(self.model.deltas, "_delta_cache_by_prefix"):
-                                self.model.deltas._delta_cache_by_prefix.clear()                        
+                            if hasattr(delta_instance, "_delta_cache_by_prefix"):
+                                delta_instance._delta_cache_by_prefix.clear()                        
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
@@ -788,8 +789,7 @@ class GenericTrainer(BaseTrainer):
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
-
-            delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
+           
             if delta_instance is not None:
               # Logar deltas do grupo se a opção estiver ativa
               if self.config.delta_pattern_save_it:

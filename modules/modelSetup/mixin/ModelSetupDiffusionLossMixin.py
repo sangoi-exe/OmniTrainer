@@ -1,6 +1,5 @@
 from abc import ABCMeta
 from collections.abc import Callable
-import os
 import traceback
 
 from modules.module.AestheticScoreModel import AestheticScoreModel
@@ -12,13 +11,10 @@ from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.masked_loss import masked_losses
 from modules.util.loss.vb_loss import vb_losses
-from torch.utils.tensorboard import SummaryWriter
 
+import torch
 from torch import Tensor
-from torch.utils.tensorboard import SummaryWriter  # Adicionado para type hint
-from modules.util.TrainProgress import TrainProgress  # Adicionado para type hint
-from modules.util.config.TrainConfig import TrainConfig  # Adicionado para type hint
-from modules.util.loss.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
+import torch.nn.functional as F
 
 from typing import TYPE_CHECKING
 
@@ -27,17 +23,16 @@ from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 
-import torch
-import torch.nn.functional as F
-
+from torch.utils.tensorboard import SummaryWriter
+from modules.util.loss.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
 
 class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     __coefficients: DiffusionScheduleCoefficients | None
     __alphas_cumprod_fun: Callable[[Tensor, int], Tensor] | None
     __sigmas: Tensor | None
-    config: TrainConfig | None  # Adicionado tipo para clareza
-    progress: TrainProgress | None  # Adicionado tipo para clareza
-    tensorboard: SummaryWriter | None  # Adicionado tipo para clareza
+    config: TrainConfig | None
+    progress: TrainProgress | None
+    tensorboard: SummaryWriter | None
 
     def __init__(self):
         super().__init__()
@@ -337,20 +332,18 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         predicted: Tensor,
         target: Tensor,
         device: torch.device,
-        tensorboard: SummaryWriter,
         gamma: float,                      # mantém o parâmetro CLI como “piso” do reward
     ):
         """
-        Função Sangoi Loss Weighting (versão 2025‑04‑19).
-        • Equilibra dificuldade de acordo com a SNR usando estratégia *Min‑SNR‑γ*.
-        • Aplica currículo linear: γ_start → γ_end ao longo das épocas.
-        • Bonifica boa predição via exp(‑MAPE) independentemente da SNR.
-        • Normaliza reward final para o intervalo [gamma, 1].
+        Função Sangoi Loss Weighting (versão 2025-04-19).
+        • Equilibra dificuldade de acordo com a SNR usando estratégia *Min-SNR-γ*.
+        • Aplica currículo linear: γ_start → γ_end ao longo das épocas.
+        • Bonifica boa predição via exp(-MAPE) independentemente da SNR.
+        • Normaliza reward final para o intervalo [gamma, 1].
 
         Retorna:
             Tensor com multiplicadores de loss (shape = batch).
         """
-        self.tensorboard = tensorboard
         progress = self.progress
         config    = self.config
         eps       = 1e-8
@@ -360,10 +353,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # ------------------------------------------------------------------
         with torch.no_grad():
             snr = self.__snr(timesteps, device)          # shape = (batch, …)
-        snr = snr + eps                                  # evita divisão / log 0
+        snr = snr + eps                                  # evita divisão / log 0
 
         # ------------------------------------------------------------------
-        # 2) Métrica de qualidade da predição  →  MAPE “blendado”
+        # 2) Métrica de qualidade da predição  →  MAPE “blendado”
         # ------------------------------------------------------------------
         abs_percent_error = ((target - predicted).abs() / (target.abs() + eps)).clamp_(0, 1)
         sq_percent_error  = abs_percent_error ** 2
@@ -372,7 +365,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         mape_reward       = 1.0 - mape                                 # quanto maior, melhor
 
         # ------------------------------------------------------------------
-        # 3) Currículo → γ_start (início)  →  γ_end (fim)
+        # 3) Currículo → γ_start (início)  →  γ_end (fim)
         # ------------------------------------------------------------------
         total_epochs  = max(config.epochs, 1)
         alpha         = progress.epoch / float(total_epochs - 1) if total_epochs > 1 else 1.0
@@ -380,7 +373,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         gamma_curr    = gamma_start + (gamma_end - gamma_start) * alpha
 
         # ------------------------------------------------------------------
-        # 4) Peso de dificuldade  →  Min‑SNR‑γ
+        # 4) Peso de dificuldade  →  Min-SNR-γ
         #     w(t) = min(SNR, γ) / SNR      (≈1 nos passos difíceis, <1 nos fáceis)
         # ------------------------------------------------------------------
         scenario_snr_weight = torch.minimum(snr, snr.new_full((), gamma_curr)) / snr  # (batch,)
@@ -391,7 +384,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         raw_reward = torch.exp(-mape_reward) * scenario_snr_weight      # (batch,)
 
         # ------------------------------------------------------------------
-        # 6) Normalização final  →  [gamma, 1]
+        # 6) Normalização final  →  [gamma, 1]
         # ------------------------------------------------------------------
         reward_floor     = gamma                                        # CLI --loss_weight_strength
         clamped_reward   = raw_reward.clamp_(0.0, 1.0)
@@ -400,13 +393,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # ------------------------------------------------------------------
         # 7) TensorBoard (opcional)
         # ------------------------------------------------------------------
-        if tensorboard is not None:
+        if self.tensorboard is not None:
             step = progress.global_step
-            tensorboard.add_scalar("sangoi/alpha",                float(alpha),                   step)
-            tensorboard.add_scalar("sangoi/gamma_curr",           float(gamma_curr),              step)
-            tensorboard.add_scalar("sangoi/mape_reward_mean",     float(mape_reward.mean()),      step)
-            tensorboard.add_scalar("sangoi/scenario_snr_weight",  float(scenario_snr_weight.mean()), step)
-            tensorboard.add_scalar("sangoi/reward_mean",          float(reward.mean()),           step)
+            self.tensorboard.add_scalar("sangoi/alpha",                float(alpha),                   step)
+            self.tensorboard.add_scalar("sangoi/gamma_curr",           float(gamma_curr),              step)
+            self.tensorboard.add_scalar("sangoi/mape_reward_mean",     float(mape_reward.mean()),      step)
+            self.tensorboard.add_scalar("sangoi/scenario_snr_weight",  float(scenario_snr_weight.mean()), step)
+            self.tensorboard.add_scalar("sangoi/reward_mean",          float(reward.mean()),           step)
         
         # multiplicador aplicado à loss (shape = batch)
         return reward
@@ -484,7 +477,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         losses.device,
                     )
                 case LossWeight.SANGOI:
-                    tensorboard.add_scalar(
+                    self.tensorboard.add_scalar(
                         "sangoi/5loss_b4_sangoi",
                         losses.mean().item(),
                         self.progress.global_step,
@@ -494,10 +487,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         data["predicted"],
                         data["target"],
                         losses.device,
-                        tensorboard,
                         config.loss_weight_strength,
                     )
-                    tensorboard.add_scalar(
+                    self.tensorboard.add_scalar(
                         "sangoi/6loss_after_sangoi",
                         losses.mean().item(),
                         self.progress.global_step,
@@ -511,10 +503,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
-                tensorboard.add_scalar("delta/loss_b4_delta", losses.mean().item(), self.progress.global_step)
+                self.tensorboard.add_scalar("delta/loss_b4_delta", losses.mean().item(), self.progress.global_step)
                 losses += penalty  # Adiciona o escalar à loss de cada item do batch
-                tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
-                tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
+                self.tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
+                self.tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
 
               except Exception as e:
                     print(f"[DeltaPattern] Erro ao calcular/aplicar penalidade: {e}")
