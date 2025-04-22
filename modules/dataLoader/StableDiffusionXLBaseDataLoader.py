@@ -72,10 +72,27 @@ class StableDiffusionXLBaseDataLoader(
         add_embeddings_to_prompt_2 = MapData(in_name='prompt', out_name='prompt_2', map_fn=model.add_text_encoder_2_embeddings_to_prompt)
         encode_conditioning_image = EncodeVAE(in_name='conditioning_image', out_name='latent_conditioning_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
         conditioning_image_sample = SampleVAEDistribution(in_name='latent_conditioning_image_distribution', out_name='latent_conditioning_image', mode='mean')
-        tokenize_prompt_1 = Tokenize(in_name='prompt_1', tokens_out_name='tokens_1', mask_out_name='tokens_mask_1', tokenizer=model.tokenizer_1, max_token_length=model.tokenizer_1.model_max_length)
-        tokenize_prompt_2 = Tokenize(in_name='prompt_2', tokens_out_name='tokens_2', mask_out_name='tokens_mask_2', tokenizer=model.tokenizer_2, max_token_length=model.tokenizer_2.model_max_length)
-        encode_prompt_1 = EncodeClipText(in_name='tokens_1', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_1_hidden_state', pooled_out_name=None, add_layer_norm=False, text_encoder=model.text_encoder_1, hidden_state_output_index=-(2 + config.text_encoder_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-        encode_prompt_2 = EncodeClipText(in_name='tokens_2', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_2_hidden_state', pooled_out_name='text_encoder_2_pooled_state', add_layer_norm=False, text_encoder=model.text_encoder_2, hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
+        
+        tokenize_prompt_1 = Tokenize(
+            in_name='prompt_1', tokens_out_name='tokens_1', mask_out_name='tokens_mask_1',
+            tokenizer=model.tokenizer_1,
+            max_token_length=model.tokenizer_1.model_max_length if not config.enable_long_prompts else None # No limit if long prompts
+        )
+        tokenize_prompt_2 = Tokenize(
+            in_name='prompt_2', tokens_out_name='tokens_2', mask_out_name='tokens_mask_2',
+            tokenizer=model.tokenizer_2,
+            max_token_length=model.tokenizer_2.model_max_length if not config.enable_long_prompts else None # No limit if long prompts
+        )
+        
+        # Conditionally add EncodeClipText only if NOT training text encoders AND NOT using long prompts
+        encode_prompt_1 = None
+        if not config.train_text_encoder_or_embedding() and not config.enable_long_prompts:
+             encode_prompt_1 = EncodeClipText(in_name='tokens_1', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_1_hidden_state', pooled_out_name=None, add_layer_norm=False, text_encoder=model.text_encoder_1, hidden_state_output_index=-(2 + config.text_encoder_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
+
+        encode_prompt_2 = None
+        if not config.train_text_encoder_2_or_embedding() and not config.enable_long_prompts:
+            encode_prompt_2 = EncodeClipText(in_name='tokens_2', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_2_hidden_state', pooled_out_name='text_encoder_2_pooled_state', add_layer_norm=False, text_encoder=model.text_encoder_2, hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
+        # END OneTrainer Long Prompt Mod
 
         modules = [
             rescale_image, encode_image, image_sample,
@@ -97,6 +114,14 @@ class StableDiffusionXLBaseDataLoader(
         if not config.train_text_encoder_2_or_embedding():
             modules.append(encode_prompt_2)
 
+        # START OneTrainer Long Prompt Mod
+        # Conditionally add encoding modules
+        if encode_prompt_1:
+            modules.append(encode_prompt_1)
+        if encode_prompt_2:
+            modules.append(encode_prompt_2)
+        # END OneTrainer Long Prompt Mod
+
         return modules
 
     def _cache_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
@@ -109,6 +134,23 @@ class StableDiffusionXLBaseDataLoader(
             image_split_names.append('latent_conditioning_image')
 
         image_aggregate_names = ['crop_resolution', 'image_path']
+        
+        # START OneTrainer Long Prompt Mod
+        text_split_names = ['tokens_1', 'tokens_2'] # Always cache tokens
+        sort_base_names = ['prompt_1', 'prompt_2', 'concept'] # Base names needed for sorting/grouping
+
+        # Conditionally add pre-computed embeddings to cache/sort if NOT using long prompts
+        # and NOT training the respective encoder
+        if not config.enable_long_prompts:
+            if not config.train_text_encoder_or_embedding():
+                text_split_names.append('text_encoder_1_hidden_state')
+                sort_base_names.append('text_encoder_1_hidden_state')
+            if not config.train_text_encoder_2_or_embedding():
+                text_split_names.append('text_encoder_2_hidden_state')
+                text_split_names.append('text_encoder_2_pooled_state')
+                sort_base_names.append('text_encoder_2_hidden_state')
+                sort_base_names.append('text_encoder_2_pooled_state')
+        # END OneTrainer Long Prompt Mod
 
         text_split_names = []
 
@@ -127,6 +169,8 @@ class StableDiffusionXLBaseDataLoader(
             text_split_names.append('text_encoder_2_hidden_state')
             text_split_names.append('text_encoder_2_pooled_state')
 
+        sort_names = image_aggregate_names + image_split_names + sort_base_names
+
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
 
@@ -138,46 +182,60 @@ class StableDiffusionXLBaseDataLoader(
 
         def before_cache_text_fun():
             model.to(self.temp_device)
-
-            if not config.train_text_encoder_or_embedding():
-                model.text_encoder_1_to(self.train_device)
-
-            if not config.train_text_encoder_2_or_embedding():
-                model.text_encoder_2_to(self.train_device)
-
+            # START OneTrainer Long Prompt Mod
+            # Conditionally move text encoders based on training AND long prompt setting
+            if not config.enable_long_prompts:
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.train_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.train_device)
+            # END OneTrainer Long Prompt Mod
             model.eval()
             torch_gc()
 
+        # Use updated text_split_names
         image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
-
+        
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+        # END OneTrainer Long Prompt Mod
 
         modules = []
 
         if config.latent_caching:
             modules.append(image_disk_cache)
-
-        if config.latent_caching:
+            # Remove image names from sorting list after image cache
             sort_names = [x for x in sort_names if x not in image_aggregate_names]
             sort_names = [x for x in sort_names if x not in image_split_names]
 
-            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
-                modules.append(text_disk_cache)
-                sort_names = [x for x in sort_names if x not in text_split_names]
+            # START OneTrainer Long Prompt Mod
+            # Conditionally add text cache and remove text names from sorting list
+            # The condition checks if we *might* have pre-computed embeddings (i.e., long prompts disabled AND not training)
+            should_cache_text = not config.enable_long_prompts and \
+                                (not config.train_text_encoder_or_embedding() or \
+                                 not config.train_text_encoder_2_or_embedding())
+
+            if should_cache_text:
+                 modules.append(text_disk_cache)
+                 sort_names = [x for x in sort_names if x not in text_split_names]
+            # END OneTrainer Long Prompt Mod
 
         if len(sort_names) > 0:
+            # Use the potentially modified sort_names list
             variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled')
             modules.append(variation_sorting)
 
         return modules
 
     def _output_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        # START OneTrainer Long Prompt Mod
+        # Base output names, always include tokens and raw prompts
         output_names = [
             'image_path', 'latent_image',
-            'prompt_1', 'prompt_2',
-            'tokens_1', 'tokens_2',
+            'prompt_1', 'prompt_2', # Raw prompts needed if encode_text uses them
+            'tokens_1', 'tokens_2', # Tokens needed if encode_text uses them (original path)
             'original_resolution', 'crop_resolution', 'crop_offset',
         ]
+        # END OneTrainer Long Prompt Mod
 
         if config.masked_training or config.model_type.has_mask_input():
             output_names.append('latent_mask')
@@ -185,17 +243,20 @@ class StableDiffusionXLBaseDataLoader(
         if config.model_type.has_conditioning_image_input():
             output_names.append('latent_conditioning_image')
 
-        if not config.train_text_encoder_or_embedding():
-            output_names.append('text_encoder_1_hidden_state')
+        # START OneTrainer Long Prompt Mod
+        # Conditionally add pre-computed hidden states if they might exist
+        if not config.enable_long_prompts:
+            if not config.train_text_encoder_or_embedding():
+                output_names.append('text_encoder_1_hidden_state')
+            if not config.train_text_encoder_2_or_embedding():
+                output_names.append('text_encoder_2_hidden_state')
+                output_names.append('text_encoder_2_pooled_state')
+        # END OneTrainer Long Prompt Mod
 
-        if not config.train_text_encoder_2_or_embedding():
-            output_names.append('text_encoder_2_hidden_state')
-            output_names.append('text_encoder_2_pooled_state')
-
+        # Combine with concept info for sorting and final output mapping
         sort_names = output_names + ['concept']
         output_names = output_names + [('concept.loss_weight', 'loss_weight')]
 
-        # add for calculating loss per concept
         if config.validation:
             output_names.append(('concept.name', 'concept_name'))
             output_names.append(('concept.path', 'concept_path'))
@@ -207,6 +268,7 @@ class StableDiffusionXLBaseDataLoader(
             model.eval()
             torch_gc()
 
+        # Call the base mixin method with potentially modified output_names and sort_names
         return self._output_modules_from_out_names(
             output_names=output_names,
             sort_names=sort_names,

@@ -2,7 +2,7 @@ import json
 import os
 import uuid
 from copy import deepcopy
-from typing import Any, List, TypedDict
+from typing import Any, List, Dict, Union
 
 from modules.util.config.BaseConfig import BaseConfig
 from modules.util.config.CloudConfig import CloudConfig
@@ -240,11 +240,6 @@ class TrainEmbeddingConfig(BaseConfig):
         return TrainEmbeddingConfig(data)
 
 
-class LoraLayerRule(TypedDict, total=False):
-    pattern: str    # substring para casar o nome do módulo
-    rank: int       # rank a usar (se omitido, cai no default global)
-    alpha: float    # alpha a usar (se omitido, cai no default global)
-
 class TrainConfig(BaseConfig):
     training_method: TrainingMethod
     model_type: ModelType
@@ -352,7 +347,7 @@ class TrainConfig(BaseConfig):
     text_encoder_3: TrainModelPartConfig
     text_encoder_3_layer_skip: int
 
-		# text encoder long prompts
+    # text encoder long prompts
     enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
     long_prompt_max_chunks: int
 
@@ -394,9 +389,11 @@ class TrainConfig(BaseConfig):
     lora_weight_dtype: DataType
     lora_layers: str  # comma-separated
     lora_layer_preset: str
-    lora_layer_rules: List[LoraLayerRule]
-    lora_layers_blacklist: list[str]
     bundle_additional_embeddings: bool
+    
+    lora_layers_blacklist: list[str]
+    lora_modules_rank_rules: list[dict[str, int]] = []
+    lora_modules_alpha_rules: list[dict[str, int]] = []
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -879,6 +876,10 @@ class TrainConfig(BaseConfig):
         data.append(("text_encoder_3", text_encoder_3, TrainModelPartConfig, False))
         data.append(("text_encoder_3_layer_skip", 0, int, False))
 
+        # text encoder long prompt
+        data.append(("enable_long_prompts", False, bool, False))
+        data.append(("long_prompt_max_chunks", 3, int, False))    
+
         # vae
         vae = TrainModelPartConfig.default_values()
         vae.model_name = ""
@@ -933,7 +934,8 @@ class TrainConfig(BaseConfig):
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("lora_layers", "", str, False))
         data.append(("lora_layer_preset", None, str, True))
-        data.append(("lora_layer_rules", {}, dict[str, dict[str, int | float]], False))
+        data.append(("lora_modules_rank_rules", [], list, False))
+        data.append(("lora_modules_alpha_rules", [], list, False))
         data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 

@@ -705,11 +705,42 @@ class GenericTrainer(BaseTrainer):
 
                 self.callbacks.on_update_status("training")
 
-                with TorchMemoryRecorder(enabled=False):
-                    model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                # with TorchMemoryRecorder(enabled=False):
+                #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
+                #     loss = self.model_setup.calculate_loss(
+                #         self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
+                #     )
+                """
+                implementação de teste - remover os gradientes fora da mask
+                teoricamente isso impede que pesos fora da mask sejam atualizados
+                então a rede pode aloprar o quanto quiser ali, não vai mudar nada
+                """
+                with TorchMemoryRecorder(enabled=False):
+                    # Previsão original
+                    model_output_data = self.model_setup.predict(
+                        self.model,
+                        batch,
+                        self.config,
+                        train_progress,
+                    )
+
+                    # ==== Início da modificação: hook de gradiente para masked training ====
+                    if self.config.masked_training:
+                      # extrai o tensor previsto do dict
+                      predicted = model_output_data['predicted']
+                      # zera gradiente fora da máscara
+                      predicted.register_hook(lambda g: g * batch['latent_mask'])
+                    # ==== Fim da modificação ====
+
+                    # Cálculo de loss permanece inalterado
                     loss = self.model_setup.calculate_loss(
-                        self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
+                        self.model,
+                        batch,
+                        model_output_data,
+                        self.config,
+                        train_progress,
+                        self.tensorboard,
                     )
 
                     loss = loss / float(self.config.gradient_accumulation_steps)
@@ -849,13 +880,19 @@ class GenericTrainer(BaseTrainer):
         elif self.model is not None:
             self.model.to(self.temp_device)
 
+        model_filename = os.path.basename(save_path)
+        model_name, _ = os.path.splitext(model_filename)
+
         delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
         if delta_instance is not None and self.config.delta_pattern_save_it:
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_dir = os.path.join(self.config.workspace_dir, "training_deltas") # Garante que o diretório existe
+                output_dir = os.path.join(self.config.workspace_dir, "training_deltas")  # Garante que o diretório existe
                 os.makedirs(output_dir, exist_ok=True)
-                save_path = os.path.join(output_dir, f"Training_Deltas_{timestamp}.json")
+                # Início do trecho alterado (nome de arquivo de deltas baseado no modelo)
+                delta_filename = f"{model_name}_Deltas_{timestamp}.json"
+                save_path = os.path.join(output_dir, delta_filename)
+                # Fim do trecho alterado
                 print(f"[DeltaPattern] Salvando deltas finais por grupo em: {save_path}")
                 delta_instance.save_group_deltas(save_path)
             except Exception as e:

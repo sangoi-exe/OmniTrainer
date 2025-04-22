@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from random import Random
+from typing import List
 
 from modules.model.BaseModel import BaseModel, BaseModelEmbedding
 from modules.model.util.clip_util import encode_clip
@@ -200,91 +201,216 @@ class StableDiffusionXLModel(BaseModel):
     def encode_text(
             self,
             train_device: torch.device,
-            batch_size: int = 1,
+            batch_size: int = 1, # Batch size is typically 1 here during encoding
             rand: Random | None = None,
             text: str = None,
-            tokens_1: Tensor = None,
-            tokens_2: Tensor = None,
+            tokens_1: Tensor = None, # Will be ignored if enable_long_prompts=True and text is provided
+            tokens_2: Tensor = None, # Will be ignored if enable_long_prompts=True and text is provided
             text_encoder_1_layer_skip: int = 0,
             text_encoder_2_layer_skip: int = 0,
-            text_encoder_1_output: Tensor = None,
-            text_encoder_2_output: Tensor = None,
+            text_encoder_1_output: Tensor = None, # Likely None if enable_long_prompts=True
+            text_encoder_2_output: Tensor = None, # Likely None if enable_long_prompts=True
             text_encoder_1_dropout_probability: float | None = None,
             text_encoder_2_dropout_probability: float | None = None,
-            pooled_text_encoder_2_output: Tensor = None,
+            pooled_text_encoder_2_output: Tensor = None, # Likely None if enable_long_prompts=True
     ) -> tuple[Tensor, Tensor, Tensor]:
-        if tokens_1 is None and text is not None:
-            tokenizer_output = self.tokenizer_1(
-                self.add_text_encoder_1_embeddings_to_prompt(text),
-                padding='max_length',
-                truncation=True,
-                max_length=77,
-                return_tensors="pt",
+        # If long prompts are not enabled, use the original logic
+        if not (self.train_config and self.train_config.enable_long_prompts and text is not None):
+            # --- Original Logic Start ---
+            if tokens_1 is None and text is not None:
+                # Apply embedding placeholders before tokenization
+                processed_text_1 = self.add_text_encoder_1_embeddings_to_prompt(text)
+                tokenizer_output_1 = self.tokenizer_1(
+                    processed_text_1,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=self.tokenizer_1.model_max_length,
+                    return_tensors="pt",
+                )
+                tokens_1 = tokenizer_output_1.input_ids.to(self.text_encoder_1.device)
+
+            if tokens_2 is None and text is not None:
+                 # Apply embedding placeholders before tokenization
+                processed_text_2 = self.add_text_encoder_2_embeddings_to_prompt(text)
+                tokenizer_output_2 = self.tokenizer_2(
+                    processed_text_2,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=self.tokenizer_2.model_max_length,
+                    return_tensors="pt",
+                )
+                tokens_2 = tokenizer_output_2.input_ids.to(self.text_encoder_2.device)
+
+            # Encode using original method
+            text_encoder_1_output, _ = encode_clip(
+                text_encoder=self.text_encoder_1,
+                tokens=tokens_1,
+                default_layer=-2,
+                layer_skip=text_encoder_1_layer_skip,
+                text_encoder_output=text_encoder_1_output,
+                add_pooled_output=False,
+                use_attention_mask=False, # Original didn't use mask here
+                add_layer_norm=False,
             )
-            tokens_1 = tokenizer_output.input_ids.to(self.text_encoder_1.device)
 
-        if tokens_2 is None and text is not None:
-            tokenizer_output = self.tokenizer_2(
-                self.add_text_encoder_2_embeddings_to_prompt(text),
-                padding='max_length',
-                truncation=True,
-                max_length=77,
-                return_tensors="pt",
+            text_encoder_2_output, pooled_text_encoder_2_output = encode_clip(
+                text_encoder=self.text_encoder_2,
+                tokens=tokens_2,
+                default_layer=-2,
+                layer_skip=text_encoder_2_layer_skip,
+                text_encoder_output=text_encoder_2_output,
+                add_pooled_output=True,
+                pooled_text_encoder_output=pooled_text_encoder_2_output,
+                use_attention_mask=False, # Original didn't use mask here
+                add_layer_norm=False,
             )
-            tokens_2 = tokenizer_output.input_ids.to(self.text_encoder_2.device)
+            # --- Original Logic End ---
 
-        text_encoder_1_output, _ = encode_clip(
-            text_encoder=self.text_encoder_1,
-            tokens=tokens_1,
-            default_layer=-2,
-            layer_skip=text_encoder_1_layer_skip,
-            text_encoder_output=text_encoder_1_output,
-            add_pooled_output=False,
-            use_attention_mask=False,
-            add_layer_norm=False,
-        )
+        else:
+            # --- Long Prompt Logic Start ---
+            max_chunks = self.train_config.long_prompt_max_chunks
+            max_len_1 = self.tokenizer_1.model_max_length
+            max_len_2 = self.tokenizer_2.model_max_length
 
-        text_encoder_2_output, pooled_text_encoder_2_output = encode_clip(
-            text_encoder=self.text_encoder_2,
-            tokens=tokens_2,
-            default_layer=-2,
-            layer_skip=text_encoder_2_layer_skip,
-            text_encoder_output=text_encoder_2_output,
-            add_pooled_output=True,
-            pooled_text_encoder_output=pooled_text_encoder_2_output,
-            use_attention_mask=False,
-            add_layer_norm=False,
-        )
+            # Apply embedding placeholders to the full text first
+            processed_text_1 = self.add_text_encoder_1_embeddings_to_prompt(text)
+            processed_text_2 = self.add_text_encoder_2_embeddings_to_prompt(text)
 
-        text_encoder_1_output = self._apply_output_embeddings(
-            self.all_text_encoder_1_embeddings(),
-            self.tokenizer_1,
-            tokens_1,
-            text_encoder_1_output,
-        )
+            # Chunk and tokenize
+            token_chunks_1, mask_chunks_1 = self._chunk_tokenizer(self.tokenizer_1, processed_text_1, max_len_1)
+            token_chunks_2, mask_chunks_2 = self._chunk_tokenizer(self.tokenizer_2, processed_text_2, max_len_2)
 
-        text_encoder_2_output = self._apply_output_embeddings(
-            self.all_text_encoder_2_embeddings(),
-            self.tokenizer_2,
-            tokens_2,
-            text_encoder_2_output,
-        )
+            # Limit chunks
+            token_chunks_1 = token_chunks_1[:max_chunks]
+            mask_chunks_1 = mask_chunks_1[:max_chunks]
+            token_chunks_2 = token_chunks_2[:max_chunks]
+            mask_chunks_2 = mask_chunks_2[:max_chunks]
+            
+            num_chunks = len(token_chunks_1) # Assume both tokenizers produce same number of chunks
 
-        # apply dropout
-        if text_encoder_1_dropout_probability is not None:
+            # Store embeddings per chunk
+            chunk_embeddings_1: List[Tensor] = []
+            chunk_embeddings_2: List[Tensor] = []
+            pooled_text_encoder_2_output = None # Get from the first chunk
+
+            # Move encoders to the correct device for processing
+            # Note: This assumes encode_text is called when encoders are already on train_device
+            # If called during sampling/caching, ensure correct device placement
+            text_encoder_1_device = self.text_encoder_1.device
+            text_encoder_2_device = self.text_encoder_2.device
+
+            for i in range(num_chunks):
+                tokens_1_chunk = token_chunks_1[i].unsqueeze(0).to(text_encoder_1_device) # Add batch dim
+                # mask_1_chunk = mask_chunks_1[i].unsqueeze(0).to(text_encoder_1_device) # Add batch dim if needed by encode_clip
+
+                tokens_2_chunk = token_chunks_2[i].unsqueeze(0).to(text_encoder_2_device) # Add batch dim
+                # mask_2_chunk = mask_chunks_2[i].unsqueeze(0).to(text_encoder_2_device) # Add batch dim if needed by encode_clip
+
+                # Encode chunk 1
+                chunk_output_1, _ = encode_clip(
+                    text_encoder=self.text_encoder_1,
+                    tokens=tokens_1_chunk,
+                    default_layer=-2,
+                    layer_skip=text_encoder_1_layer_skip,
+                    add_pooled_output=False,
+                    use_attention_mask=False, # Set to True if mask is used
+                    # attention_mask=mask_1_chunk,
+                    add_layer_norm=False,
+                )
+
+                 # Encode chunk 2
+                chunk_output_2, pooled_output_2_chunk = encode_clip(
+                    text_encoder=self.text_encoder_2,
+                    tokens=tokens_2_chunk,
+                    default_layer=-2,
+                    layer_skip=text_encoder_2_layer_skip,
+                    add_pooled_output=True,
+                    use_attention_mask=False, # Set to True if mask is used
+                    # attention_mask=mask_2_chunk,
+                    add_layer_norm=False,
+                )
+                
+                # --- Apply output embeddings *per chunk* before concatenation ---
+                # Note: This assumes _apply_output_embeddings works with single-item batches
+                # and uses the chunk's tokens for indexing.
+                chunk_output_1 = self._apply_output_embeddings(
+                    self.all_text_encoder_1_embeddings(),
+                    self.tokenizer_1,
+                    tokens_1_chunk, # Use the chunk tokens
+                    chunk_output_1,
+                )
+                chunk_output_2 = self._apply_output_embeddings(
+                    self.all_text_encoder_2_embeddings(),
+                    self.tokenizer_2,
+                    tokens_2_chunk, # Use the chunk tokens
+                    chunk_output_2,
+                )
+                # --- End Output Embedding Application ---
+
+
+                # Store results (remove BOS/EOS embeddings before storing)
+                # Assumes sequence length is axis 1 after batch dim 0
+                chunk_embeddings_1.append(chunk_output_1[:, 1:-1, :]) # Exclude BOS/EOS
+                chunk_embeddings_2.append(chunk_output_2[:, 1:-1, :]) # Exclude BOS/EOS
+
+                if i == 0:
+                    pooled_text_encoder_2_output = pooled_output_2_chunk # Store pooled from first chunk
+
+            # Concatenate chunk embeddings along the sequence length dimension
+            if chunk_embeddings_1:
+                text_encoder_1_output = torch.cat(chunk_embeddings_1, dim=1)
+            else:
+                 # Handle case with no valid chunks (e.g., empty prompt)
+                 # Create a zero tensor with expected shape or handle error
+                 # Assuming hidden size can be inferred from text_encoder_1
+                 hidden_size_1 = self.text_encoder_1.config.hidden_size
+                 text_encoder_1_output = torch.zeros((batch_size, 0, hidden_size_1), device=text_encoder_1_device, dtype=self.text_encoder_1.dtype)
+
+
+            if chunk_embeddings_2:
+                text_encoder_2_output = torch.cat(chunk_embeddings_2, dim=1)
+            else:
+                # Handle case with no valid chunks
+                hidden_size_2 = self.text_encoder_2.config.hidden_size
+                text_encoder_2_output = torch.zeros((batch_size, 0, hidden_size_2), device=text_encoder_2_device, dtype=self.text_encoder_2.dtype)
+                # Ensure pooled output is also zero/None if no chunks
+                if pooled_text_encoder_2_output is None:
+                     pooled_size_2 = self.text_encoder_2.config.projection_dim
+                     pooled_text_encoder_2_output = torch.zeros((batch_size, pooled_size_2), device=text_encoder_2_device, dtype=self.text_encoder_2.dtype)
+
+            # --- End Long Prompt Logic ---
+
+        # --- Common Logic (Dropout, Final Application of Output Embeddings if not done per chunk) ---
+        # Apply output embeddings *after* concatenation if not done per chunk
+        # Note: Applying per-chunk (as implemented above) is generally easier
+        # text_encoder_1_output = self._apply_output_embeddings(
+        #     self.all_text_encoder_1_embeddings(), self.tokenizer_1, concatenated_tokens_1, text_encoder_1_output
+        # )
+        # text_encoder_2_output = self._apply_output_embeddings(
+        #     self.all_text_encoder_2_embeddings(), self.tokenizer_2, concatenated_tokens_2, text_encoder_2_output
+        # )
+
+        # Apply dropout
+        if text_encoder_1_dropout_probability is not None and text_encoder_1_output.numel() > 0:
             dropout_text_encoder_1_mask = (torch.tensor(
-                [rand.random() > text_encoder_1_dropout_probability for _ in range(batch_size)],
-                device=train_device)).float()
-            text_encoder_1_output = text_encoder_1_output * dropout_text_encoder_1_mask[:, None, None]
+                [rand.random() > text_encoder_1_dropout_probability for _ in range(batch_size)], # Uses batch_size here
+                device=train_device)).float() # Ensure mask is on train_device
+            # Adjust mask shape if needed for broadcasting (usually [batch, 1, 1])
+            text_encoder_1_output = text_encoder_1_output * dropout_text_encoder_1_mask.view(-1, 1, 1).to(text_encoder_1_output.device)
 
-        if text_encoder_2_dropout_probability is not None:
+
+        if text_encoder_2_dropout_probability is not None and text_encoder_2_output.numel() > 0:
             dropout_text_encoder_2_mask = (torch.tensor(
-                [rand.random() > text_encoder_2_dropout_probability for _ in range(batch_size)],
-                device=train_device)).float()
-            pooled_text_encoder_2_output = pooled_text_encoder_2_output * dropout_text_encoder_2_mask[:, None]
-            text_encoder_2_output = text_encoder_2_output * dropout_text_encoder_2_mask[:, None, None]
+                [rand.random() > text_encoder_2_dropout_probability for _ in range(batch_size)], # Uses batch_size here
+                device=train_device)).float() # Ensure mask is on train_device
+            # Adjust mask shape
+            if pooled_text_encoder_2_output is not None and pooled_text_encoder_2_output.numel() > 0:
+                 pooled_text_encoder_2_output = pooled_text_encoder_2_output * dropout_text_encoder_2_mask.view(-1, 1).to(pooled_text_encoder_2_output.device) # Mask shape (batch, 1)
+            text_encoder_2_output = text_encoder_2_output * dropout_text_encoder_2_mask.view(-1, 1, 1).to(text_encoder_2_output.device) # Mask shape (batch, 1, 1)
+
 
         return text_encoder_1_output, text_encoder_2_output, pooled_text_encoder_2_output
+    # END OneTrainer Long Prompt Mod
 
     def combine_text_encoder_output(
             self,
@@ -292,5 +418,73 @@ class StableDiffusionXLModel(BaseModel):
             text_encoder_2_output: Tensor,
             pooled_text_encoder_2_output: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        text_encoder_output = torch.concat([text_encoder_1_output, text_encoder_2_output], dim=-1)
-        return text_encoder_output, pooled_text_encoder_2_output
+        # START OneTrainer Long Prompt Mod
+        # Ensure dimensions match for concatenation, even if one is empty due to chunking failure
+        target_device = pooled_text_encoder_2_output.device # Use pooled output device as target
+        target_dtype = pooled_text_encoder_2_output.dtype # Use pooled output dtype as target
+
+        if text_encoder_1_output.shape[1] != text_encoder_2_output.shape[1]:
+            # This indicates an issue, likely one encoder failed or produced different sequence length
+            # For robustness, try to pad or truncate, but ideally lengths should match after chunking/concatenation
+            # Or, handle based on which one might be empty if processing failed
+            print(f"[WARN] Mismatched sequence lengths in combine_text_encoder_output: TE1={text_encoder_1_output.shape[1]}, TE2={text_encoder_2_output.shape[1]}. This might cause errors.")
+            # Simple fallback: use the shorter sequence length (may lose info)
+            min_seq_len = min(text_encoder_1_output.shape[1], text_encoder_2_output.shape[1])
+            if min_seq_len == 0: # If one is completely empty, return zeros for combined (or raise error)
+                 combined_hidden_size = text_encoder_1_output.shape[-1] + text_encoder_2_output.shape[-1]
+                 text_encoder_output = torch.zeros((text_encoder_1_output.shape[0], 0, combined_hidden_size), device=target_device, dtype=target_dtype)
+            else:
+                 text_encoder_output = torch.cat(
+                     [text_encoder_1_output[:, :min_seq_len, :].to(target_device, target_dtype),
+                      text_encoder_2_output[:, :min_seq_len, :].to(target_device, target_dtype)],
+                     dim=-1
+                 )
+
+        elif text_encoder_1_output.shape[1] == 0 and text_encoder_2_output.shape[1] == 0:
+             # Handle case where both are empty
+             combined_hidden_size = text_encoder_1_output.shape[-1] + text_encoder_2_output.shape[-1]
+             text_encoder_output = torch.zeros((text_encoder_1_output.shape[0], 0, combined_hidden_size), device=target_device, dtype=target_dtype)
+        else:
+             # Original concatenation
+            text_encoder_output = torch.cat(
+                [text_encoder_1_output.to(target_device, target_dtype),
+                 text_encoder_2_output.to(target_device, target_dtype)],
+                dim=-1
+            )
+        # END OneTrainer Long Prompt Mod
+
+        return text_encoder_output, pooled_text_encoder_2_output.to(target_device, target_dtype) # Ensure pooled is also on correct device/dtype
+    
+    def _chunk_tokenizer(self, tokenizer, text, max_length):
+        """Helper to tokenize and chunk text."""
+        # Tokenize full text without truncation first to get all ids
+        # We handle special tokens manually per chunk later.
+        all_input_ids = tokenizer(text, add_special_tokens=False).input_ids
+
+        bos = tokenizer.bos_token_id
+        eos = tokenizer.eos_token_id
+        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos # Use EOS for padding if PAD is None
+
+        # Max length for actual content tokens per chunk
+        content_max_length = max_length - 2 # Account for BOS and EOS
+
+        chunks = []
+        attention_masks = []
+
+        for i in range(0, len(all_input_ids), content_max_length):
+            chunk_ids = all_input_ids[i:i + content_max_length]
+            
+            # Create chunk with special tokens
+            input_ids = [bos] + chunk_ids + [eos]
+            mask = [1] * len(input_ids)
+
+            # Pad chunk if necessary
+            padding_len = max_length - len(input_ids)
+            if padding_len > 0:
+                input_ids = input_ids + ([pad] * padding_len)
+                mask = mask + ([0] * padding_len)
+
+            chunks.append(torch.tensor(input_ids, dtype=torch.long))
+            attention_masks.append(torch.tensor(mask, dtype=torch.long))
+
+        return chunks, attention_masks

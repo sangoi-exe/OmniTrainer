@@ -90,7 +90,32 @@ class BaseConfig:
                             value = None
                         setattr(self, name, value)
                     else:
-                        setattr(self, name, data[name])
+                        value = data[name]
+
+                        # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
+                        if self.types[name] is list or get_origin(self.types[name]) is list:
+                            # detecta se a lista veio como string JSON
+                            if isinstance(value, str):
+                                try:
+                                    import json
+                                    parsed = json.loads(value)
+                                    if isinstance(parsed, list):
+                                        value = parsed
+                                    else:
+                                        raise ValueError("Parsed value is not a list")
+                                except Exception as e:
+                                    print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
+                                    value = []
+
+                            # se a lista deveria conter dicts, garante isso
+                            expected = get_args(self.types[name])
+                            if expected and expected[0] is dict:
+                                if not all(isinstance(v, dict) for v in value):
+                                    print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
+                                    value = []
+
+                        setattr(self, name, value)
+
                 elif self.types[name] is dict or get_origin(self.types[name]) is dict:
                     if len(get_args(self.types[name])) > 0 and issubclass(get_args(self.types[name])[1], BaseConfig):
                         dict_type = get_args(self.types[name])[1]
@@ -99,7 +124,31 @@ class BaseConfig:
                             value[dict_key] = dict_type.default_values().from_dict(dict_value)
                         setattr(self, name, value)
                     else:
-                        setattr(self, name, data[name])
+                          value = data[name]
+
+                          # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
+                          if self.types[name] is list or get_origin(self.types[name]) is list:
+                              # detecta se a lista veio como string JSON
+                              if isinstance(value, str):
+                                  try:
+                                      import json
+                                      parsed = json.loads(value)
+                                      if isinstance(parsed, list):
+                                          value = parsed
+                                      else:
+                                          raise ValueError("Parsed value is not a list")
+                                  except Exception as e:
+                                      print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
+                                      value = []
+
+                              # se a lista deveria conter dicts, garante isso
+                              expected = get_args(self.types[name])
+                              if expected and expected[0] is dict:
+                                  if not all(isinstance(v, dict) for v in value):
+                                      print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
+                                      value = []
+
+                          setattr(self, name, value)
                 elif self.types[name] is str:
                     if self.nullables[name]:
                         setattr(self, name, None if data[name] is None else str(data[name]))
@@ -112,9 +161,57 @@ class BaseConfig:
                         else:
                             setattr(self, name, self.types[name][data[name]])
                     else:
-                        setattr(self, name, data[name])
+                          value = data[name]
+
+                          # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
+                          if self.types[name] is list or get_origin(self.types[name]) is list:
+                              # detecta se a lista veio como string JSON
+                              if isinstance(value, str):
+                                  try:
+                                      import json
+                                      parsed = json.loads(value)
+                                      if isinstance(parsed, list):
+                                          value = parsed
+                                      else:
+                                          raise ValueError("Parsed value is not a list")
+                                  except Exception as e:
+                                      print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
+                                      value = []
+
+                              # se a lista deveria conter dicts, garante isso
+                              expected = get_args(self.types[name])
+                              if expected and expected[0] is dict:
+                                  if not all(isinstance(v, dict) for v in value):
+                                      print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
+                                      value = []
+
+                          setattr(self, name, value)
                 elif self.types[name] is bool:
-                    setattr(self, name, data[name])
+                  value = data[name]
+
+                  # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
+                  if self.types[name] is list or get_origin(self.types[name]) is list:
+                      # detecta se a lista veio como string JSON
+                      if isinstance(value, str):
+                          try:
+                              import json
+                              parsed = json.loads(value)
+                              if isinstance(parsed, list):
+                                  value = parsed
+                              else:
+                                  raise ValueError("Parsed value is not a list")
+                          except Exception as e:
+                              print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
+                              value = []
+
+                      # se a lista deveria conter dicts, garante isso
+                      expected = get_args(self.types[name])
+                      if expected and expected[0] is dict:
+                          if not all(isinstance(v, dict) for v in value):
+                              print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
+                              value = []
+
+                  setattr(self, name, value)
                 elif self.types[name] is int:
                     if self.nullables[name]:
                         setattr(self, name, None if data[name] is None else int(data[name]))
