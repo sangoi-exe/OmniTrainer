@@ -352,6 +352,10 @@ class TrainConfig(BaseConfig):
     text_encoder_3: TrainModelPartConfig
     text_encoder_3_layer_skip: int
 
+		# text encoder long prompts
+    enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
+    long_prompt_max_chunks: int
+
     # vae
     vae: TrainModelPartConfig
 
