@@ -2,7 +2,7 @@ import json
 import os
 import uuid
 from copy import deepcopy
-from typing import Any
+from typing import Any, List, TypedDict
 
 from modules.util.config.BaseConfig import BaseConfig
 from modules.util.config.CloudConfig import CloudConfig
@@ -240,6 +240,11 @@ class TrainEmbeddingConfig(BaseConfig):
         return TrainEmbeddingConfig(data)
 
 
+class LoraLayerRule(TypedDict, total=False):
+    pattern: str    # substring para casar o nome do módulo
+    rank: int       # rank a usar (se omitido, cai no default global)
+    alpha: float    # alpha a usar (se omitido, cai no default global)
+
 class TrainConfig(BaseConfig):
     training_method: TrainingMethod
     model_type: ModelType
@@ -385,7 +390,7 @@ class TrainConfig(BaseConfig):
     lora_weight_dtype: DataType
     lora_layers: str  # comma-separated
     lora_layer_preset: str
-    lora_layer_rules: dict[str, dict[str, int | float]]
+    lora_layer_rules: List[LoraLayerRule]
     lora_layers_blacklist: list[str]
     bundle_additional_embeddings: bool
 
@@ -924,7 +929,7 @@ class TrainConfig(BaseConfig):
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("lora_layers", "", str, False))
         data.append(("lora_layer_preset", None, str, True))
-        data.append(("lora_layer_rules", {}, dict[str, dict[str, int | float]], False)) # None como padrão
+        data.append(("lora_layer_rules", {}, dict[str, dict[str, int | float]], False))
         data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 

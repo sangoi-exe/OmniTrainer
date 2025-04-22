@@ -726,17 +726,24 @@ class LoRAModuleWrapper:
             f"[LoRA INFO] Active exclusion patterns (blacklist): {self.exclusion_filter_patterns if self.exclusion_filter_patterns else 'None'}"
         )
 
-        self.layer_rules = config.lora_layer_rules or {}
-        
-        print(f"[LoRA INFO self.layer_rules: {self.layer_rules}")
+        rules_list = getattr(config, "lora_rules", []) or []
+        self.lora_layer_rules = {
+            rule["pattern"]: {
+                "rank": rule.get("rank", self.default_rank),
+                "alpha": rule.get("alpha", self.default_alpha),
+            }
+            for rule in rules_list
+            if "pattern" in rule
+        }
+        print(f"[LoRA INFO] Converted lora_rules list to mapping: {self.lora_layer_rules}")
 
-        self._sorted_rule_patterns = sorted(self.layer_rules.keys(), key=len, reverse=True)
+        self._sorted_rule_patterns = sorted(self.lora_layer_rules.keys(), key=len, reverse=True)
         print(f"[LoRA INFO self._sorted_rule_patterns: {self._sorted_rule_patterns}")
 
-        if self.layer_rules:
-            print(f"[LoRA INFO] Loaded {len(self.layer_rules)} layer-specific rank/alpha rules:")
+        if self.lora_layer_rules:
+            print(f"[LoRA INFO] Loaded {len(self.lora_layer_rules)} layer-specific rank/alpha rules:")
             for pattern in self._sorted_rule_patterns:
-                print(f"  - Rule: '{pattern}' -> {self.layer_rules[pattern]}")
+                print(f"  - Rule: '{pattern}' -> {self.lora_layer_rules[pattern]}")
         else:
             print("[LoRA INFO] No layer-specific rank/alpha rules defined. Using global defaults.")
 
@@ -829,7 +836,6 @@ class LoRAModuleWrapper:
             if should_include:
                 peft_module_prefix_for_constructor = potential_peft_prefix_argument
 
-                # --- NOVO: Determina Rank/Alpha usando Regras ---
                 rank_to_use = self.default_rank
                 alpha_to_use = self.default_alpha
                 rule_applied = "Global Default"
@@ -840,8 +846,8 @@ class LoRAModuleWrapper:
                 for pattern in self._sorted_rule_patterns:  # Itera sobre regras ordenadas
                     for target_name in target_names_for_rules:
                         # Usa fnmatch padrão (ou `f"*{pattern}*"` se preferir 'contains')
-                        if fnmatch.fnmatch(target_name, pattern):
-                            rule_config = self.layer_rules[pattern]
+                        if fnmatch.fnmatch(target_name, f"*{pattern}*"):
+                            rule_config = self.lora_layer_rules[pattern]
                             # Pega rank/alpha da regra, fallback para default global
                             rank_to_use = rule_config.get("rank", self.default_rank)
                             alpha_to_use = rule_config.get("alpha", self.default_alpha)
@@ -850,7 +856,6 @@ class LoRAModuleWrapper:
                             break  # Para de checar alvos para este padrão
                     if matched_rule:
                         break  # Para de checar padrões (primeiro match vence)
-                # --- FIM NOVO ---
 
                 # Prepara args/kwargs para o construtor do PEFT
                 args_for_this_module = [
@@ -974,7 +979,7 @@ class LoRAModuleWrapper:
             for pattern in self._sorted_rule_patterns:
                 for target_name in target_names_for_rules:
                     if fnmatch.fnmatch(target_name, pattern):
-                        rule_config = self.layer_rules[pattern]
+                        rule_config = self.lora_layer_rules[pattern]
                         rank_to_use = rule_config.get("rank", self.default_rank)
                         alpha_to_use = rule_config.get("alpha", self.default_alpha)
                         rule_applied = f"Rule ('{pattern}')"
