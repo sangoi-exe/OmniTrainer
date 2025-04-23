@@ -19,7 +19,7 @@ from modules.util.dtype_util import create_autocast_context, disable_fp16_autoca
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.TrainProgress import TrainProgress
-from torch.utils.tensorboard import SummaryWriter
+from modules.util.TensorBoardManager import TensorBoardManager
 
 import torch
 from torch import Tensor
@@ -382,7 +382,7 @@ class BaseStableDiffusionXLSetup(
 			data: dict,
 			config: TrainConfig,
 			progress: TrainProgress,
-			tensorboard: SummaryWriter
+			tensorboard: TensorBoardManager
 	) -> Tensor:
 		return self._diffusion_losses(
 			batch=batch,

@@ -16,14 +16,14 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from typing import TYPE_CHECKING
-
 from modules.util.NamedParameterGroup import NamedParameterGroupCollection
-
+from typing import TYPE_CHECKING, Optional, Callable, Tuple, Union
 if TYPE_CHECKING:
+    from modules.util.TensorBoardManager import TensorBoardManager
+    from modules.model.BaseModel import BaseModel # Para type hint do model
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 
-from torch.utils.tensorboard import SummaryWriter
+from modules.util.TensorBoardManager import TensorBoardManager
 from modules.util.loss.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
 
 class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
@@ -32,7 +32,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     __sigmas: Tensor | None
     config: TrainConfig | None
     progress: TrainProgress | None
-    tensorboard: SummaryWriter | None
+    tensorboard: TensorBoardManager | None
 
     def __init__(self):
         super().__init__()
@@ -411,7 +411,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         data: dict,
         config: TrainConfig,
         progress: TrainProgress,
-        tensorboard: SummaryWriter,
+        tensorboard: TensorBoardManager,
         train_device: torch.device,
         model: torch.nn.Module,
         betas: Tensor | None = None,

@@ -1,13 +1,19 @@
 import os
+import traceback
+from typing import Optional
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import (
+    NamedParameterGroup,
+    NamedParameterGroupCollection,
+)
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.torch_util import state_dict_has_prefix
 from modules.util.TrainProgress import TrainProgress
 from modules.module.LoRAModule import PeftBase
+from modules.util.TensorBoardManager import TensorBoardManager
 
 import torch
 
@@ -22,10 +28,10 @@ class StableDiffusionXLLoRASetup(
     BaseStableDiffusionXLSetup,
 ):
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            debug_mode: bool,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        debug_mode: bool,
     ):
         super().__init__(
             train_device=train_device,
@@ -34,70 +40,86 @@ class StableDiffusionXLLoRASetup(
         )
 
     def create_parameters(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
         # Grupo para Text Encoder 1 LoRA/DoRA/LoHa
         if config.text_encoder.train and model.text_encoder_1_lora:
-            for original_name, peft_module in model.text_encoder_1_lora.lora_modules.items():
+            for (
+                original_name,
+                peft_module,
+            ) in model.text_encoder_1_lora.lora_modules.items():
                 # Certifique-se de que o módulo PEFT foi inicializado e tem parâmetros
                 if peft_module._initialized and list(peft_module.parameters()):
-                     # Usar o prefixo do módulo PEFT garante unicidade e reflete a chave do state_dict
-                    unique_name = peft_module.prefix.removesuffix('.')
-                    parameter_group_collection.add_group(NamedParameterGroup(
-                        unique_name=unique_name,
-                        # Opcional: Usar nome original para display
-                        display_name=f"te1/{original_name}",
-                        parameters=peft_module.parameters(),
-                        learning_rate=config.text_encoder.learning_rate,
-                    ))
+                    # Usar o prefixo do módulo PEFT garante unicidade e reflete a chave do state_dict
+                    unique_name = peft_module.prefix.removesuffix(".")
+                    parameter_group_collection.add_group(
+                        NamedParameterGroup(
+                            unique_name=unique_name,
+                            # Opcional: Usar nome original para display
+                            display_name=f"te1/{original_name}",
+                            parameters=peft_module.parameters(),
+                            learning_rate=config.text_encoder.learning_rate,
+                        )
+                    )
 
         # Grupo para Text Encoder 2 LoRA/DoRA/LoHa
         if config.text_encoder_2.train and model.text_encoder_2_lora:
-            for original_name, peft_module in model.text_encoder_2_lora.lora_modules.items():
+            for (
+                original_name,
+                peft_module,
+            ) in model.text_encoder_2_lora.lora_modules.items():
                 if peft_module._initialized and list(peft_module.parameters()):
-                    unique_name = peft_module.prefix.removesuffix('.')
-                    parameter_group_collection.add_group(NamedParameterGroup(
-                        unique_name=unique_name,
-                        display_name=f"te2/{original_name}",
-                        parameters=peft_module.parameters(),
-                        learning_rate=config.text_encoder_2.learning_rate,
-                    ))
+                    unique_name = peft_module.prefix.removesuffix(".")
+                    parameter_group_collection.add_group(
+                        NamedParameterGroup(
+                            unique_name=unique_name,
+                            display_name=f"te2/{original_name}",
+                            parameters=peft_module.parameters(),
+                            learning_rate=config.text_encoder_2.learning_rate,
+                        )
+                    )
 
         # Grupo para UNet LoRA/DoRA/LoHa
         if config.unet.train and model.unet_lora:
             for original_name, peft_module in model.unet_lora.lora_modules.items():
                 if peft_module._initialized and list(peft_module.parameters()):
-                    unique_name = peft_module.prefix.removesuffix('.')
-                    parameter_group_collection.add_group(NamedParameterGroup(
-                        unique_name=unique_name,
-                        display_name=f"unet/{original_name}",
-                        parameters=peft_module.parameters(),
-                        learning_rate=config.unet.learning_rate,
-                    ))
+                    unique_name = peft_module.prefix.removesuffix(".")
+                    parameter_group_collection.add_group(
+                        NamedParameterGroup(
+                            unique_name=unique_name,
+                            display_name=f"unet/{original_name}",
+                            parameters=peft_module.parameters(),
+                            learning_rate=config.unet.learning_rate,
+                        )
+                    )
 
         if config.train_any_embedding() or config.train_any_output_embedding():
             if config.text_encoder.train_embedding:
                 self._add_embedding_param_groups(
-                    model.all_text_encoder_1_embeddings(), parameter_group_collection, config.embedding_learning_rate,
-                    "embeddings_1"
+                    model.all_text_encoder_1_embeddings(),
+                    parameter_group_collection,
+                    config.embedding_learning_rate,
+                    "embeddings_1",
                 )
 
             if config.text_encoder_2.train_embedding:
                 self._add_embedding_param_groups(
-                    model.all_text_encoder_2_embeddings(), parameter_group_collection, config.embedding_learning_rate,
-                    "embeddings_2"
+                    model.all_text_encoder_2_embeddings(),
+                    parameter_group_collection,
+                    config.embedding_learning_rate,
+                    "embeddings_2",
                 )
 
         return parameter_group_collection
 
     def __setup_requires_grad(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ):
         self._setup_embeddings_requires_grad(model, config)
         model.text_encoder_1.requires_grad_(False)
@@ -106,39 +128,38 @@ class StableDiffusionXLLoRASetup(
         model.vae.requires_grad_(False)
 
         if model.text_encoder_1_lora is not None:
-            train_text_encoder_1 = config.text_encoder.train and \
-                                   not self.stop_text_encoder_training_elapsed(config, model.train_progress)
+            train_text_encoder_1 = config.text_encoder.train and not self.stop_text_encoder_training_elapsed(
+                config, model.train_progress
+            )
             model.text_encoder_1_lora.requires_grad_(train_text_encoder_1)
 
         if model.text_encoder_2_lora is not None:
-            train_text_encoder_2 = config.text_encoder_2.train and \
-                                   not self.stop_text_encoder_2_training_elapsed(config, model.train_progress)
+            train_text_encoder_2 = config.text_encoder_2.train and not self.stop_text_encoder_2_training_elapsed(
+                config, model.train_progress
+            )
             model.text_encoder_2_lora.requires_grad_(train_text_encoder_2)
 
         if model.unet_lora is not None:
-            train_unet = config.unet.train and \
-                         not self.stop_unet_training_elapsed(config, model.train_progress)
+            train_unet = config.unet.train and not self.stop_unet_training_elapsed(config, model.train_progress)
             model.unet_lora.requires_grad_(train_unet)
 
     def setup_model(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self, model: StableDiffusionXLModel, config: TrainConfig, tensorboard: Optional[TensorBoardManager] = None
     ):
+
+        model.tensorboard = tensorboard
+        print(
+            f"[TensorBoardManager] Instância TensorBoard {'atribuída' if model.tensorboard else 'NÃO atribuída'} ao modelo."
+        )
+
         create_te1 = config.text_encoder.train or state_dict_has_prefix(model.lora_state_dict, "lora_te1")
         create_te2 = config.text_encoder_2.train or state_dict_has_prefix(model.lora_state_dict, "lora_te2")
- 
-        model.text_encoder_1_lora = LoRAModuleWrapper(
-            model.text_encoder_1, "lora_te1", config
-        ) if create_te1 else None
 
-        model.text_encoder_2_lora = LoRAModuleWrapper(
-            model.text_encoder_2, "lora_te2", config
-        ) if create_te2 else None
+        model.text_encoder_1_lora = LoRAModuleWrapper(model.text_encoder_1, "lora_te1", config) if create_te1 else None
 
-        model.unet_lora = LoRAModuleWrapper(
-            model.unet, "lora_unet", config, config.lora_layers.split(",")
-        )
+        model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
+
+        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layers.split(","))
 
         if model.lora_state_dict:
             if create_te1:
@@ -175,46 +196,94 @@ class StableDiffusionXLLoRASetup(
         self._setup_embedding_wrapper(model, config)
         self.__setup_requires_grad(model, config)
 
-        parameter_collection = self.create_parameters(model, config) # Recria ou pega a coleção
+        parameter_collection = self.create_parameters(model, config)  # Recria ou pega a coleção
         init_model_parameters(model, parameter_collection, self.train_device)
 
         model.parameters = parameter_collection
-        
+
+        # testar esse mamute do gemini, cheio de verificações e etc
         from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
-        model.deltas = DeltaPatternRegularizer(model, model.parameters)
 
-        # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
-        if config.delta_pattern_save_it:
-            print("[DeltaPattern] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
-            model.deltas.capture_weights()
+        if config.delta_pattern_use_it or config.delta_pattern_save_it:
+            if not hasattr(model, "deltas"):  # Evita re-inicialização
+                try:
+                    param_collection = getattr(model, "parameters", None)
+                    if param_collection is None:
+                        raise ValueError("Coleção de parâmetros (model.parameters) não encontrada para DeltaPattern.")
 
-        if config.delta_pattern_use_it:
-          if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
-              print(f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}")
-              model.deltas.load_reference_pattern(config.delta_pattern_path)
-              if model.deltas.reference_deltas: # Verifica se carregou com sucesso
-                  print("[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
-                  model.deltas.capture_initial_weights_run2()
-              else:
-                  print(f"[DeltaPattern] Aviso: Falha ao carregar o padrão de delta de '{config.delta_pattern_path}'. A penalidade será desativada.")
-                  config.delta_pattern_use_it = False # Desativa se não conseguiu carregar
-          else:
-              print(f"[DeltaPattern] Aviso: 'delta_pattern_use_it' é True, mas o caminho '{config.delta_pattern_path}' não foi encontrado ou não especificado. A penalidade será desativada.")
-              config.delta_pattern_use_it = False # Desativa se o caminho não existe
-        
+                    print("[DeltaPattern] Inicializando DeltaPatternRegularizer...")
+                    # Atribui a instância ao modelo
+                    model.deltas = DeltaPatternRegularizer(model, param_collection)
+
+                    if config.delta_pattern_save_it:
+                        print("[DeltaPattern] Capturando pesos iniciais para salvar (Run 1)...")
+                        model.deltas.capture_weights()
+
+                    if config.delta_pattern_use_it:
+                        if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
+                            print(f"[DeltaPattern] Carregando padrão de referência de: {config.delta_pattern_path}")
+                            # Passa device/dtype corretos
+                            train_dtype_torch = getattr(model, "train_dtype", None)  # Tenta pegar do modelo
+                            if train_dtype_torch is None:
+                                train_dtype_torch = config.train_dtype  # Fallback para config
+                            model.deltas.load_reference_pattern(
+                                config.delta_pattern_path, self.train_device, train_dtype_torch.torch_dtype()
+                            )
+                            if model.deltas.reference_deltas:  # Checa se carregou
+                                print("[DeltaPattern] Capturando pesos iniciais para cálculo de penalidade (Run 2)...")
+                                model.deltas.capture_initial_weights_run2()
+                            else:
+                                print(
+                                    f"[DeltaPattern] Aviso: Falha ao carregar padrão de delta de '{config.delta_pattern_path}'. Penalidade desativada."
+                                )
+                                config.delta_pattern_use_it = False  # Desativa
+                        else:
+                            print(
+                                f"[DeltaPattern] Aviso: 'delta_pattern_use_it' True, mas caminho '{config.delta_pattern_path}' inválido. Penalidade desativada."
+                            )
+                            config.delta_pattern_use_it = False  # Desativa
+
+                    print("[DeltaPattern] DeltaPatternRegularizer inicializado.")
+
+                except Exception as e:
+                    print(f"[DeltaPattern] Falha ao inicializar DeltaPatternRegularizer: {e}")
+                    traceback.print_exc()
+                    model.deltas = None  # Garante None se falhar
+        else:
+            model.deltas = None  # Garante None se não for usado
+
+        # model.deltas = DeltaPatternRegularizer(model, model.parameters)
+        # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
+        # if config.delta_pattern_save_it:
+        #     print("[DeltaPattern] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
+        #     model.deltas.capture_weights()
+
+        # if config.delta_pattern_use_it:
+        #     if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
+        #         print(f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}")
+        #         model.deltas.load_reference_pattern(config.delta_pattern_path)
+        #         if model.deltas.reference_deltas:  # Verifica se carregou com sucesso
+        #             print("[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
+        #             model.deltas.capture_initial_weights_run2()
+        #         else:
+        #             print(
+        #                 f"[DeltaPattern] Aviso: Falha ao carregar o padrão de delta de '{config.delta_pattern_path}'. A penalidade será desativada."
+        #             )
+        #             config.delta_pattern_use_it = False  # Desativa se não conseguiu carregar
+        #     else:
+        #         print(
+        #             f"[DeltaPattern] Aviso: 'delta_pattern_use_it' é True, mas o caminho '{config.delta_pattern_path}' não foi encontrado ou não especificado. A penalidade será desativada."
+        #         )
+        #         config.delta_pattern_use_it = False  # Desativa se o caminho não existe
 
     def setup_train_device(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ):
         vae_on_train_device = not config.latent_caching
-        text_encoder_1_on_train_device = \
-            config.train_text_encoder_or_embedding()\
-            or not config.latent_caching
-        text_encoder_2_on_train_device = \
-            config.train_text_encoder_2_or_embedding() \
-            or not config.latent_caching
+        text_encoder_1_on_train_device = config.train_text_encoder_or_embedding() or not config.latent_caching
+        text_encoder_2_on_train_device = config.train_text_encoder_2_or_embedding() or not config.latent_caching
 
         model.text_encoder_1_to(self.train_device if text_encoder_1_on_train_device else self.temp_device)
         model.text_encoder_2_to(self.train_device if text_encoder_2_on_train_device else self.temp_device)
@@ -239,10 +308,10 @@ class StableDiffusionXLLoRASetup(
             model.unet.eval()
 
     def after_optimizer_step(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
-            train_progress: TrainProgress
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+        train_progress: TrainProgress,
     ):
         if config.preserve_embedding_norm:
             self._normalize_output_embeddings(model.all_text_encoder_1_embeddings())

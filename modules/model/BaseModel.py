@@ -1,7 +1,9 @@
 from abc import ABCMeta, abstractmethod
+from typing import Optional
 from uuid import uuid4
 
 from modules.module.EMAModule import EMAModuleWrapper
+from modules.util.TensorBoardManager import TensorBoardManager
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.modelSpec.ModelSpec import ModelSpec
@@ -71,6 +73,8 @@ class BaseModel(metaclass=ABCMeta):
     model_spec: ModelSpec | None
     train_config: TrainConfig | None
     embedding_state_dicts: dict[str, dict[str, Tensor]] | None
+    
+    tensorboard: Optional[TensorBoardManager] = None
 
     def __init__(
             self,
@@ -86,6 +90,8 @@ class BaseModel(metaclass=ABCMeta):
         self.model_spec = None
         self.train_config = None
         self.embedding_state_dicts = {}
+
+        self.tensorboard = None
 
     @abstractmethod
     def to(self, device: torch.device):

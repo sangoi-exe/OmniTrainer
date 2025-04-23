@@ -35,7 +35,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.utils.hooks import RemovableHandle
-from torch.utils.tensorboard import SummaryWriter
+from modules.util.TensorBoardManager import TensorBoardManager
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
@@ -57,7 +57,7 @@ class GenericTrainer(BaseTrainer):
 
     parameters: list[Parameter]
 
-    tensorboard: SummaryWriter
+    tensorboard: TensorBoardManager
 
     grad_hook_handles: list[RemovableHandle]
 
@@ -66,8 +66,10 @@ class GenericTrainer(BaseTrainer):
 
         tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
         os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
-        self.tensorboard = SummaryWriter(
-            os.path.join(tensorboard_log_dir, f"{config.save_filename_prefix}{get_string_timestamp()}")
+        self.tensorboard = TensorBoardManager(
+            log_dir=os.path.join(tensorboard_log_dir, f"{config.save_filename_prefix}{get_string_timestamp()}")
+            # Você pode ajustar flush_secs e max_queue_size aqui se necessário
+            # max_queue_size=20000 # Exemplo
         )
         if config.tensorboard:
             super()._start_tensorboard()

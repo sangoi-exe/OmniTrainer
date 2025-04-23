@@ -329,14 +329,6 @@ class DynamicLossStrength:
         self.last_logged_delta_epoch = self.progress.epoch
 
         current_norm, reference_norm = delta_regularizer.get_delta_norms()
-        if current_norm is not None:
-            tensorboard.add_scalar(
-                "delta/current_norm", current_norm, self.progress.global_step
-            )
-        if reference_norm is not None:
-            tensorboard.add_scalar(
-                "delta/reference_norm", reference_norm, self.progress.global_step
-            )
 
         print(
             f"[DeltaPattern] Epoch {progress.epoch} | Current Δ: {current_norm:.4f} | Ref Δ: {reference_norm:.4f}"

@@ -1,4 +1,5 @@
 from abc import ABCMeta, abstractmethod
+from typing import Optional
 
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig
@@ -9,7 +10,7 @@ from modules.util.TrainProgress import TrainProgress
 import torch
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.tensorboard import SummaryWriter
+from modules.util.TensorBoardManager import TensorBoardManager
 
 from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
 
@@ -51,6 +52,7 @@ class BaseModelSetup(
         self,
         model: BaseModel,
         config: TrainConfig,
+        tensorboard: Optional[TensorBoardManager] = None
     ):
         pass
 
@@ -82,7 +84,7 @@ class BaseModelSetup(
         data: dict,
         config: TrainConfig,
         progress: TrainProgress,
-        tensorboard: SummaryWriter,
+        tensorboard: TensorBoardManager,
     ) -> Tensor:
         pass
 
@@ -100,8 +102,12 @@ class BaseModelSetup(
         model: BaseModel,
         config: TrainConfig,
         scheduler: LRScheduler,
-        tensorboard: SummaryWriter,
     ):
+        tensorboard_instance = model.tensorboard
+        if tensorboard_instance is None:
+            print("[WARN] Tentativa de reportar ao TensorBoard, mas a instância não está disponível no modelo.")
+            return # Sai se não houver tensorboard no modelo
+        
         lrs = scheduler.get_last_lr()
         parameters = model.parameters.display_name_mapping
 
@@ -110,7 +116,7 @@ class BaseModelSetup(
             # only use the prefix. this prevents multiple embedding reports. TODO: find a better solution
             name = parameter.split("/")[0]
 
-            tensorboard.add_scalar(
+            tensorboard_instance.add_scalar(
                 f"lr/{name}_orig", lr, model.train_progress.global_step
             )
 
@@ -122,7 +128,7 @@ class BaseModelSetup(
         )
 
         for name, lr in reported_learning_rates.items():
-            tensorboard.add_scalar(f"lr/{name}", lr, model.train_progress.global_step)
+            tensorboard_instance.add_scalar(f"lr/{name}", lr, model.train_progress.global_step)
 
     def stop_unet_training_elapsed(
         self,
