@@ -16,7 +16,7 @@ class TensorBoardManager:
     """
 
     def __init__(
-        self, log_dir: str, flush_secs: int = 120, max_queue_size: int = 10000
+        self, log_dir: str, flush_secs: int = 30, max_queue_size: int = 1000000
     ):
         """
         Inicializa o TensorBoardManager.

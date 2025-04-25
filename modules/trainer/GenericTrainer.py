@@ -132,7 +132,7 @@ class GenericTrainer(BaseTrainer):
 
         self.model_setup.setup_optimizations(self.model, self.config)
         self.model_setup.setup_train_device(self.model, self.config)
-        self.model_setup.setup_model(self.model, self.config)
+        self.model_setup.setup_model(self.model, self.config, self.tensorboard)
         self.model.to(self.temp_device)
         self.model.eval()
         torch_gc()
@@ -784,7 +784,7 @@ class GenericTrainer(BaseTrainer):
                         has_gradient = False
 
                         # Report learning rate after potential scheduler step
-                        self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler, self.tensorboard)
+                        self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler)
 
                         self.tensorboard.add_scalar("loss/train_step", accumulated_loss.mean().item(), train_progress.global_step)
                         ema_loss = ema_loss or accumulated_loss.item()

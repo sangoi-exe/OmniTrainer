@@ -205,50 +205,50 @@ class StableDiffusionXLLoRASetup(
         from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
 
         if config.delta_pattern_use_it or config.delta_pattern_save_it:
-            if not hasattr(model, "deltas"):  # Evita re-inicialização
-                try:
-                    param_collection = getattr(model, "parameters", None)
-                    if param_collection is None:
-                        raise ValueError("Coleção de parâmetros (model.parameters) não encontrada para DeltaPattern.")
+            print("[DeltaPattern] Inicializando os deltas...")
+            try:
+                param_collection = getattr(model, "parameters", None)
+                if param_collection is None:
+                    raise ValueError("Coleção de parâmetros (model.parameters) não encontrada para DeltaPattern.")
 
-                    print("[DeltaPattern] Inicializando DeltaPatternRegularizer...")
-                    # Atribui a instância ao modelo
-                    model.deltas = DeltaPatternRegularizer(model, param_collection)
+                print("[DeltaPattern] Inicializando DeltaPatternRegularizer...")
+                # Atribui a instância ao modelo
+                model.deltas = DeltaPatternRegularizer(model, param_collection)
 
-                    if config.delta_pattern_save_it:
-                        print("[DeltaPattern] Capturando pesos iniciais para salvar (Run 1)...")
-                        model.deltas.capture_weights()
+                if config.delta_pattern_save_it:
+                    print("[DeltaPattern] Capturando pesos iniciais para salvar (Run 1)...")
+                    model.deltas.capture_weights()
 
-                    if config.delta_pattern_use_it:
-                        if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
-                            print(f"[DeltaPattern] Carregando padrão de referência de: {config.delta_pattern_path}")
-                            # Passa device/dtype corretos
-                            train_dtype_torch = getattr(model, "train_dtype", None)  # Tenta pegar do modelo
-                            if train_dtype_torch is None:
-                                train_dtype_torch = config.train_dtype  # Fallback para config
-                            model.deltas.load_reference_pattern(
-                                config.delta_pattern_path, self.train_device, train_dtype_torch.torch_dtype()
-                            )
-                            if model.deltas.reference_deltas:  # Checa se carregou
-                                print("[DeltaPattern] Capturando pesos iniciais para cálculo de penalidade (Run 2)...")
-                                model.deltas.capture_initial_weights_run2()
-                            else:
-                                print(
-                                    f"[DeltaPattern] Aviso: Falha ao carregar padrão de delta de '{config.delta_pattern_path}'. Penalidade desativada."
-                                )
-                                config.delta_pattern_use_it = False  # Desativa
+                if config.delta_pattern_use_it:
+                    if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
+                        print(f"[DeltaPattern] Carregando padrão de referência de: {config.delta_pattern_path}")
+                        # Passa device/dtype corretos
+                        train_dtype_torch = getattr(model, "train_dtype", None)  # Tenta pegar do modelo
+                        if train_dtype_torch is None:
+                            train_dtype_torch = config.train_dtype  # Fallback para config
+                        model.deltas.load_reference_pattern(
+                            config.delta_pattern_path, self.train_device, train_dtype_torch.torch_dtype()
+                        )
+                        if model.deltas.reference_deltas:  # Checa se carregou
+                            print("[DeltaPattern] Capturando pesos iniciais para cálculo de penalidade (Run 2)...")
+                            model.deltas.capture_initial_weights_run2()
                         else:
                             print(
-                                f"[DeltaPattern] Aviso: 'delta_pattern_use_it' True, mas caminho '{config.delta_pattern_path}' inválido. Penalidade desativada."
+                                f"[DeltaPattern] Aviso: Falha ao carregar padrão de delta de '{config.delta_pattern_path}'. Penalidade desativada."
                             )
                             config.delta_pattern_use_it = False  # Desativa
+                    else:
+                        print(
+                            f"[DeltaPattern] Aviso: 'delta_pattern_use_it' True, mas caminho '{config.delta_pattern_path}' inválido. Penalidade desativada."
+                        )
+                        config.delta_pattern_use_it = False  # Desativa
 
-                    print("[DeltaPattern] DeltaPatternRegularizer inicializado.")
+                print("[DeltaPattern] DeltaPatternRegularizer inicializado.")
 
-                except Exception as e:
-                    print(f"[DeltaPattern] Falha ao inicializar DeltaPatternRegularizer: {e}")
-                    traceback.print_exc()
-                    model.deltas = None  # Garante None se falhar
+            except Exception as e:
+                print(f"[DeltaPattern] Falha ao inicializar DeltaPatternRegularizer: {e}")
+                traceback.print_exc()
+                model.deltas = None  # Garante None se falhar
         else:
             model.deltas = None  # Garante None se não for usado
 

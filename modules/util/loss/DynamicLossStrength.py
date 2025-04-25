@@ -362,6 +362,7 @@ class DeltaPatternRegularizer:
         )
         self.penalty_metric: str = penalty_metric.lower()
         self._delta_cache_by_prefix: dict[str, torch.Tensor] = {}
+        self._ref_index: list[tuple[str, str]] = []
         if self.penalty_metric not in {"mse", "cosine"}:
             raise ValueError("penalty_metric deve ser 'mse' ou 'cosine'")
 
@@ -461,10 +462,20 @@ class DeltaPatternRegularizer:
         try:
             with open(pattern_path, "r", encoding="utf‑8") as f:
                 json_data = json.load(f)
+            
+            self.reference_deltas = json_data
 
             flat_list: list[float] = []
-            for metrics in json_data.values():
-                flat_list.extend(float(v) for v in metrics.values())
+
+            # >>> INÍCIO ALTERAÇÃO
+            self._ref_index.clear()                                # zera índice
+            for epoch_key in sorted(json_data.keys(),
+                                    key=lambda k: int(k.replace("epoch_", ""))):
+                metrics = json_data[epoch_key]
+                for prefix in sorted(metrics.keys()):
+                    self._ref_index.append((epoch_key, prefix))    # preserva ordem
+                    flat_list.append(float(metrics[prefix]))       # mesmo valor que será usado
+            # <<< FIM ALTERAÇÃO
 
             if not flat_list:
                 print("[DeltaPattern] JSON estava vazio ou mal formatado.")
@@ -498,33 +509,40 @@ class DeltaPatternRegularizer:
         Compara o delta atual (run 2) vs. delta de referência (run 1)
         de forma vetorizada, sem skips nem atualizações condicionais.
         """
-        # device/dtype para tensores escalar zeros e comparações
-        device = next(self.model.parameters()).device
-        dtype  = next(self.model.parameters()).dtype
+        params = [p for p in self.param_collection.parameters() if p is not None]
+        if not params:
+            raise RuntimeError("[DeltaPattern] Nenhum parâmetro em param_collection.")
+        sample = params[0]
+        device, dtype = sample.device, sample.dtype
 
-        # precisa ter inicialização prévia
-        if not hasattr(self, "init_vec") or not hasattr(self, "ref_vec"):
+        # precisa ter referência carregada
+        if not self.reference_deltas or not self._ref_index:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        # vetoriza TODOS os params LoRA
-        cur_vec = torch.nn.utils.parameters_to_vector(
-            [p for p in self.param_collection.parameters() if p is not None]
-        )
+        # >>> INÍCIO ALTERAÇÃO
+        # 1) deltas atuais agrupados por prefixo (mantém gradientes)
+        cur_prefix_norms = self._get_current_module_deltas(device, dtype)
 
-        # delta em relação ao snapshot inicial
-        delta_vec = cur_vec - self.init_vec
+        # 2) monta vetor na MESMA ordem do vetor de referência
+        cur_vec = torch.stack([
+            cur_prefix_norms.get(prefix, torch.tensor(0.0, device=device, dtype=dtype))
+            for _, prefix in self._ref_index
+        ]).view(-1)
 
-        # cálculo da penalidade
+        # 3) vetor de referência já construído em load_reference_pattern
+        ref_vec = self.ref_vec.to(device=device, dtype=dtype).view(-1)
+        # <<< FIM ALTERAÇÃO
+
+        # cálculo da penalidade segue igual
         if self.penalty_metric == "cosine":
             penalty_val = 1.0 - torch.nn.functional.cosine_similarity(
-                delta_vec.view(-1),
-                self.ref_vec.view(-1),
-                dim=0,
-                eps=1e-8,
+                cur_vec, ref_vec, dim=0, eps=1e-8
             )
         else:  # "mse"
-            penalty_val = torch.mean((delta_vec.view(-1) - self.ref_vec.view(-1)) ** 2)
+            penalty_val = torch.mean((cur_vec - ref_vec) ** 2)
 
+        # cache opcional para monitoramento externo
+        self.current_total_delta_norm = torch.norm(cur_vec, p=2).item()
         return lambda_weight * penalty_val
 
     def _calculate_total_norm(
