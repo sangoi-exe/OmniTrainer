@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 from typing import Iterable, Tuple, List, Dict, Union, Optional, TYPE_CHECKING
 
 from modules.util.NamedParameterGroup import NamedParameterGroup
+from modules.util.TensorBoardManager import TensorBoardManager
 
 if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
@@ -335,6 +336,7 @@ class DynamicLossStrength:
         )
 
 class DeltaPatternRegularizer:
+    tensorboard: TensorBoardManager | None
     def __init__(
         self, model: torch.nn.Module, param_collection: "NamedParameterGroupCollection", penalty_metric: str = "cosine"
     ):
@@ -343,6 +345,7 @@ class DeltaPatternRegularizer:
                 "param_collection não pode ser None para DeltaPatternRegularizer."
             )
         self.model = model
+        self.tensorboard = model.tensorboard
         self.param_collection: "NamedParameterGroupCollection" = param_collection
         self.delta_log_by_module: Dict[str, Dict[str, float]] = {}
         self.initial_weights_run1: Dict[str, torch.Tensor] = (
@@ -467,7 +470,6 @@ class DeltaPatternRegularizer:
 
             flat_list: list[float] = []
 
-            # >>> INÍCIO ALTERAÇÃO
             self._ref_index.clear()                                # zera índice
             for epoch_key in sorted(json_data.keys(),
                                     key=lambda k: int(k.replace("epoch_", ""))):
@@ -475,7 +477,6 @@ class DeltaPatternRegularizer:
                 for prefix in sorted(metrics.keys()):
                     self._ref_index.append((epoch_key, prefix))    # preserva ordem
                     flat_list.append(float(metrics[prefix]))       # mesmo valor que será usado
-            # <<< FIM ALTERAÇÃO
 
             if not flat_list:
                 print("[DeltaPattern] JSON estava vazio ou mal formatado.")
@@ -519,7 +520,6 @@ class DeltaPatternRegularizer:
         if not self.reference_deltas or not self._ref_index:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        # >>> INÍCIO ALTERAÇÃO
         # 1) deltas atuais agrupados por prefixo (mantém gradientes)
         cur_prefix_norms = self._get_current_module_deltas(device, dtype)
 
@@ -531,7 +531,6 @@ class DeltaPatternRegularizer:
 
         # 3) vetor de referência já construído em load_reference_pattern
         ref_vec = self.ref_vec.to(device=device, dtype=dtype).view(-1)
-        # <<< FIM ALTERAÇÃO
 
         # cálculo da penalidade segue igual
         if self.penalty_metric == "cosine":
@@ -551,7 +550,7 @@ class DeltaPatternRegularizer:
         """Calcula a norma L2 total sobre todos os tensores no dicionário."""
         if not weight_dict:
             return 0.0
-        # Usa float64 para precisão na soma, no device especificado
+        
         total_norm_sq = torch.tensor(0.0, dtype=torch.float32, device=device)
         for tensor in weight_dict.values():
             # Garante que o tensor está no device correto e calcula a norma quadrada
@@ -576,10 +575,9 @@ class DeltaPatternRegularizer:
             print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
             return
 
-        epoch_key = f"epoch_{epoch}"
         self.delta_log_by_module[epoch_key] = {}
-        # do_tensorboard = hasattr(self, "tensorboard") and self.tensorboard is not None
-
+        
+        epoch_key = f"epoch_{epoch}"
         group_norms: Dict[str, float] = {}
         param_counts: Dict[str, int] = {}
 
@@ -607,8 +605,8 @@ class DeltaPatternRegularizer:
             count = param_counts[prefix]
             delta_norm = norm_sq**0.5 if count > 0 else 0.0
             self.delta_log_by_module[epoch_key][prefix] = delta_norm
-        # if do_tensorboard:
-        #     self.tensorboard.add_scalar(f"delta/by_group/{prefix}", delta_norm, epoch)
+        if self.tensorboard:
+            self.tensorboard.add_scalar(f"delta/by_group/{prefix}", delta_norm, epoch)
 
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
 

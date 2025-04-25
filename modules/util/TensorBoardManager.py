@@ -1,13 +1,10 @@
-# modules/util/TensorBoardManager.py
 import time
-from collections import deque
-from threading import Lock, Thread
 import torch
+from threading import Lock
 from torch.utils.tensorboard import SummaryWriter
-from typing import Any, Optional, Dict, Tuple, List
+from typing import Any, Optional, Tuple, List
 
 
-# START: Adição Módulo TensorBoardManager
 class TensorBoardManager:
     """
     Um wrapper para torch.utils.tensorboard.SummaryWriter que acumula
@@ -16,7 +13,7 @@ class TensorBoardManager:
     """
 
     def __init__(
-        self, log_dir: str, flush_secs: int = 30, max_queue_size: int = 1000000
+        self, log_dir: str, flush_secs: int = 30, max_queue_size: int = 100000
     ):
         """
         Inicializa o TensorBoardManager.

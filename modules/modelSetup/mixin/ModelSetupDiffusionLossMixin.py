@@ -393,13 +393,12 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # ------------------------------------------------------------------
         # 7) TensorBoard (opcional)
         # ------------------------------------------------------------------
-        if self.tensorboard is not None:
-            step = progress.global_step
-            self.tensorboard.add_scalar("sangoi/alpha",                float(alpha),                   step)
-            self.tensorboard.add_scalar("sangoi/gamma_curr",           float(gamma_curr),              step)
-            self.tensorboard.add_scalar("sangoi/mape_reward_mean",     float(mape_reward.mean()),      step)
-            self.tensorboard.add_scalar("sangoi/scenario_snr_weight",  float(scenario_snr_weight.mean()), step)
-            self.tensorboard.add_scalar("sangoi/reward_mean",          float(reward.mean()),           step)
+        step = progress.global_step
+        self.tensorboard.add_scalar("sangoi/alpha",                float(alpha),                   step)
+        self.tensorboard.add_scalar("sangoi/gamma_curr",           float(gamma_curr),              step)
+        self.tensorboard.add_scalar("sangoi/mape_reward_mean",     float(mape_reward.mean()),      step)
+        self.tensorboard.add_scalar("sangoi/scenario_snr_weight",  float(scenario_snr_weight.mean()), step)
+        self.tensorboard.add_scalar("sangoi/reward_mean",          float(reward.mean()),           step)
         
         # multiplicador aplicado à loss (shape = batch)
         return reward
@@ -411,7 +410,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         data: dict,
         config: TrainConfig,
         progress: TrainProgress,
-        tensorboard: TensorBoardManager,
         train_device: torch.device,
         model: torch.nn.Module,
         betas: Tensor | None = None,
@@ -420,7 +418,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         self.config = config
         self.progress = progress
-        self.tensorboard = tensorboard
+        self.tensorboard = model.tensorboard
         
         delta_instance: DeltaPatternRegularizer | None = getattr(model, 'deltas', None)
 
@@ -504,9 +502,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
                 self.tensorboard.add_scalar("delta/loss_b4_delta", losses.mean().item(), self.progress.global_step)
+                self.tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
                 losses += penalty  # Adiciona o escalar à loss de cada item do batch
                 self.tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
-                self.tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
 
               except Exception as e:
                     print(f"[DeltaPattern] Erro ao calcular/aplicar penalidade: {e}")
