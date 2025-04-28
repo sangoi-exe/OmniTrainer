@@ -636,15 +636,11 @@ class DoRAModule(LoRAModule):
         self.dora_num_dims = orig_weight.dim() - 1
         self.dora_scale = nn.Parameter(
             torch.norm(
-                orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
-                dim=1,
-                keepdim=True,
-            )
-            .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
-            .transpose(1, 0)
+                orig_weight.reshape(orig_weight.shape[0], -1),
+                dim=1, keepdim=True)
+            .reshape(orig_weight.shape[0], *[1] * self.dora_num_dims)
             .to(device=self.orig_module.weight.device)
         )
-
         del orig_weight
 
     def check_initialized(self):
@@ -669,16 +665,10 @@ class DoRAModule(LoRAModule):
         # backpropagation in order to save VRAM (to do this, we detach it from
         # the gradient graph).
         eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        norm = (
-            WP.detach()
-            .transpose(0, 1)
-            .reshape(WP.shape[1], -1)
-            .norm(dim=1, keepdim=True)
-            .reshape(WP.shape[1], *[1] * self.dora_num_dims)
-            .transpose(0, 1)
-            + eps
-        )
-        WP = self.dora_scale * (WP / norm)
+        flat = WP.detach().view(WP.shape[0], -1)           # view evita realloc se contiguous
+        row_norm = flat.norm(dim=1, keepdim=True).add_(eps)
+        row_norm = row_norm.view(WP.shape[0], *[1]*self.dora_num_dims)
+        WP = self.dora_scale * (WP / row_norm)
         # In the DoRA codebase (and thus the paper results), they perform
         # dropout on the *input*, rather than between layers, so we duplicate
         # that here.

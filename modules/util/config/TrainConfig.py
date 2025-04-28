@@ -435,6 +435,10 @@ class TrainConfig(BaseConfig):
     delta_pattern_weight: float
     delta_pattern_save_every: int = 0
     delta_pattern_save_every_unit: TimeUnit = TimeUnit.EPOCH
+    
+    # dcoef pattern settings
+    dcoef_pattern_path: str
+    dcoef_pattern_use_it: bool
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
@@ -805,6 +809,8 @@ class TrainConfig(BaseConfig):
         data.append(("delta_pattern_use_it", False, bool, False))
         data.append(("delta_pattern_weight", 0.0, float, False))
         data.append(("delta_pattern_path", "", str, False))
+        data.append(("dcoef_pattern_use_it", False, bool, False))
+        data.append(("dcoef_pattern_path", "", str, False))
         data.append(("log_cosh_strength", 0.0, float, False))
         data.append(("vb_loss_strength", 1.0, float, False))
         data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))

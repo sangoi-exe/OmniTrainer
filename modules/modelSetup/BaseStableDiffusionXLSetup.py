@@ -382,7 +382,6 @@ class BaseStableDiffusionXLSetup(
 			data: dict,
 			config: TrainConfig,
 			progress: TrainProgress,
-			tensorboard: TensorBoardManager
 	) -> Tensor:
 		return self._diffusion_losses(
 			batch=batch,
@@ -390,7 +389,6 @@ class BaseStableDiffusionXLSetup(
 			model=model,
 			config=config,
 			progress=progress,
-			tensorboard=tensorboard,
 			train_device=self.train_device,
 			betas=model.noise_scheduler.betas.to(device=self.train_device),
 		).mean()

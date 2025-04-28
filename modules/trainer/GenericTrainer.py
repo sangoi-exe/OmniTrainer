@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import copy
 from datetime import datetime
@@ -14,8 +15,10 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.sangoi.ModuleDynRecorder import ModuleDynRecorder
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
+from modules.util.DeltaGater import DeltaGater
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.SampleConfig import SampleConfig
@@ -61,15 +64,18 @@ class GenericTrainer(BaseTrainer):
 
     grad_hook_handles: list[RemovableHandle]
 
-    def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
+    def __init__(
+        self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands
+    ):
         super().__init__(config, callbacks, commands)
 
         tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
         os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
         self.tensorboard = TensorBoardManager(
-            log_dir=os.path.join(tensorboard_log_dir, f"{config.save_filename_prefix}{get_string_timestamp()}")
-            # Você pode ajustar flush_secs e max_queue_size aqui se necessário
-            # max_queue_size=20000 # Exemplo
+            log_dir=os.path.join(
+                tensorboard_log_dir,
+                f"{config.save_filename_prefix}{get_string_timestamp()}",
+            )
         )
         if config.tensorboard:
             super()._start_tensorboard()
@@ -78,6 +84,33 @@ class GenericTrainer(BaseTrainer):
         self.one_step_trained = False
 
         self.grad_hook_handles = []
+
+        # >>> CHATGPT ADD: inicializa histórico de módulos para evitar AttributeError
+        self.delta_gater = DeltaGater(
+            z_thresh=2.0,        # Threshold Z-score para considerar convergido
+            u_abs_thresh=1e-4,   # Threshold absoluto de UWR para considerar inativo
+            k_confirm=10,         # Quantas confirmações seguidas antes de congelar
+            warmup_frac=0.2,     # Só começa a congelar depois de 50% do treino
+            total_epochs=self.config.epochs,  # Número total de epochs do treino
+        )
+        self._event_log = collections.defaultdict(
+            list
+        )  # módulo → [(epoch, step, state)]
+        self._log_dir = Path(self.config.workspace_dir) / "module_state_logs"
+        self._log_dir.mkdir(exist_ok=True)
+        self._last_dump_epoch = -1
+        self.recorder = ModuleDynRecorder(k_stride=10)
+        if getattr(self.config, "dcoef_pattern_use_it", False):
+            from modules.sangoi.AdaptiveDCoef import AdaptiveDCoef  
+            self.adaptive_dcoef = AdaptiveDCoef(
+                profile_path=self.config.dcoef_pattern_path,
+                gamma=2.0,
+                alpha=1.0,
+                min_scale=1e-3
+            )
+        else:
+            self.adaptive_dcoef = None    
+        # <<< FIM CHATGPT ADD
 
     def start(self):
         self.__save_config_to_workspace()
@@ -139,7 +172,9 @@ class GenericTrainer(BaseTrainer):
 
         self.callbacks.on_update_status("creating the data loader/caching")
 
-        self.data_loader = self.create_data_loader(self.model, self.model.train_progress)
+        self.data_loader = self.create_data_loader(
+            self.model, self.model.train_progress
+        )
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -167,7 +202,9 @@ class GenericTrainer(BaseTrainer):
         if os.path.isdir(self.config.cache_dir):
             for filename in os.listdir(self.config.cache_dir):
                 path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith("epoch-") or filename in ["image", "text"]):
+                if os.path.isdir(path) and (
+                    filename.startswith("epoch-") or filename in ["image", "text"]
+                ):
                     shutil.rmtree(path)
 
     def __prune_backups(self, backups_to_keep: int):
@@ -226,11 +263,15 @@ class GenericTrainer(BaseTrainer):
                         )
 
                     sample_path = os.path.join(
-                        sample_dir, f"{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
+                        sample_dir,
+                        f"{get_string_timestamp()}-training-sample-{train_progress.filename_string()}",
                     )
 
                     def on_sample_default(sampler_output: ModelSamplerOutput):
-                        if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
+                        if (
+                            self.config.samples_to_tensorboard
+                            and sampler_output.file_type == FileType.IMAGE
+                        ):
                             self.tensorboard.add_image(
                                 f"sample{str(i)} - {safe_prompt}",
                                 pil_to_tensor(sampler_output.data),  # noqa: B023
@@ -241,7 +282,9 @@ class GenericTrainer(BaseTrainer):
                     def on_sample_custom(sampler_output: ModelSamplerOutput):
                         self.callbacks.on_sample_custom(sampler_output)
 
-                    on_sample = on_sample_custom if is_custom_sample else on_sample_default
+                    on_sample = (
+                        on_sample_custom if is_custom_sample else on_sample_default
+                    )
                     on_update_progress = (
                         self.callbacks.on_update_sample_custom_progress
                         if is_custom_sample
@@ -329,7 +372,9 @@ class GenericTrainer(BaseTrainer):
     def __validate(self, train_progress: TrainProgress):
         if self.__needs_validate(train_progress):
             self.validation_data_loader.get_data_set().start_next_epoch()
-            current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+            current_epoch_length_validation = (
+                self.validation_data_loader.get_data_set().approximate_length()
+            )
 
             if current_epoch_length_validation == 0:
                 return
@@ -356,7 +401,11 @@ class GenericTrainer(BaseTrainer):
 
                 with torch.no_grad():
                     model_output_data = self.model_setup.predict(
-                        self.model, validation_batch, self.config, train_progress, deterministic=True
+                        self.model,
+                        validation_batch,
+                        self.config,
+                        train_progress,
+                        deterministic=True,
                     )
                     loss_validation = self.model_setup.calculate_loss(
                         self.model, validation_batch, model_output_data, self.config
@@ -370,10 +419,16 @@ class GenericTrainer(BaseTrainer):
 
                 label = concept_name if concept_name else os.path.basename(concept_path)
                 # check and fix collision to display both graphs in tensorboard
-                if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
+                if (
+                    label in mapping_label_to_seed
+                    and mapping_label_to_seed[label] != concept_seed
+                ):
                     suffix = 1
                     new_label = f"{label}({suffix})"
-                    while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
+                    while (
+                        new_label in mapping_label_to_seed
+                        and mapping_label_to_seed[new_label] != concept_seed
+                    ):
                         suffix += 1
                         new_label = f"{label}({suffix})"
                     label = new_label
@@ -382,7 +437,9 @@ class GenericTrainer(BaseTrainer):
                     mapping_seed_to_label[concept_seed] = label
                     mapping_label_to_seed[label] = concept_seed
 
-                accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
+                accumulated_loss_per_concept[concept_seed] = (
+                    accumulated_loss_per_concept.get(concept_seed, 0) + loss
+                )
                 concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
 
             for concept_seed, total_loss in accumulated_loss_per_concept.items():
@@ -395,12 +452,16 @@ class GenericTrainer(BaseTrainer):
                 )
 
             if len(concept_counts) > 1:
-                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
+                total_loss = sum(
+                    accumulated_loss_per_concept[key] for key in concept_counts
+                )
                 total_count = sum(concept_counts[key] for key in concept_counts)
                 total_average_loss = total_loss / total_count
 
                 self.tensorboard.add_scalar(
-                    "loss/validation_step/total_average", total_average_loss, train_progress.global_step
+                    "loss/validation_step/total_average",
+                    total_average_loss,
+                    train_progress.global_step,
                 )
 
     def __save_backup_config(self, backup_path):
@@ -418,12 +479,19 @@ class GenericTrainer(BaseTrainer):
         if os.path.isfile(self.config.sample_definition_file_name):
             shutil.copy2(self.config.sample_definition_file_name, samples_path)
 
-    def backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+    def backup(
+        self,
+        train_progress: TrainProgress,
+        print_msg: bool = True,
+        print_cb: Callable[[str], None] = print,
+    ):
         torch_gc()
 
         self.callbacks.on_update_status("creating backup")
 
-        backup_name = f"{get_string_timestamp()}-backup-{train_progress.filename_string()}"
+        backup_name = (
+            f"{get_string_timestamp()}-backup-{train_progress.filename_string()}"
+        )
         backup_path = os.path.join(self.config.workspace_dir, "backup", backup_name)
 
         # Special case for schedule-free optimizers.
@@ -465,7 +533,12 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
-    def save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+    def save(
+        self,
+        train_progress: TrainProgress,
+        print_msg: bool = True,
+        print_cb: Callable[[str], None] = print,
+    ):
         torch_gc()
 
         self.callbacks.on_update_status("saving")
@@ -513,38 +586,67 @@ class GenericTrainer(BaseTrainer):
 
     def __needs_sample(self, train_progress: TrainProgress):
         return self.single_action_elapsed(
-            "sample_skip_first", self.config.sample_skip_first, self.config.sample_after_unit, train_progress
+            "sample_skip_first",
+            self.config.sample_skip_first,
+            self.config.sample_after_unit,
+            train_progress,
         ) and self.repeating_action_needed(
-            "sample", self.config.sample_after, self.config.sample_after_unit, train_progress
+            "sample",
+            self.config.sample_after,
+            self.config.sample_after_unit,
+            train_progress,
         )
 
     def __needs_backup(self, train_progress: TrainProgress):
         return self.repeating_action_needed(
-            "backup", self.config.backup_after, self.config.backup_after_unit, train_progress, start_at_zero=False
+            "backup",
+            self.config.backup_after,
+            self.config.backup_after_unit,
+            train_progress,
+            start_at_zero=False,
         )
 
     def __needs_save(self, train_progress: TrainProgress):
         return self.single_action_elapsed(
-            "save_skip_first", self.config.save_skip_first, self.config.save_every_unit, train_progress
+            "save_skip_first",
+            self.config.save_skip_first,
+            self.config.save_every_unit,
+            train_progress,
         ) and self.repeating_action_needed(
-            "save", self.config.save_every, self.config.save_every_unit, train_progress, start_at_zero=False
+            "save",
+            self.config.save_every,
+            self.config.save_every_unit,
+            train_progress,
+            start_at_zero=False,
         )
 
     def __needs_gc(self, train_progress: TrainProgress):
-        return self.repeating_action_needed("gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False)
+        return self.repeating_action_needed(
+            "gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False
+        )
 
     def __needs_validate(self, train_progress: TrainProgress):
         return self.repeating_action_needed(
-            "validate", self.config.validate_after, self.config.validate_after_unit, train_progress
+            "validate",
+            self.config.validate_after,
+            self.config.validate_after_unit,
+            train_progress,
         )
 
     def __is_update_step(self, train_progress: TrainProgress) -> bool:
         return self.repeating_action_needed(
-            "update_step", self.config.gradient_accumulation_steps, TimeUnit.STEP, train_progress, start_at_zero=False
+            "update_step",
+            self.config.gradient_accumulation_steps,
+            TimeUnit.STEP,
+            train_progress,
+            start_at_zero=False,
         )
 
     def __apply_fused_back_pass(self, scaler):
-        if self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+        if (
+            self.config.optimizer.optimizer.supports_fused_back_pass()
+            and self.config.optimizer.fused_back_pass
+        ):
             if self.config.gradient_accumulation_steps > 1:
                 print(
                     "Warning: activating fused_back_pass with gradient_accumulation_steps > 1 does not reduce VRAM usage."
@@ -557,24 +659,40 @@ class GenericTrainer(BaseTrainer):
                     if parameter.requires_grad:
                         if scaler:
 
-                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
+                            def __grad_hook(
+                                tensor: Tensor, param_group=param_group, i=i
+                            ):
                                 if self.__is_update_step(self.model.train_progress):
-                                    scaler.unscale_parameter_(tensor, self.model.optimizer)
+                                    scaler.unscale_parameter_(
+                                        tensor, self.model.optimizer
+                                    )
                                     if self.config.clip_grad_norm is not None:
-                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
-                                    scaler.maybe_opt_step_parameter(tensor, param_group, i, self.model.optimizer)
+                                        nn.utils.clip_grad_norm_(
+                                            tensor, self.config.clip_grad_norm
+                                        )
+                                    scaler.maybe_opt_step_parameter(
+                                        tensor, param_group, i, self.model.optimizer
+                                    )
                                     tensor.grad = None
 
                         else:
 
-                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
+                            def __grad_hook(
+                                tensor: Tensor, param_group=param_group, i=i
+                            ):
                                 if self.__is_update_step(self.model.train_progress):
                                     if self.config.clip_grad_norm is not None:
-                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
-                                    self.model.optimizer.step_parameter(tensor, param_group, i)
+                                        nn.utils.clip_grad_norm_(
+                                            tensor, self.config.clip_grad_norm
+                                        )
+                                    self.model.optimizer.step_parameter(
+                                        tensor, param_group, i
+                                    )
                                     tensor.grad = None
 
-                        handle = parameter.register_post_accumulate_grad_hook(__grad_hook)
+                        handle = parameter.register_post_accumulate_grad_hook(
+                            __grad_hook
+                        )
                         self.grad_hook_handles.append(handle)
 
     def __before_eval(self):
@@ -587,27 +705,37 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         scheduler_step_counter = 0
+        self.delta_gater.set_current_epoch(self.model.train_progress.epoch)
 
         def wrap_scheduler_step(orig_step):
             def wrapped(*args, **kwargs):
                 nonlocal scheduler_step_counter
                 scheduler_step_counter += 1
-                print(f"[DEBUG] scheduler.step() chamado {scheduler_step_counter} vezes")
+                print(
+                    f"[DEBUG] scheduler.step() chamado {scheduler_step_counter} vezes"
+                )
                 print(f"[DEBUG] scheduler.last_epoch = {lr_scheduler.last_epoch}")
                 return orig_step(*args, **kwargs)
+
             return wrapped
-        
+
         train_device = torch.device(self.config.train_device)
 
         train_progress = self.model.train_progress
 
         if self.config.only_cache:
             self.callbacks.on_update_status("caching")
-            for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
+            for _epoch in tqdm(
+                range(train_progress.epoch, self.config.epochs, 1), desc="epoch"
+            ):
                 self.data_loader.get_data_set().start_next_epoch()
             return
 
-        scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
+        scaler = (
+            create_grad_scaler()
+            if enable_grad_scaling(self.config.train_dtype, self.parameters)
+            else None
+        )
 
         self.__apply_fused_back_pass(scaler)
 
@@ -619,8 +747,10 @@ class GenericTrainer(BaseTrainer):
         ema_loss = None
 
         lr_scheduler = None
-        
-        for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
+
+        for _epoch in tqdm(
+            range(train_progress.epoch, self.config.epochs, 1), desc="epoch"
+        ):
             self.callbacks.on_update_status("starting epoch/caching")
 
             if self.config.latent_caching:
@@ -653,7 +783,7 @@ class GenericTrainer(BaseTrainer):
                     gradient_accumulation_steps=self.config.gradient_accumulation_steps,
                     global_step=train_progress.global_step,
                 )
-            
+
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
             step_tqdm = tqdm(
                 self.data_loader.get_data_loader(),
@@ -661,11 +791,18 @@ class GenericTrainer(BaseTrainer):
                 total=current_epoch_length,
                 initial=train_progress.epoch_step,
             )
-            delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
+            delta_instance: DeltaPatternRegularizer | None = getattr(
+                self.model, "deltas", None
+            )
             for batch in step_tqdm:
-                if self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                if (
+                    self.__needs_sample(train_progress)
+                    or self.commands.get_and_reset_sample_default_command()
+                ):
                     self.__enqueue_sample_during_training(
-                        lambda: self.__sample_during_training(train_progress, train_device)
+                        lambda: self.__sample_during_training(
+                            train_progress, train_device
+                        )
                     )
 
                 if self.__needs_backup(train_progress):
@@ -679,11 +816,15 @@ class GenericTrainer(BaseTrainer):
 
                     def create_sample_commands_fun(sample_commands):
                         def sample_commands_fun():
-                            self.__sample_during_training(train_progress, train_device, sample_commands)
+                            self.__sample_during_training(
+                                train_progress, train_device, sample_commands
+                            )
 
                         return sample_commands_fun
 
-                    self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
+                    self.__enqueue_sample_during_training(
+                        create_sample_commands_fun(sample_commands)
+                    )
 
                 if self.__needs_gc(train_progress):
                     torch_gc()
@@ -729,10 +870,10 @@ class GenericTrainer(BaseTrainer):
 
                     # ==== Início da modificação: hook de gradiente para masked training ====
                     if self.config.masked_training:
-                      # extrai o tensor previsto do dict
-                      predicted = model_output_data['predicted']
-                      # zera gradiente fora da máscara
-                      predicted.register_hook(lambda g: g * batch['latent_mask'])
+                        # extrai o tensor previsto do dict
+                        predicted = model_output_data["predicted"]
+                        # zera gradiente fora da máscara
+                        predicted.register_hook(lambda g: g * batch["latent_mask"])
                     # ==== Fim da modificação ====
 
                     # Cálculo de loss permanece inalterado
@@ -742,7 +883,6 @@ class GenericTrainer(BaseTrainer):
                         model_output_data,
                         self.config,
                         train_progress,
-                        self.tensorboard,
                     )
 
                     loss = loss / float(self.config.gradient_accumulation_steps)
@@ -769,45 +909,139 @@ class GenericTrainer(BaseTrainer):
                         elif scaler:
                             scaler.unscale_(self.model.optimizer)
                             if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                nn.utils.clip_grad_norm_(
+                                    self.parameters, self.config.clip_grad_norm
+                                )
                             scaler.step(self.model.optimizer)
                             scaler.update()
                         else:
                             if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                nn.utils.clip_grad_norm_(
+                                    self.parameters, self.config.clip_grad_norm
+                                )
+
+                        # dentro do loop de treino, ANTES de optimizer.step():
+                        if self.adaptive_dcoef:
+                            total_steps   = self.config.epochs * len(self.data_loader)
+                            current_step  = self.model.train_progress.global_step
+                            for g in self.model.optimizer.param_groups:
+                                module_name = g.get("name")
+                                scale       = self.adaptive_dcoef.scale(module_name, current_step, total_steps)
+                                base        = self.adaptive_dcoef.d_coef_base.get(module_name, g.get("d_coef", 1.0))
+                                g["d_coef"] = base * scale
+
                             self.model.optimizer.step()
-                            if hasattr(delta_instance, "_delta_cache_by_prefix"):
-                                delta_instance._delta_cache_by_prefix.clear()                        
+
+                            try:
+                                K = 10
+                                if self.model.train_progress.global_step % K == 0:
+
+                                    # 1️⃣ Coleta de estatísticas UWR (sempre coleta)
+                                    for stat in self.model.optimizer.pop_stats():
+                                        group_name = self.model.param_group_mapping[stat["group_idx"]]
+                                        self.delta_gater.ingest(group_name, stat["uwr"])
+
+                                    # 2️⃣ Só aplica gating depois da primeira epoch
+                                    if self.model.train_progress.epoch >= 1:
+
+                                        # 🆕 Atualiza o epoch antes de decidir
+                                        self.delta_gater.set_current_epoch(self.model.train_progress.epoch)
+
+                                        # 🔵 Decisão UWR
+                                        uwr_decisions = self.delta_gater.decide()
+                                        for group_name, freeze in uwr_decisions.items():
+                                            param_group = self.model.parameters.by_unique_name(group_name)
+                                            if not param_group:
+                                                continue
+                                            desired_state = not freeze
+                                            if param_group.is_enabled != desired_state:
+                                                param_group.set_requires_grad(desired_state)
+                                                state_str = "FROZEN" if freeze else "ACTIVE"
+                                                print(f"[Delta-Gater] {group_name} ⇒ {state_str}")
+
+                                            self._event_log[group_name].append(
+                                                (
+                                                    self.model.train_progress.epoch,
+                                                    self.model.train_progress.global_step,
+                                                    int(desired_state),
+                                                )
+                                            )
+
+                                        # 🔵 Decisão Delta (separada, depende do last_gate_decisions)
+                                        cur_delta_decisions = self.delta_gater.last_decisions
+                                        for prefix_name, freeze in cur_delta_decisions.items():
+                                            param_group = self.model.parameters.by_unique_name(prefix_name)
+                                            if not param_group:
+                                                continue
+                                            desired_state = not freeze
+                                            if param_group.is_enabled != desired_state:
+                                                param_group.set_requires_grad(desired_state)
+                                                state_str = "FROZEN" if freeze else "ACTIVE"
+                                                print(f"[Delta-GateΔ] {prefix_name} ⇒ {state_str}")
+
+                            except Exception as e:
+                                print(f"[DeltaPattern] Deu pau aqui: {e}")
+                                traceback.print_exc()
+                            # END
+                            try:                          
+                              for s in self.model.optimizer.pop_stats():
+                                name = self.model.param_group_mapping[s["group_idx"]]
+                                converged = name in self.delta_gater.perma_frozen
+                                self.recorder.log_step(
+                                    name       = name,
+                                    step       = self.model.train_progress.global_step,
+                                    uwr        = s["uwr"],
+                                    d_hat      = s["d_hat"],
+                                    d_coef     = s["d_coef"],
+                                    converged  = converged,
+                                  )
+                            except Exception as e:
+                                print(f"[DynDcoef] Deu pau aqui: {e}")
+                                traceback.print_exc()
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
 
                         # Report learning rate after potential scheduler step
-                        self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler)
+                        self.model_setup.report_to_tensorboard(
+                            self.model, self.config, lr_scheduler
+                        )
 
-                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss.mean().item(), train_progress.global_step)
+                        self.tensorboard.add_scalar(
+                            "loss/train_step",
+                            accumulated_loss.mean().item(),
+                            train_progress.global_step,
+                        )
                         ema_loss = ema_loss or accumulated_loss.item()
                         ema_loss = (ema_loss * 0.99) + (accumulated_loss.item() * 0.01)
-                        step_tqdm.set_postfix({
-                            'loss': accumulated_loss.item(),
-                            'smooth loss': ema_loss,
-                        })
-                        self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                        step_tqdm.set_postfix(
+                            {
+                                "loss": accumulated_loss.item(),
+                                "smooth loss": ema_loss,
+                            }
+                        )
+                        self.tensorboard.add_scalar(
+                            "smooth_loss/train_step",
+                            ema_loss,
+                            train_progress.global_step,
+                        )
                         accumulated_loss = 0.0
 
-                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        self.model_setup.after_optimizer_step(
+                            self.model, self.config, train_progress
+                        )
                         if self.model.ema:
-                            update_step = train_progress.global_step // self.config.gradient_accumulation_steps
+                            update_step = (
+                                train_progress.global_step
+                                // self.config.gradient_accumulation_steps
+                            )
                             self.tensorboard.add_scalar(
                                 "ema_decay",
                                 self.model.ema.get_current_decay(update_step),
-                                train_progress.global_step
+                                train_progress.global_step,
                             )
-                            self.model.ema.step(
-                                self.parameters,
-                                update_step
-                            )
+                            self.model.ema.step(self.parameters, update_step)
 
                         self.one_step_trained = True
 
@@ -815,35 +1049,53 @@ class GenericTrainer(BaseTrainer):
                     self.__validate(train_progress)
 
                 train_progress.next_step(self.config.batch_size)
-                self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+                self.callbacks.on_update_train_progress(
+                    train_progress, current_epoch_length, self.config.epochs
+                )
 
                 if self.commands.get_stop_command():
                     return
 
             train_progress.next_epoch()
-            self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
-           
+            self.callbacks.on_update_train_progress(
+                train_progress, current_epoch_length, self.config.epochs
+            )
+
             if delta_instance is not None:
-              # Logar deltas do grupo se a opção estiver ativa
-              if self.config.delta_pattern_save_it:
+                # Logar deltas do grupo se a opção estiver ativa
+                if self.config.delta_pattern_save_it:
                     try:
                         # Loga para a época que acabou de terminar
                         delta_instance.log_group_deltas(train_progress.epoch - 1)
                     except Exception as e:
-                        print(f"[DeltaPattern] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}")
+                        print(
+                            f"[DeltaPattern] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}"
+                        )
                         traceback.print_exc()
 
-              # Logar normas totais para o TensorBoard
-              try:
-                  current_norm, reference_norm = delta_instance.get_delta_norms()
-                  if current_norm is not None:
-                      self.tensorboard.add_scalar("delta_pattern/current_total_delta_norm", current_norm, train_progress.global_step)
-                  if reference_norm is not None:
-                      self.tensorboard.add_scalar("delta_pattern/reference_delta_norm", reference_norm, train_progress.global_step)
-              except Exception as e:
-                    print(f"[DeltaPattern] Erro ao logar normas totais no TensorBoard: {e}")
+                # Logar normas totais para o TensorBoard
+                try:
+                    current_norm, reference_norm = delta_instance.get_delta_norms()
+                    if current_norm is not None:
+                        self.tensorboard.add_scalar(
+                            "delta_pattern/current_total_delta_norm",
+                            current_norm,
+                            train_progress.global_step,
+                        )
+                    if reference_norm is not None:
+                        self.tensorboard.add_scalar(
+                            "delta_pattern/reference_delta_norm",
+                            reference_norm,
+                            train_progress.global_step,
+                        )
+                except Exception as e:
+                    print(
+                        f"[DeltaPattern] Erro ao logar normas totais no TensorBoard: {e}"
+                    )
                     traceback.print_exc()
-            self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+            self.callbacks.on_update_train_progress(
+                train_progress, current_epoch_length, self.config.epochs
+            )
 
             if self.commands.get_stop_command():
                 return
@@ -863,7 +1115,10 @@ class GenericTrainer(BaseTrainer):
 
             if self.model.ema:
                 self.model.ema.copy_ema_to(self.parameters, store_temp=False)
-            if os.path.isdir(self.config.output_model_destination) and self.config.output_model_format.is_single_file():
+            if (
+                os.path.isdir(self.config.output_model_destination)
+                and self.config.output_model_format.is_single_file()
+            ):
                 save_path = os.path.join(
                     self.config.output_model_destination,
                     f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}",
@@ -885,20 +1140,42 @@ class GenericTrainer(BaseTrainer):
         model_filename = os.path.basename(save_path)
         model_name, _ = os.path.splitext(model_filename)
 
-        delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
+        delta_instance: DeltaPatternRegularizer | None = getattr(
+            self.model, "deltas", None
+        )
         if delta_instance is not None and self.config.delta_pattern_save_it:
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_dir = os.path.join(self.config.workspace_dir, "training_deltas")  # Garante que o diretório existe
+                output_dir = os.path.join(
+                    self.config.workspace_dir, "training_deltas"
+                )  # Garante que o diretório existe
                 os.makedirs(output_dir, exist_ok=True)
                 # Início do trecho alterado (nome de arquivo de deltas baseado no modelo)
                 delta_filename = f"{model_name}_Deltas_{timestamp}.json"
                 save_path = os.path.join(output_dir, delta_filename)
                 # Fim do trecho alterado
-                print(f"[DeltaPattern] Salvando deltas finais por grupo em: {save_path}")
+                print(
+                    f"[DeltaPattern] Salvando deltas finais por grupo em: {save_path}"
+                )
                 delta_instance.save_group_deltas(save_path)
             except Exception as e:
                 print(f"[DeltaPattern] Erro ao salvar deltas finais: {e}")
+                traceback.print_exc()
+
+            try:
+              dcoef_output_dir = os.path.join(
+                  self.config.workspace_dir, "dcoef_stats"
+              )  # Garante que o diretório existe        
+              os.makedirs(output_dir, exist_ok=True)
+
+              dcoef_filename = f"{model_name}_DynDcoef_{timestamp}.json.gz"
+              dcoef_save_path = os.path.join(dcoef_output_dir, dcoef_filename)
+              self.recorder.dump(dcoef_save_path)
+              print(
+                  f"[DynDcoef] Salvando dynamic dcoef stats em: {dcoef_save_path}"
+              )
+            except Exception as e:
+                print(f"[DynDcoef] Deu pau aqui: {e}")
                 traceback.print_exc()
 
         self.tensorboard.close()

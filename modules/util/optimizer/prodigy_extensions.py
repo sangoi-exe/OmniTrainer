@@ -1,4 +1,5 @@
 import math
+import traceback
 import torch
 import torch.distributed as dist
 
@@ -12,10 +13,6 @@ from prodigyopt.prodigy import Prodigy
 
 @torch.no_grad()
 def step_prodigy(self, closure=None):
-
-
-
-
     """Performs a single optimization step.
 
     Arguments:
@@ -25,9 +22,16 @@ def step_prodigy(self, closure=None):
     loss = None
     if closure is not None:
         loss = closure()
+        
+    if not hasattr(self, "_stats_buffer"):
+
+        self._stats_buffer = ProdigyStatsBuffer()
+    # limpa o buffer no primeiro grupo da step
 
     # iterate over each parameter group independently
     for group_idx, group in enumerate(self.param_groups):
+        if group_idx == 0:
+            self._stats_buffer.clear()
 
         if group["lr"] == 0.0:
             continue
@@ -155,6 +159,17 @@ def step_prodigy(self, closure=None):
             group["d_numerator"] = global_d_numerator
             group["d_denom"] = global_d_denom
 
+        self._stats_buffer.push(
+            group_idx = group_idx,
+            step      = group["k"],               # k antes do incremento
+            lr        = lr,
+            d         = group["d"],
+            d_hat     = d_hat,                    # NEW — já calculado
+            d_coef    = group["d_coef"],          # NEW — valor atual
+            d0        = group["d0"],              # NEW — ref inicial
+            uwr       = float(global_d_numerator / (global_d_denom + 1e-12)),
+        )
+
         # recompute dlr with the updated d (for this group)
         dlr = d * lr * bias_correction
 
@@ -177,12 +192,26 @@ def step_prodigy(self, closure=None):
             if beta1 > 0:
                 exp_avg = state["exp_avg"]
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
+                    # <<< CHATGPT ADD STROCHASTIC PROTECT >>>
+                    try:
+                        addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
+                    except Exception as e:
+                        print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
+                        traceback.print_exc()
+                        p.data.addcdiv_(exp_avg, denom, value=-dlr)
+                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(exp_avg, denom, value=-dlr)
             else:
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
+                    # <<< CHATGPT ADD STROCHASTIC PROTECT <<<
+                    try:
+                        addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
+                    except Exception as e:
+                        print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
+                        traceback.print_exc()
+                        p.data.addcdiv_(grad, denom, value=-dlr * d)
+                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(grad, denom, value=-dlr * d)
 
@@ -198,5 +227,32 @@ def patch_prodigy(optimizer: Prodigy, stochastic_rounding: bool):
     Ativa o suporte a Stochastic Rounding no Prodigy,
     substituindo o método step pelo nosso step_prodigy.
     """
-    optimizer.stochastic_rounding = stochastic_rounding
-    optimizer.step = step_prodigy.__get__(optimizer, Prodigy)
+    try:
+      optimizer.stochastic_rounding = stochastic_rounding
+      optimizer.step = step_prodigy.__get__(optimizer, Prodigy)
+      optimizer.pop_stats = _pop_prodigy_stats.__get__(optimizer, Prodigy)
+    except Exception as e:
+      print(f"Failed to set options in patch_prodigy: {e}")
+      traceback.print_exc()
+
+def _pop_prodigy_stats(self):
+    """
+    Retorna e esvazia o buffer das estatísticas mais recentes.
+    Chame após optimizer.step().
+    """
+    return getattr(self, "_stats_buffer", []).pop_all()
+
+class ProdigyStatsBuffer(list):
+    """
+    Coleciona dicts de estatísticas por grupo a cada .step().
+    Chamou .pop_all() => devolve lista acumulada e limpa o buffer.
+    """
+    def push(self, **kwargs):
+        self.append(kwargs)
+
+    def pop_all(self):
+        buf = list(self)
+        self.clear()
+        return buf
+
+

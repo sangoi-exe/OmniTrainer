@@ -1,3 +1,4 @@
+import collections
 import json
 import traceback
 import os
@@ -338,7 +339,13 @@ class DynamicLossStrength:
 class DeltaPatternRegularizer:
     tensorboard: TensorBoardManager | None
     def __init__(
-        self, model: torch.nn.Module, param_collection: "NamedParameterGroupCollection", penalty_metric: str = "cosine"
+        self,
+        model: torch.nn.Module,
+        param_collection: "NamedParameterGroupCollection",
+        penalty_metric: str = "cosine",
+        gate_window:    int   = 20,
+        gate_z_thresh:  float = 1.5,
+        gate_cool_down: int   = 3,
     ):
         if param_collection is None:
             raise ValueError(
@@ -366,6 +373,17 @@ class DeltaPatternRegularizer:
         self.penalty_metric: str = penalty_metric.lower()
         self._delta_cache_by_prefix: dict[str, torch.Tensor] = {}
         self._ref_index: list[tuple[str, str]] = []
+        
+        # ---- GATING POR DELTA (frear layers afobadas) --------------
+        self.gate_window    = gate_window
+        self.gate_z_thresh  = gate_z_thresh
+        self.gate_cool_down = gate_cool_down
+
+        self._delta_buf   : Dict[str, collections.deque[float]] = collections.defaultdict(
+            lambda: collections.deque(maxlen=self.gate_window)
+        )
+        self._frozen_epochs: Dict[str, int] = collections.defaultdict(int)
+        self.last_gate_decisions: Dict[str, bool] = {}
         if self.penalty_metric not in {"mse", "cosine"}:
             raise ValueError("penalty_metric deve ser 'mse' ou 'cosine'")
 
@@ -574,12 +592,11 @@ class DeltaPatternRegularizer:
         if not self.initial_weights_run1:
             print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
             return
-
-        self.delta_log_by_module[epoch_key] = {}
-        
         epoch_key = f"epoch_{epoch}"
         group_norms: Dict[str, float] = {}
         param_counts: Dict[str, int] = {}
+        
+        self.delta_log_by_module[epoch_key] = {}
 
         for name, current_param, _ in self._iterate_params():
             if name not in self.initial_weights_run1:
@@ -605,8 +622,6 @@ class DeltaPatternRegularizer:
             count = param_counts[prefix]
             delta_norm = norm_sq**0.5 if count > 0 else 0.0
             self.delta_log_by_module[epoch_key][prefix] = delta_norm
-        if self.tensorboard:
-            self.tensorboard.add_scalar(f"delta/by_group/{prefix}", delta_norm, epoch)
 
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
 

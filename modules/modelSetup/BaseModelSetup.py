@@ -84,7 +84,6 @@ class BaseModelSetup(
         data: dict,
         config: TrainConfig,
         progress: TrainProgress,
-        tensorboard: TensorBoardManager,
     ) -> Tensor:
         pass
 

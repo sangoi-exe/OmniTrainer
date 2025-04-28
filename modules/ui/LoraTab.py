@@ -193,10 +193,21 @@ class LoraTab:
                          tooltip="Path to the delta pattern file (.pt, .safetensors). Leave empty if not using.")
         delta_path_entry = components.file_entry(
             master, 9, 1, self.ui_state, "delta_pattern_path"
-            # Não há modificador de path específico aqui, assume-se que o componente lida com o caminho completo.
         )
-        # Ocupa colunas 1 a 4.
         delta_path_entry.grid(row=9, column=1, columnspan=4, sticky="ew")
+
+        # Switch para usar DCoef Pattern
+        components.label(master, 10, 0, "Use DCoef Pattern",
+                         tooltip="Apply a pre-defined dcoef pattern per module.")
+        components.switch(master, 10, 1, self.ui_state, "dcoef_pattern_use_it")
+
+        # Campo para path do DCoef Pattern
+        components.label(master, 11, 0, "DCoef Pattern Path",
+                         tooltip="Path to the dcoef pattern profile (.json.gz). Leave empty if not using.")
+        dcoef_path_entry = components.file_entry(
+            master, 11, 1, self.ui_state, "dcoef_pattern_path"
+        )
+        dcoef_path_entry.grid(row=11, column=1, columnspan=4, sticky="ew")
 				
         # Some configs will come with the lora_layer_preset unset or wrong for
         # the new model, so let's set it now to a reasonable default so it hits
