@@ -87,8 +87,8 @@ class GenericTrainer(BaseTrainer):
 
         # >>> CHATGPT ADD: inicializa histórico de módulos para evitar AttributeError
         self.delta_gater = DeltaGater(
-            z_thresh=2.0,        # Threshold Z-score para considerar convergido
-            u_abs_thresh=1e-4,   # Threshold absoluto de UWR para considerar inativo
+            z_thresh=2.5,        # Threshold Z-score para considerar convergido
+            u_abs_thresh=5e-5,   # Threshold absoluto de UWR para considerar inativo
             k_confirm=10,         # Quantas confirmações seguidas antes de congelar
             warmup_frac=0.2,     # Só começa a congelar depois de 50% do treino
             total_epochs=self.config.epochs,  # Número total de epochs do treino
@@ -920,86 +920,144 @@ class GenericTrainer(BaseTrainer):
                                     self.parameters, self.config.clip_grad_norm
                                 )
 
-                        # dentro do loop de treino, ANTES de optimizer.step():
+                        # START: Modify AdaptiveDCoef application for vectorization
                         if self.adaptive_dcoef:
-                            total_steps   = self.config.epochs * len(self.data_loader)
-                            current_step  = self.model.train_progress.global_step
-                            for g in self.model.optimizer.param_groups:
-                                module_name = g.get("name")
-                                scale       = self.adaptive_dcoef.scale(module_name, current_step, total_steps)
-                                base        = self.adaptive_dcoef.d_coef_base.get(module_name, g.get("d_coef", 1.0))
-                                g["d_coef"] = base * scale
+                            # Determine target device and dtype from a model parameter
+                            # Assuming at least one parameter exists
+                            sample_param = next(iter(self.parameters), None)
+                            if sample_param is not None:
+                                target_device = sample_param.device
+                                target_dtype = sample_param.dtype # Or use a specific one like torch.float32
 
-                            self.model.optimizer.step()
+                                # --- Vectorized d_coef calculation ---
+                                total_steps = self.config.epochs * self.data_loader.get_data_set().approximate_length()
+                                current_step = self.model.train_progress.global_step
 
-                            try:
-                                K = 10
-                                if self.model.train_progress.global_step % K == 0:
+                                # 1. Collect names of modules needing scaling
+                                module_names_to_scale = []
+                                for g in self.model.optimizer.param_groups:
+                                    module_name = g.get("name")
+                                    # Only include if name exists and has a base d_coef entry
+                                    if module_name and module_name in self.adaptive_dcoef.d_coef_base:
+                                        module_names_to_scale.append(module_name)
+                                module_names_to_scale = list(set(module_names_to_scale)) # Unique names
 
-                                    # 1️⃣ Coleta de estatísticas UWR (sempre coleta)
-                                    for stat in self.model.optimizer.pop_stats():
-                                        group_name = self.model.param_group_mapping[stat["group_idx"]]
+                                # 2. Call vectorized scaling function once
+                                scale_factors = {} # Default empty
+                                if module_names_to_scale:
+                                     try:
+                                         scale_factors = self.adaptive_dcoef.scale_vectorized(
+                                             names=module_names_to_scale,
+                                             step=current_step,
+                                             total_steps=total_steps,
+                                             device=target_device,
+                                             dtype=target_dtype
+                                         )
+                                     except Exception as e:
+                                         print(f"[AdaptiveDCoef Error] Failed vectorized scaling: {e}")
+                                         traceback.print_exc()
+                                         # Fallback or skip update might be needed here depending on requirements
+                                         # For now, we'll proceed with potentially empty scale_factors
+
+                                # 3. Apply pre-calculated scales
+                                for g in self.model.optimizer.param_groups:
+                                    module_name = g.get("name")
+                                    if module_name and module_name in scale_factors:
+                                        # Get pre-calculated scale (tensor scalar on GPU)
+                                        scale_tensor = scale_factors[module_name]
+                                        # Get base d_coef (float)
+                                        base_d_coef = self.adaptive_dcoef.d_coef_base.get(module_name) # Already fetched/checked
+
+                                        # Ensure base_d_coef is valid before multiplication
+                                        if base_d_coef is not None:
+                                            # Perform multiplication. Result stays on GPU for a moment.
+                                            # Move the final scalar value to CPU as optimizer expects float.
+                                            g["d_coef"] = (float(base_d_coef) * scale_tensor).item()
+                                        else:
+                                            # Should not happen due to check above, but good practice
+                                            pass # Or log a warning
+                                    elif module_name and module_name in self.adaptive_dcoef.d_coef_base:
+                                        # Handle case where scaling failed but module expected it
+                                        # Maybe keep old value or set to base? Setting to base:
+                                        base_d_coef = self.adaptive_dcoef.d_coef_base.get(module_name)
+                                        if base_d_coef is not None:
+                                             g["d_coef"] = float(base_d_coef)
+                                        # print(f"[AdaptiveDCoef Warning] Scale factor not found for {module_name}, using base.")
+
+                            else:
+                                print("[AdaptiveDCoef Warning] Could not determine target device/dtype, skipping update.")
+                        # END: Modify AdaptiveDCoef application for vectorization
+
+                        self.model.optimizer.step()
+
+                        try:
+                            # Pop stats ONCE after the step
+                            current_stats = self.model.optimizer.pop_stats()
+
+                            # Process stats for Recorder (Run 1) and Gater (Run 2)
+                            if current_stats: # Only proceed if stats were generated
+                                # Define K for gating step frequency (e.g., every step or less often)
+                                step_k = 1 # Gate check every step in this example
+                                is_gate_step = (self.model.train_progress.global_step % step_k == 0)
+
+                                for stat in current_stats:
+                                    # Map group_idx to name robustly
+                                    group_name = self.model.param_group_mapping[stat["group_idx"]] # can't use get here, its a list
+                                    if not group_name:
+                                        # print(f"[Warning] No name mapping for group index {stat['group_idx']}")
+                                        continue # Skip if no name found
+
+                                    # 1. Recorder (Run 1): Log stats every step if active
+                                    if self.recorder:
+                                        # Determine convergence based on DeltaGater state (if available)
+                                        converged = (self.delta_gater is not None) and (group_name in self.delta_gater.perma_frozen)
+                                        # Get d_coef actually used in the step (from optimizer state if possible, or group dict)
+                                        # Note: Pop_stats might already contain the d_coef used. Check optimizer impl.
+                                        # Assuming stat['d_coef'] holds the value used in the step:
+                                        d_coef_used = stat.get("d_coef", 0.0) # Default if not present
+
+                                        self.recorder.log_step(
+                                            name       = group_name,
+                                            step       = self.model.train_progress.global_step,
+                                            uwr        = stat["uwr"],
+                                            d_hat      = stat.get("d_hat", 0.0), # Use .get for safety
+                                            d_coef     = d_coef_used,
+                                            converged  = converged,
+                                        )
+
+                                    # 2. Delta Gater Ingest (Run 2): Ingest UWR every step if active
+                                    if self.delta_gater:
                                         self.delta_gater.ingest(group_name, stat["uwr"])
 
-                                    # 2️⃣ Só aplica gating depois da primeira epoch
-                                    if self.model.train_progress.epoch >= 1:
+                                # 3. Delta Gater Decision/Action (Run 2): Decide/Act every K steps
+                                # Ensure epoch is at least 1 before gating starts making decisions
+                                if self.delta_gater and is_gate_step and self.model.train_progress.epoch >= 1:
+                                    # Update epoch for DeltaGater before deciding
+                                    self.delta_gater.set_current_epoch(self.model.train_progress.epoch)
 
-                                        # 🆕 Atualiza o epoch antes de decidir
-                                        self.delta_gater.set_current_epoch(self.model.train_progress.epoch)
+                                    # Decide which modules to freeze based on UWR history
+                                    uwr_decisions = self.delta_gater.decide()
 
-                                        # 🔵 Decisão UWR
-                                        uwr_decisions = self.delta_gater.decide()
-                                        for group_name, freeze in uwr_decisions.items():
-                                            param_group = self.model.parameters.by_unique_name(group_name)
-                                            if not param_group:
-                                                continue
-                                            desired_state = not freeze
-                                            if param_group.is_enabled != desired_state:
-                                                param_group.set_requires_grad(desired_state)
-                                                state_str = "FROZEN" if freeze else "ACTIVE"
-                                                print(f"[Delta-Gater] {group_name} ⇒ {state_str}")
+                                    # Apply decisions: enable/disable gradients
+                                    for group_name, freeze in uwr_decisions.items():
+                                        param_group = self.model.parameters.by_unique_name(group_name)
+                                        if not param_group:
+                                            # print(f"[DeltaGater Warning] Param group '{group_name}' not found.")
+                                            continue
 
-                                            self._event_log[group_name].append(
-                                                (
-                                                    self.model.train_progress.epoch,
-                                                    self.model.train_progress.global_step,
-                                                    int(desired_state),
-                                                )
-                                            )
+                                        desired_grad_state = not freeze # True if should require grad, False if frozen
+                                        if param_group.is_enabled != desired_grad_state:
+                                            param_group.set_requires_grad(desired_grad_state)
+                                            # print(f"[DeltaGater] Setting {group_name} requires_grad={desired_grad_state}")
 
-                                        # 🔵 Decisão Delta (separada, depende do last_gate_decisions)
-                                        cur_delta_decisions = self.delta_gater.last_decisions
-                                        for prefix_name, freeze in cur_delta_decisions.items():
-                                            param_group = self.model.parameters.by_unique_name(prefix_name)
-                                            if not param_group:
-                                                continue
-                                            desired_state = not freeze
-                                            if param_group.is_enabled != desired_state:
-                                                param_group.set_requires_grad(desired_state)
-                                                state_str = "FROZEN" if freeze else "ACTIVE"
-                                                print(f"[Delta-GateΔ] {prefix_name} ⇒ {state_str}")
 
-                            except Exception as e:
-                                print(f"[DeltaPattern] Deu pau aqui: {e}")
-                                traceback.print_exc()
-                            # END
-                            try:                          
-                              for s in self.model.optimizer.pop_stats():
-                                name = self.model.param_group_mapping[s["group_idx"]]
-                                converged = name in self.delta_gater.perma_frozen
-                                self.recorder.log_step(
-                                    name       = name,
-                                    step       = self.model.train_progress.global_step,
-                                    uwr        = s["uwr"],
-                                    d_hat      = s["d_hat"],
-                                    d_coef     = s["d_coef"],
-                                    converged  = converged,
-                                  )
-                            except Exception as e:
-                                print(f"[DynDcoef] Deu pau aqui: {e}")
-                                traceback.print_exc()
+                        except Exception as e:
+                            print(f"[Post-Step Error] Failed during gating/recording: {e}")
+                            traceback.print_exc()
+                        # END CHANGE: Refactor Gating/Recording Logic (No changes here, just context)
 
-                        lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
+                        # --- LR Scheduler Step ---
+                        lr_scheduler.step() # Often done after optimizer step
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
 

@@ -386,6 +386,14 @@ class DeltaPatternRegularizer:
         self.last_gate_decisions: Dict[str, bool] = {}
         if self.penalty_metric not in {"mse", "cosine"}:
             raise ValueError("penalty_metric deve ser 'mse' ou 'cosine'")
+        params = [p for p in self.param_collection.parameters() if p is not None]
+        if not params:
+            raise RuntimeError("[DeltaPattern] Nenhum parâmetro em param_collection.")
+        try:
+          sample = params[0]
+          self.device = sample.device
+        except StopIteration:
+          self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")        
 
     def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor, torch.device]]:
         """Iterates through tensors within the state_dicts of relevant LoRA wrappers."""
@@ -420,7 +428,7 @@ class DeltaPatternRegularizer:
         count = 0
         try:
             for key, param, _ in self._iterate_params():
-                self.initial_weights_run1[key] = param.detach().cpu()  # Armazena em CPU
+                self.initial_weights_run1[key] = param.detach().clone().to(self.device)
                 count += 1
         except Exception as e:
             print(f"[DeltaPattern] Erro durante capture_weights: {e}")

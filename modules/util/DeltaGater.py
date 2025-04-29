@@ -83,10 +83,15 @@ class DeltaGater:
                 else:
                     decisions[name] = False
 
-            self.last_decisions = decisions
+            previous_decisions = getattr(self, "last_decisions", {})
+            # 3. Logging compacto APENAS se mudou algo
+            changed = False
+            for name, frozen_now in decisions.items():
+                if previous_decisions.get(name, False) != frozen_now:
+                    changed = True
+                    break
 
-            # 3. Logging compacto
-            if any(decisions.values()):
+            if changed:
                 total_modules = len(medians)
                 frozen_now = sum(1 for v in decisions.values() if v)
                 active_now = total_modules - frozen_now
@@ -95,6 +100,7 @@ class DeltaGater:
                     f"Triggers {frozen_now}/{total_modules} | "
                     f"Active {active_now}/{total_modules}"
                 )
+            self.last_decisions = decisions  # salva agora!                
 
             return decisions
 
