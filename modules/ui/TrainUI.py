@@ -59,6 +59,7 @@ class TrainUI(ctk.CTk):
     embedding_tab_content: ctk.CTkFrame | None = None # Renomeado para evitar conflito com o método
     tabview: ctk.CTkTabview | None = None
     pause_switch_widget: ctk.CTkSwitch | None = None
+    pause_switch_var: ctk.BooleanVar | None = None # Nova variável
 
     def __init__(self):
         super().__init__()
@@ -112,6 +113,7 @@ class TrainUI(ctk.CTk):
         # na estrutura inicial, antes do lazy loading do conteúdo.
         self.change_training_method(self.train_config.training_method)
         # END: Otimização - Chamar change_training_method após UI básica estar pronta
+        self.pause_switch_var = ctk.BooleanVar(self, value=False)
 
     # __close, top_bar, bottom_bar permanecem iguais
     def __close(self):
@@ -388,13 +390,15 @@ class TrainUI(ctk.CTk):
         components.label(frame, row_index, 0, "Pause Training", tooltip="Pause after the current epoch finishes and move model to CPU. Toggle again to resume.")
         # Usa 'pause_training' no ui_state para o valor ON/OFF visual inicial
         # Mas a lógica principal está no command=self.toggle_pause e nos callbacks
-        self.pause_switch_widget = components.switch(
-            frame, row_index, 1, self.ui_state, "pause_training", command=self.toggle_pause
+        self.pause_switch_widget = ctk.CTkSwitch(
+            master=frame,
+            text="",  # O texto está no label separado
+            variable=self.pause_switch_var, # Associa à variável dedicada
+            onvalue=True,
+            offvalue=False,
+            command=self.toggle_pause # O comando permanece o mesmo
         )
-        # Inicializa o estado visual baseado no comando pendente ou estado pausado (se o treino estiver rodando)
-        self._update_pause_switch_initial_state()
-        row_index += 1
-        # --- FIM DA NOVA LINHA ---        
+        self.pause_switch_widget.grid(row=row_index, column=1, padx=(0, 20), pady=5, sticky="w")     
 
         frame.pack(fill="both", expand=True)
         return frame # Retorna o frame criado
@@ -441,50 +445,41 @@ class TrainUI(ctk.CTk):
              print("[UI Init] No pending requests, setting switch OFF and NORMAL.")
 
 
+    # Em TrainUI.toggle_pause
     def toggle_pause(self):
         """Chamado quando o switch de pausa é clicado."""
         if not self.training_commands:
             print("[UI] Cannot pause/resume: Not training.")
             # Reverte visualmente o switch se não estiver treinando
-            if self.pause_switch_widget:
-                is_checked_visual = self.pause_switch_widget.get() == 1
-                if is_checked_visual: self.pause_switch_widget.deselect()
-                else: self.pause_switch_widget.select()
-                self.ui_state["pause_training"] = not is_checked_visual # Atualiza estado lógico
+            # Lê o valor ATUAL da variável antes de reverter
+            current_val = self.pause_switch_var.get()
+            self.pause_switch_var.set(not current_val) # Inverte o valor na variável
             return
 
-        is_checked = self.ui_state.get("pause_training", False) # Estado LÓGICO desejado pelo clique
-        print(f"[UI] Toggle Pause clicked. Desired state (checked={is_checked}).")
+        # Obtém o estado DESEJADO pelo clique (o valor que a variável terá APÓS o clique)
+        # A variável já foi atualizada pelo clique antes do comando ser chamado
+        is_checked = self.pause_switch_var.get()
+        print(f"[UI] Toggle Pause clicked. Switch variable is now: {is_checked}")
 
-        if is_checked: # Usuário quer PAUSAR (clicou para ON)
+        if is_checked: # Usuário quer PAUSAR (variável agora é True)
             print("[UI] Requesting pause...")
             success = self.training_commands.request_pause()
             if success:
                 print("[UI] Pause request sent successfully. Waiting for trainer confirmation (callback).")
                 # O callback handle_pause_request_accepted vai desabilitar o switch
             else:
-                print("[UI] Pause request rejected by commands (likely already pending/paused or resume pending). Reverting switch.")
-                # Reverte o estado visual e lógico do switch
-                if self.pause_switch_widget:
-                    self.pause_switch_widget.deselect()
-                self.ui_state["pause_training"] = False
-        else: # Usuário quer RETOMAR (clicou para OFF)
+                print("[UI] Pause request rejected by commands. Reverting switch variable.")
+                # Reverte o estado da variável Tkinter
+                self.pause_switch_var.set(False)
+        else: # Usuário quer RETOMAR (variável agora é False)
             print("[UI] Requesting resume...")
             success = self.training_commands.request_resume()
             if success:
                 print("[UI] Resume request sent successfully. Waiting for trainer confirmation (callback).")
-                # O callback handle_resume_completed vai garantir que o switch fique OFF e enabled
-                # Podemos desabilitar temporariamente se quisermos feedback imediato
-                # if self.pause_switch_widget:
-                #     self.pause_switch_widget.configure(state="disabled")
             else:
-                print("[UI] Resume request rejected by commands (likely not paused or pause pending). Reverting switch.")
-                # Reverte o estado visual e lógico do switch
-                if self.pause_switch_widget:
-                    self.pause_switch_widget.select()
-                self.ui_state["pause_training"] = True
-
-    # --- Métodos Handler para Callbacks (Serão chamados pela thread do Trainer) ---
+                print("[UI] Resume request rejected by commands. Reverting switch variable.")
+                # Reverte o estado da variável Tkinter
+                self.pause_switch_var.set(True)
 
     def handle_pause_request_accepted_threadsafe(self):
         print("[UI Callback Thread] Pause request accepted by trainer.")
@@ -503,34 +498,33 @@ class TrainUI(ctk.CTk):
         self.after(0, self._handle_resume_completed_ui)
 
     # --- Métodos que rodam na thread da UI (Chamados via self.after) ---
-
+    # Em TrainUI._handle_pause_request_accepted_ui
     def _handle_pause_request_accepted_ui(self):
         print("[UI Thread] Updating UI for pause request accepted: Switch ON, DISABLED.")
         if self.pause_switch_widget:
-            self.ui_state["pause_training"] = True # Confirma estado lógico
-            self.pause_switch_widget.select() # Garante visual ON
+            self.pause_switch_var.set(True) # Confirma estado lógico/visual ON
             self.pause_switch_widget.configure(state="disabled") # Trava
 
+    # Em TrainUI._handle_pause_initiated_ui
     def _handle_pause_initiated_ui(self):
         print("[UI Thread] Updating UI for pause initiated: Switch ON, NORMAL (can resume).")
         if self.pause_switch_widget:
-            self.ui_state["pause_training"] = True # Continua ON (está pausado)
-            self.pause_switch_widget.select() # Garante visual ON
+            self.pause_switch_var.set(True) # Continua ON (está pausado)
             self.pause_switch_widget.configure(state="normal") # Libera para clicar e retomar
 
+    # Em TrainUI._handle_resume_started_ui
     def _handle_resume_started_ui(self):
         print("[UI Thread] Updating UI for resume started: Switch OFF, DISABLED (optional).")
         if self.pause_switch_widget:
-            self.ui_state["pause_training"] = False # Estado lógico vai pra OFF
-            self.pause_switch_widget.deselect() # Garante visual OFF
+            self.pause_switch_var.set(False) # Estado lógico/visual vai pra OFF
             # Opcional: desabilitar enquanto move de volta pra GPU
             # self.pause_switch_widget.configure(state="disabled")
 
+    # Em TrainUI._handle_resume_completed_ui
     def _handle_resume_completed_ui(self):
         print("[UI Thread] Updating UI for resume completed: Switch OFF, NORMAL.")
         if self.pause_switch_widget:
-            self.ui_state["pause_training"] = False # Garante estado lógico OFF
-            self.pause_switch_widget.deselect() # Garante visual OFF
+            self.pause_switch_var.set(False) # Garante estado lógico/visual OFF
             self.pause_switch_widget.configure(state="normal") # Garante habilitado
 
     def lora_tab(self, master) -> LoraTab: # Note: Renomeado de create_lora_tab se necessário
@@ -779,8 +773,7 @@ class TrainUI(ctk.CTk):
 
         # Reseta o switch de pausa para OFF e NORMAL
         if self.pause_switch_widget:
-            self.ui_state["pause_training"] = False
-            self.pause_switch_widget.deselect()
+            self.pause_switch_var.set(False)
             self.pause_switch_widget.configure(state="normal")
 
         # Reseta os comandos AQUI para garantir que não haja comandos pendentes após parada/erro
