@@ -12,7 +12,7 @@ from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from modules.util.TensorBoardManager import TensorBoardManager
 
-from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
+from modules.sangoi.DynamicLossStrength import DeltaPatternRegularizer
 
 
 class BaseModelSetup(

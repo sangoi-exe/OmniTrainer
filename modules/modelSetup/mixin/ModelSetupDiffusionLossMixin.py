@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 
 from modules.util.TensorBoardManager import TensorBoardManager
-from modules.util.loss.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
+from modules.sangoi.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
 
 class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     __coefficients: DiffusionScheduleCoefficients | None

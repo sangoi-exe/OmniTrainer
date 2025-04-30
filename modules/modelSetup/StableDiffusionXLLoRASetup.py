@@ -202,55 +202,92 @@ class StableDiffusionXLLoRASetup(
         model.parameters = parameter_collection
 
         # testar esse mamute do gemini, cheio de verificações e etc
-        from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
+        # START: Modificação solicitada - Refined DeltaPatternRegularizer initialization
+        from modules.sangoi.DynamicLossStrength import DeltaPatternRegularizer
+        import torch # Ensure torch is imported
+
+        # Garante que deltas é None por padrão
+        model.deltas = None
 
         if config.delta_pattern_use_it or config.delta_pattern_save_it:
-            print("[DeltaPattern] Inicializando os deltas...")
+            print("[DeltaPattern] Tentando inicializar DeltaPatternRegularizer...")
             try:
+                # A coleção de parâmetros AGORA existe e foi atribuída
                 param_collection = getattr(model, "parameters", None)
-                if param_collection is None:
-                    raise ValueError("Coleção de parâmetros (model.parameters) não encontrada para DeltaPattern.")
-
-                print("[DeltaPattern] Inicializando DeltaPatternRegularizer...")
-                # Atribui a instância ao modelo
-                model.deltas = DeltaPatternRegularizer(model, param_collection)
-
-                if config.delta_pattern_save_it:
-                    print("[DeltaPattern] Capturando pesos iniciais para salvar (Run 1)...")
-                    model.deltas.capture_weights()
-
-                if config.delta_pattern_use_it:
-                    if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
-                        print(f"[DeltaPattern] Carregando padrão de referência de: {config.delta_pattern_path}")
-                        # Passa device/dtype corretos
-                        train_dtype_torch = getattr(model, "train_dtype", None)  # Tenta pegar do modelo
-                        if train_dtype_torch is None:
-                            train_dtype_torch = config.train_dtype  # Fallback para config
-                        model.deltas.load_reference_pattern(
-                            config.delta_pattern_path, self.train_device, train_dtype_torch.torch_dtype()
-                        )
-                        if model.deltas.reference_deltas:  # Checa se carregou
-                            print("[DeltaPattern] Capturando pesos iniciais para cálculo de penalidade (Run 2)...")
-                            model.deltas.capture_initial_weights_run2()
-                        else:
-                            print(
-                                f"[DeltaPattern] Aviso: Falha ao carregar padrão de delta de '{config.delta_pattern_path}'. Penalidade desativada."
-                            )
-                            config.delta_pattern_use_it = False  # Desativa
+                if param_collection is None or not isinstance(param_collection, NamedParameterGroupCollection):
+                     raise ValueError("Coleção de parâmetros (model.parameters) inválida ou não encontrada para DeltaPattern.")
+                if not list(param_collection.parameters()):
+                    print("[DeltaPattern] Aviso: Coleção de parâmetros está vazia. DeltaPattern não será inicializado.")
+                else:
+                    # Determina o cache_device (GPU preferencialmente)
+                    # Tenta usar o train_device se disponível, senão o device do primeiro parâmetro
+                    if hasattr(self, 'train_device'):
+                        cache_dev = self.train_device
                     else:
-                        print(
-                            f"[DeltaPattern] Aviso: 'delta_pattern_use_it' True, mas caminho '{config.delta_pattern_path}' inválido. Penalidade desativada."
-                        )
-                        config.delta_pattern_use_it = False  # Desativa
+                        first_param = next(iter(param_collection.parameters()), None)
+                        if first_param is not None:
+                             cache_dev = first_param.device
+                        else:
+                             # Fallback para CPU se nenhum parâmetro foi encontrado (improvável aqui)
+                             print("[DeltaPattern] Aviso: Não foi possível determinar o device dos parâmetros. Usando CPU para cache.")
+                             cache_dev = torch.device("cpu")
+                    print(f"[DeltaPattern] Usando device '{cache_dev}' para cache interno.")
 
-                print("[DeltaPattern] DeltaPatternRegularizer inicializado.")
+                    # Atribui a instância ao modelo
+                    model.deltas = DeltaPatternRegularizer(
+                        model=model, # Passa a instância do modelo completa
+                        param_collection=param_collection, # Passa a coleção de parâmetros
+                        penalty_metric=getattr(config, "delta_pattern_metric", "cosine"), # Usa config ou default
+                        cache_device=cache_dev # Passa o device de cache determinado
+                    )
+                    print("[DeltaPattern] DeltaPatternRegularizer instanciado.")
+                    print(f"[Trainer Setup] DeltaPattern cache_device: {model.deltas.cache_device}")
+                    print(f"[Trainer Setup] Trainer train_device: {self.train_device}")
+                    if model.deltas.cache_device != self.train_device:
+                        print("[Trainer Setup] ALERTA! DeltaPattern cache_device é diferente do train_device!")                    
+
+                    if config.delta_pattern_save_it:
+                        print("[DeltaPattern] Capturando pesos iniciais para salvar (Run 1)...")
+                        model.deltas.capture_weights() # Usa o cache_device interno
+
+                    if config.delta_pattern_use_it:
+                        delta_path = getattr(config, "delta_pattern_path", None)
+                        if delta_path and os.path.exists(delta_path):
+                            print(f"[DeltaPattern] Carregando padrão de referência de: {delta_path}")
+                            # Determina device/dtype de treino para carregar o padrão corretamente
+                            train_dtype_torch = config.train_dtype.torch_dtype() # Pega do config
+                            train_dev = self.train_device # Usa o train_device da classe setup
+
+                            model.deltas.load_reference_pattern(
+                                delta_path,
+                                train_device=train_dev,    # Device de treino explícito
+                                train_dtype=train_dtype_torch # Dtype de treino explícito
+                            )
+                            if model.deltas.reference_deltas:  # Checa se carregou
+                                print("[DeltaPattern] Capturando pesos iniciais para cálculo de penalidade (Run 2)...")
+                                model.deltas.capture_initial_weights_run2() # Usa o cache_device interno
+                            else:
+                                print(f"[DeltaPattern] Aviso: Falha ao carregar padrão de delta de '{delta_path}'. Penalidade desativada.")
+                                config.delta_pattern_use_it = False  # Desativa
+                        else:
+                            print(f"[DeltaPattern] Aviso: 'delta_pattern_use_it' True, mas caminho '{delta_path}' inválido ou não especificado. Penalidade desativada.")
+                            config.delta_pattern_use_it = False  # Desativa
+
+                    print("[DeltaPattern] Configuração do DeltaPatternRegularizer concluída.")
 
             except Exception as e:
-                print(f"[DeltaPattern] Falha ao inicializar DeltaPatternRegularizer: {e}")
+                print(f"[DeltaPattern] Falha CRÍTICA ao inicializar DeltaPatternRegularizer: {e}")
                 traceback.print_exc()
                 model.deltas = None  # Garante None se falhar
+                config.delta_pattern_use_it = False # Desativa a funcionalidade se a inicialização falhar
         else:
-            model.deltas = None  # Garante None se não for usado
+            print("[DeltaPattern] DeltaPatternRegularizer não será usado (configurações desativadas).")
+            model.deltas = None # Garante None se não for usado
+        # END: Modificação solicitada - Refined DeltaPatternRegularizer initialization
+
+        # # Código original comentado para referência
+        # model.deltas = DeltaPatternRegularizer(model, model.parameters)
+        # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
 
         # model.deltas = DeltaPatternRegularizer(model, model.parameters)
         # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)

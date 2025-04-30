@@ -2,16 +2,12 @@ import collections
 import json
 import traceback
 import os
-import time
-import warnings
 import torch
 from torch import Tensor
 from collections import deque
-from safetensors.torch import load_file
 
 from typing import Iterable, Tuple, List, Dict, Union, Optional, TYPE_CHECKING
 
-from modules.util.NamedParameterGroup import NamedParameterGroup
 from modules.util.TensorBoardManager import TensorBoardManager
 
 if TYPE_CHECKING:
@@ -343,9 +339,7 @@ class DeltaPatternRegularizer:
         model: torch.nn.Module,
         param_collection: "NamedParameterGroupCollection",
         penalty_metric: str = "cosine",
-        gate_window:    int   = 20,
-        gate_z_thresh:  float = 1.5,
-        gate_cool_down: int   = 3,
+        cache_device: torch.device | None = None,
     ):
         if param_collection is None:
             raise ValueError(
@@ -354,6 +348,23 @@ class DeltaPatternRegularizer:
         self.model = model
         self.tensorboard = model.tensorboard
         self.param_collection: "NamedParameterGroupCollection" = param_collection
+        # --- START: caching de parâmetros para iteração rápida (evita state_dict por step) ---
+        from typing import List, Tuple
+        self._param_tuples: List[Tuple[str, torch.Tensor, torch.device]] = []
+        wrappers_to_cache = [getattr(self.model, "unet_lora", None)]
+        for wrapper in wrappers_to_cache:
+            if wrapper is None:
+                continue
+            try:
+                wrapper_state_dict = wrapper.state_dict()
+                for key, tensor in wrapper_state_dict.items():
+                    if isinstance(tensor, torch.Tensor):
+                        # detach view (sem clone) — compartilha a mesma memória
+                        self._param_tuples.append((key, tensor.detach(), tensor.device))
+            except Exception as e:
+                print(f"[DeltaPattern] Erro ao cachear parâmetros de {wrapper}: {e}")
+                traceback.print_exc()
+        # --- END: caching de parâmetros para iteração rápida ---        
         self.delta_log_by_module: Dict[str, Dict[str, float]] = {}
         self.initial_weights_run1: Dict[str, torch.Tensor] = (
             {}
@@ -374,66 +385,50 @@ class DeltaPatternRegularizer:
         self._delta_cache_by_prefix: dict[str, torch.Tensor] = {}
         self._ref_index: list[tuple[str, str]] = []
         
-        # ---- GATING POR DELTA (frear layers afobadas) --------------
-        self.gate_window    = gate_window
-        self.gate_z_thresh  = gate_z_thresh
-        self.gate_cool_down = gate_cool_down
-
-        self._delta_buf   : Dict[str, collections.deque[float]] = collections.defaultdict(
-            lambda: collections.deque(maxlen=self.gate_window)
-        )
-        self._frozen_epochs: Dict[str, int] = collections.defaultdict(int)
-        self.last_gate_decisions: Dict[str, bool] = {}
         if self.penalty_metric not in {"mse", "cosine"}:
             raise ValueError("penalty_metric deve ser 'mse' ou 'cosine'")
         params = [p for p in self.param_collection.parameters() if p is not None]
         if not params:
             raise RuntimeError("[DeltaPattern] Nenhum parâmetro em param_collection.")
-        try:
-          sample = params[0]
-          self.device = sample.device
-        except StopIteration:
-          self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")        
+        if cache_device is not None:
+            self.cache_device = cache_device
+        else:
+            # START: Modificação solicitada - Fallback cache_device logic refinement
+            # Get parameters again specifically for device check
+            params_for_device = [p for p in param_collection.parameters() if p is not None]
+            if not params_for_device:
+                 print("[DeltaPattern] Aviso: Nenhum parâmetro válido encontrado para determinar device. Usando CPU para cache.")
+                 self.cache_device = torch.device("cpu")
+            else:
+                 # Use the device of the first parameter found
+                 self.cache_device = params_for_device[0].device
+                 print(f"[DeltaPattern] Cache device não especificado, usando device do primeiro parâmetro: {self.cache_device}")
+            # END: Modificação solicitada - Fallback cache_device logic refinement
 
     def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor, torch.device]]:
-        """Iterates through tensors within the state_dicts of relevant LoRA wrappers."""
-        wrappers_to_check = [
-            getattr(self.model, "unet_lora", None),
-        ]
-        processed_keys = (
-            set()
-        )  # Evita processar a mesma chave de diferentes wrappers (improvável mas seguro)
-
-        for wrapper in wrappers_to_check:
-            if wrapper is None:
-                continue
-            try:
-                # state_dict() do wrapper deve retornar chaves de módulos reais/dummies
-                wrapper_state_dict = wrapper.state_dict()
-                for key, tensor in wrapper_state_dict.items():
-                    # Verifica se é um tensor e ainda não foi processado
-                    if isinstance(tensor, torch.Tensor) and key not in processed_keys:
-                        # Assume que todos os tensores no state_dict são relevantes
-                        # Retorna tensor destacado (detach) para evitar problemas de grafo
-                        yield key, tensor.detach(), tensor.device
-                        processed_keys.add(key)
-            except Exception as e:
-                print(
-                    f"[DeltaPattern] Erro ao iterar state_dict para wrapper {getattr(wrapper, 'prefix', 'Unknown')}: {e}"
-                )
+        """
+        Itera pelos tensores LoRA no UNet usando o cache populado no __init__,
+        evitando o state_dict() e detach() a cada chamada.
+        """
+        for key, tensor, device in self._param_tuples:
+            yield key, tensor, device
 
     def capture_weights(self):
         """Captura os pesos iniciais (usado no início da Run 1) e armazena em CPU."""
         self.initial_weights_run1 = {}  # Limpa antes de capturar
         count = 0
+        # START: Modificação solicitada - Ensure initial weights use cache_device
+        capture_device = self.cache_device # Use the designated cache device
+        print(f"[DeltaPattern] capture_weights (Run 1) usando device: {capture_device}")
+        # END: Modificação solicitada - Ensure initial weights use cache_device
         try:
             for key, param, _ in self._iterate_params():
-                self.initial_weights_run1[key] = param.detach().clone().to(self.device)
+                # START: Modificação solicitada - Clone to cache_device
+                self.initial_weights_run1[key] = param.detach().clone().to(capture_device)
+                # END: Modificação solicitada - Clone to cache_device
                 count += 1
         except Exception as e:
             print(f"[DeltaPattern] Erro durante capture_weights: {e}")
-            traceback.print_exc()
-            raise  # Re-levanta a exceção para indicar falha
 
         if count == 0:
             print("[DeltaPattern] capture_weights não encontrou parâmetros treináveis.")
@@ -453,16 +448,22 @@ class DeltaPatternRegularizer:
         """
         self.initial_weights_run2 = {}
         count = 0
+        # START: Modificação solicitada - Ensure initial weights (run2) use cache_device
+        capture_device = self.cache_device # Use the designated cache device
+        print(f"[DeltaPattern] capture_initial_weights_run2 (Run 2) usando device: {capture_device}")
+        # END: Modificação solicitada - Ensure initial weights (run2) use cache_device
 
         try:
             for key, param, _ in self._iterate_params():
-                # clone + detach no mesmo device/dtype
-                self.initial_weights_run2[key] = param.detach().clone()
+                # START: Modificação solicitada - Clone to cache_device
+                # clone + detach no mesmo device/dtype original, THEN move to cache_device
+                # self.initial_weights_run2[key] = param.detach().clone().to(capture_device, non_blocking=True) # Original might change dtype
+                original_dtype = param.dtype
+                self.initial_weights_run2[key] = param.detach().clone().to(device=capture_device, dtype=original_dtype, non_blocking=True)
+                # END: Modificação solicitada - Clone to cache_device
                 count += 1
         except Exception as e:
             print(f"[DeltaPattern] Erro durante capture_initial_weights_run2: {e}")
-            traceback.print_exc()
-            raise
 
         if count == 0:
             print("[DeltaPattern] capture_initial_weights_run2 não encontrou parâmetros treináveis.")
@@ -471,8 +472,8 @@ class DeltaPatternRegularizer:
 
         # Vetor de snapshot inicial para vectorização
         self.init_vec = torch.nn.utils.parameters_to_vector(
-            [p for p in self.param_collection.parameters() if p is not None]
-        ).detach().clone()
+            [p.detach() for p in self.param_collection.parameters() if p is not None]
+        ).to(self.cache_device, non_blocking=True)
 
     def load_reference_pattern(
         self,
@@ -485,7 +486,12 @@ class DeltaPatternRegularizer:
         device/dtype de treino e monta `self.ref_vec`.
         """
         if not os.path.isfile(pattern_path):
-            print(f"[DeltaPattern] Arquivo JSON não encontrado: {pattern_path}")
+            print(f"[DeltaPattern] Arquivo JSON de padrão não encontrado: {pattern_path}")
+            # START: Modificação solicitada - Ensure reference_deltas is empty if file not found
+            self.reference_deltas = {}
+            self.ref_vec = None
+            self.reference_delta_norm = None
+            # END: Modificação solicitada - Ensure reference_deltas is empty if file not found
             return
 
         try:
@@ -508,11 +514,27 @@ class DeltaPatternRegularizer:
                 print("[DeltaPattern] JSON estava vazio ou mal formatado.")
                 return
 
-            dev  = train_device or torch.device("cpu")
             dtyp = train_dtype  or torch.float32
 
             # vetor único de referência
-            self.ref_vec = torch.tensor(flat_list, device=dev, dtype=dtyp).view(-1)
+            target_dev  = train_device or self.cache_device
+            self.ref_vec = torch.tensor(flat_list, device=target_dev,
+                                        dtype=dtyp).view(-1).detach() 
+
+            # START: Modificação solicitada - Ensure device/dtype are valid before use
+            if not isinstance(train_device, torch.device):
+                 raise ValueError(f"train_device inválido: {train_device}")
+            if not isinstance(train_dtype, torch.dtype):
+                 raise ValueError(f"train_dtype inválido: {train_dtype}")
+
+            target_dev  = train_device # Use explicitly passed train_device
+            target_dtype = train_dtype # Use explicitly passed train_dtype
+            print(f"[DeltaPattern] Carregando vetor de referência para device: {target_dev}, dtype: {target_dtype}")
+
+            # Vetor único de referência, convertido para device/dtype de treino
+            self.ref_vec = torch.tensor(flat_list, device=target_dev,
+                                        dtype=target_dtype).view(-1).detach()
+            # END: Modificação solicitada - Ensure device/dtype are valid before use
             self.reference_delta_norm = torch.norm(self.ref_vec, p=2).item()
 
             # metadados
@@ -536,39 +558,42 @@ class DeltaPatternRegularizer:
         Compara o delta atual (run 2) vs. delta de referência (run 1)
         de forma vetorizada, sem skips nem atualizações condicionais.
         """
-        params = [p for p in self.param_collection.parameters() if p is not None]
-        if not params:
-            raise RuntimeError("[DeltaPattern] Nenhum parâmetro em param_collection.")
-        sample = params[0]
-        device, dtype = sample.device, sample.dtype
+        try:
+            dtype = next(iter(self.param_collection.parameters())).dtype
+            device = self.cache_device
+         
+            # precisa ter referência carregada
+            if not self.reference_deltas or not self._ref_index:
+                return torch.tensor(0.0, device=self.cache_device)
 
-        # precisa ter referência carregada
-        if not self.reference_deltas or not self._ref_index:
-            return torch.tensor(0.0, device=device, dtype=dtype)
+            # 1) deltas atuais agrupados por prefixo (mantém gradientes)
+            cur_prefix_norms = self._get_current_module_deltas(device, dtype)
 
-        # 1) deltas atuais agrupados por prefixo (mantém gradientes)
-        cur_prefix_norms = self._get_current_module_deltas(device, dtype)
+            # 2) monta vetor na MESMA ordem do vetor de referência
+            cur_vec = torch.stack([
+                cur_prefix_norms.get(prefix, torch.tensor(0.0, device=self.cache_device))
+                for _, prefix in self._ref_index
+            ]).view(-1)
 
-        # 2) monta vetor na MESMA ordem do vetor de referência
-        cur_vec = torch.stack([
-            cur_prefix_norms.get(prefix, torch.tensor(0.0, device=device, dtype=dtype))
-            for _, prefix in self._ref_index
-        ]).view(-1)
+            # 3) vetor de referência já construído em load_reference_pattern
+            ref_vec = self.ref_vec 
 
-        # 3) vetor de referência já construído em load_reference_pattern
-        ref_vec = self.ref_vec.to(device=device, dtype=dtype).view(-1)
+            # cálculo da penalidade segue igual
+            if self.penalty_metric == "cosine":
+                penalty_val = 1.0 - torch.nn.functional.cosine_similarity(
+                    cur_vec, ref_vec, dim=0, eps=1e-8
+                )
+            else:  # "mse"
+                penalty_val = torch.mean((cur_vec - ref_vec) ** 2)
 
-        # cálculo da penalidade segue igual
-        if self.penalty_metric == "cosine":
-            penalty_val = 1.0 - torch.nn.functional.cosine_similarity(
-                cur_vec, ref_vec, dim=0, eps=1e-8
-            )
-        else:  # "mse"
-            penalty_val = torch.mean((cur_vec - ref_vec) ** 2)
+            # cache opcional para monitoramento externo
+            self.current_total_delta_norm = torch.norm(cur_vec, p=2).item()
+            return lambda_weight * penalty_val
 
-        # cache opcional para monitoramento externo
-        self.current_total_delta_norm = torch.norm(cur_vec, p=2).item()
-        return lambda_weight * penalty_val
+        except Exception as e:
+            print(f"[DeltaPattern] Erro em compute_penalty: {e}")
+            traceback.print_exc()
+            return torch.tensor(0.0, device=self.cache_device)
 
     def _calculate_total_norm(
         self, weight_dict: Dict[str, Tensor], device: torch.device = torch.device("cpu")
@@ -597,55 +622,57 @@ class DeltaPatternRegularizer:
         Salva norma L2 do delta para cada grupo (agrupados por prefixo simples) no epoch atual.
         Usa self.initial_weights_run1 como base.
         """
-        if not self.initial_weights_run1:
-            print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
-            return
-        epoch_key = f"epoch_{epoch}"
-        group_norms: Dict[str, float] = {}
-        param_counts: Dict[str, int] = {}
-        
-        self.delta_log_by_module[epoch_key] = {}
+        try:
+            if not self.initial_weights_run1:
+                print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
+                return
+            epoch_key = f"epoch_{epoch}"
+            group_norms: Dict[str, float] = {}
+            param_counts: Dict[str, int] = {}
+            
+            self.delta_log_by_module[epoch_key] = {}
 
-        for name, current_param, _ in self._iterate_params():
-            if name not in self.initial_weights_run1:
-                continue
+            for name, current_param, _ in self._iterate_params():
+                if name not in self.initial_weights_run1:
+                    continue
 
-            initial_weight = self.initial_weights_run1[name].to(
-                dtype=torch.float32, device=current_param.device
-            )
-            delta = current_param.detach().to(dtype=torch.float32) - initial_weight
+                initial_weight = self.initial_weights_run1[name].to(dtype=torch.float32)
+                delta = current_param.detach().to(dtype=torch.float32) - initial_weight
 
-            # Define o prefixo de agrupamento (ajuste aqui para granularidade desejada)
-            prefix = name.split(".")[
-                0
-            ]
+                # Define o prefixo de agrupamento (ajuste aqui para granularidade desejada)
+                prefix = name.split(".")[0]
 
-            group_norms.setdefault(prefix, 0.0)
-            param_counts.setdefault(prefix, 0)
+                group_norms.setdefault(prefix, 0.0)
+                param_counts.setdefault(prefix, 0)
 
-            group_norms[prefix] += torch.norm(delta, p=2).pow(2).item()
-            param_counts[prefix] += 1
+                group_norms[prefix] += torch.norm(delta, p=2).pow(2).item()
+                param_counts[prefix] += 1
 
-        for prefix, norm_sq in group_norms.items():
-            count = param_counts[prefix]
-            delta_norm = norm_sq**0.5 if count > 0 else 0.0
-            self.delta_log_by_module[epoch_key][prefix] = delta_norm
+            for prefix, norm_sq in group_norms.items():
+                count = param_counts[prefix]
+                delta_norm = norm_sq**0.5 if count > 0 else 0.0
+                self.delta_log_by_module[epoch_key][prefix] = delta_norm
 
-        print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
+            print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
+
+        except Exception as e:
+            print(f"[DeltaPattern] Erro em log_group_deltas: {e}")
+            traceback.print_exc()
 
     def save_group_deltas(
         self, path: str = "./training_pattern/delta_log_by_module.json"
     ):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.delta_log_by_module, f, indent=2)
-        print(f"[DeltaPattern] Delta por grupo salvo em {path}")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(self.delta_log_by_module, f, indent=2)
+            print(f"[DeltaPattern] Delta por grupo salvo em {path}")
 
-    def _get_current_module_deltas(
-        self,
-        target_device: torch.device,
-        target_dtype : torch.dtype,
-    ) -> dict[str, torch.Tensor]:
+        except Exception as e:
+            print(f"[DeltaPattern] Erro em save_group_deltas: {e}")
+            traceback.print_exc()
+
+    def _get_current_module_deltas(self, target_device, target_dtype) -> dict[str, torch.Tensor]:
         """
         Retorna {prefixo: escalar_norma_L2_delta} para TODOS os prefixos presentes
         no wrapper LoRA do UNet.  Mantém gradiente.
@@ -659,24 +686,40 @@ class DeltaPatternRegularizer:
 
         # Acumula soma dos quadrados por prefixo
         l2_sq_by_prefix: dict[str, torch.Tensor] = {}
+        if not self.initial_weights_run2:
+             print("[DeltaPattern][_get_current_module_deltas] Aviso: Pesos iniciais da Run 2 não capturados.")
+             return {}
+        # END: Modificação solicitada - Use target_device for calculations involving current params
+        try:
+            for name, cur_param, _ in self._iterate_params():
+                if name not in self.initial_weights_run2:
+                    continue # Skip params not present in initial snapshot
 
-        for name, cur_param, _ in self._iterate_params():
-            if name not in self.initial_weights_run2:          # peso não existia no snapshot
-                continue
+                prefix = name.split('.', 1)[0]
+                # START: Modificação solicitada - Ensure initial weight is on correct device/dtype for subtraction
+                # Move initial weight (cached) to current param's device/dtype for subtraction
+                init_w = self.initial_weights_run2[name].to(device=cur_param.device, dtype=cur_param.dtype)
 
-            prefix   = name.split('.', 1)[0]                   # mesmo recorte usado no JSON
-            init_w   = self.initial_weights_run2[name].to(
-                device=target_device, dtype=target_dtype, non_blocking=True
-            )
+                # Calculate delta on the parameter's device, maintaining grad
+                # Cast to float32 for stable norm calculation, but keep on original device
+                delta = (cur_param - init_w).to(torch.float32)
+                # END: Modificação solicitada - Ensure initial weight is on correct device/dtype for subtraction
+                delta_sq = delta.pow(2).sum() # Sum on the current device
 
-            delta    = (cur_param.to(dtype=target_dtype) - init_w).float()
-            delta_sq = delta.pow(2).sum()                      # escalar
+                if prefix in l2_sq_by_prefix:
+                    l2_sq_by_prefix[prefix] = l2_sq_by_prefix[prefix] + delta_sq
+                else:
+                    l2_sq_by_prefix[prefix] = delta_sq
 
-            # soma incremental da L2‑norm²
-            if prefix in l2_sq_by_prefix:
-                l2_sq_by_prefix[prefix] = l2_sq_by_prefix[prefix] + delta_sq
-            else:
-                l2_sq_by_prefix[prefix] = delta_sq
+            # START: Modificação solicitada - Calculate sqrt on the final target device
+            # Calculate final sqrt on the target_device passed to the function
+            final_norms = {
+                 pfx: torch.sqrt(val.to(device=target_device, dtype=target_dtype))
+                 for pfx, val in l2_sq_by_prefix.items()
+             }
+            return final_norms
+            # END: Modificação solicitada - Calculate sqrt on the final target device
 
-        # Raiz para obter norma L2 final por prefixo
-        return {pfx: torch.sqrt(val) for pfx, val in l2_sq_by_prefix.items()}
+        except Exception as e:
+            print(f"[DeltaPattern] Erro em _get_current_module_deltas: {e}")
+

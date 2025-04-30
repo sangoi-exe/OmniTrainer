@@ -1,8 +1,5 @@
-### START AdaptiveDCoef.py #################################################
 import math
-# START: Import torch
 import torch
-# END: Import torch
 import gzip
 import json
 
@@ -17,34 +14,63 @@ class AdaptiveDCoef:
 
     Modificado para suportar cálculos vetorizados em GPU com torch.
     """
-    def __init__(self, profile_path: str,
-                 gamma: float = 2.0, alpha: float = 1.0, min_scale: float = 1e-3):
-        import gzip, json, math
+    def __init__(self,
+                 profile_path: str,
+                 gamma: float = 2.0,
+                 alpha: float = 1.0,
+                 min_scale: float = 1e-3,
+                 debug: bool = True,
+                 verbose: bool = True):
+        import gzip, json  # Keep local imports if preferred style
+        import os
+        if not os.path.isfile(profile_path):
+            raise FileNotFoundError(f"AdaptiveDCoef profile not found at: {profile_path}")
+
         with gzip.open(profile_path, "rt", encoding="utf-8") as f:
             p = json.load(f)
         # essas chaves vêm do dump() do ModuleDynRecorder
         self.conv_step    = {k: int(v) for k, v in p.get("conv_step", {}).items()}
         self.d_hat_final  = p.get("d_hat_final", {})      # caso queira usar depois
-        self.d_coef_base  = {k: float(v) for k, v in p.get("d_coef_base", {}).items()} # Store as float
+        self.d_coef_base  = {k: float(v) for k, v in p.get("d_coef_base", {}).items()}
+
         self.gam          = gamma
         self.alpha        = alpha
         self.min_scale    = min_scale
-        # START: Remove math.pi, use torch.pi
-        # self.pi           = math.pi
-        # END: Remove math.pi, use torch.pi
+
+        self.debug       = debug
+        self.verbose     = verbose
 
     def scale(self, name: str, step: int, total_steps: int) -> float:
         """ Método original (CPU) - mantido para referência ou fallback. """
+        import math  # Local import for math fallback
+
+        # --- START: debug entry log ---
+        if self.debug:
+            cs = self.conv_step.get(name, total_steps)
+            print(f"[AdaptiveDCoef][DEBUG] scale() name={name}, step={step}, total_steps={total_steps}, conv_step={cs}")
+        # --- END: debug entry log ---
+
         # pega t0 = passo em que esse módulo convergiu (ou total_steps)
         t0 = self.conv_step.get(name, total_steps) * self.alpha
         # normaliza em [0,1]
-        # Ensure denominator is not zero, minimum 1
         denominator = max(1.0, float(total_steps) - t0)
         x = (float(step) - t0) / denominator
-        x = min(max(x, 0.0), 1.0) # Clamp between 0 and 1
+        x = min(max(x, 0.0), 1.0)  # Clamp between 0 and 1
         # cosine fall-off de 1→0
         s = 0.5 * (1 + math.cos(math.pi * x))
-        return max(self.min_scale, s ** self.gam)
+        result = max(self.min_scale, s ** self.gam)
+
+        # --- START: debug exit log ---
+        if self.debug:
+            print(f"[AdaptiveDCoef][DEBUG] scale() result for '{name}' = {result:.6f}")
+        # --- END: debug exit log ---
+
+        # --- START: verbose log ---
+        if self.verbose:
+            print(f"[AdaptiveDCoef] scale('{name}', step={step}) -> {result:.6f}")
+        # --- END: verbose log ---
+
+        return result
 
     # START: Add vectorized scale method using torch
     def scale_vectorized(self,
@@ -55,17 +81,12 @@ class AdaptiveDCoef:
                          dtype: torch.dtype = torch.float32) -> dict[str, torch.Tensor]:
         """
         Calcula os fatores de escala para múltiplos módulos de forma vetorizada em um device específico.
-
-        Args:
-            names: Lista de nomes de módulos para calcular a escala.
-            step: Passo de treino atual.
-            total_steps: Total de passos de treino estimados.
-            device: Device torch (e.g., 'cuda:0') para realizar os cálculos.
-            dtype: Dtype torch para os cálculos.
-
-        Returns:
-            Dicionário mapeando nome do módulo para seu fator de escala (tensor escalar no device).
         """
+        # --- START: debug entry log ---
+        if self.debug:
+            print(f"[AdaptiveDCoef][DEBUG] scale_vectorized() names={names}, step={step}, total_steps={total_steps}, device={device}")
+        # --- END: debug entry log ---
+
         if not names:
             return {}
 
@@ -80,19 +101,26 @@ class AdaptiveDCoef:
         # Evita divisão por zero ou valores negativos no denominador
         denominator = torch.clamp(total_steps_tensor - t0_tensor, min=1.0)
 
-        # Normaliza x em [0, 1]
-        x = (step_tensor - t0_tensor) / denominator
+        # Normaliza x em [0,1]
+        x = (step_tensor.expand_as(t0_tensor) - t0_tensor) / denominator
         x = torch.clamp(x, min=0.0, max=1.0)
 
-        # Cosine fall-off 1 -> 0 usando torch
-        # torch.pi requires torch 1.8+
+        # Cosine fall-off 1→0 usando torch
         s = 0.5 * (1.0 + torch.cos(torch.pi * x))
 
         # Aplica gamma e garante escala mínima
         scales = torch.clamp(s.pow(self.gam), min=self.min_scale)
 
-        # Retorna dicionário mapeando nome -> tensor escalar de escala
+        # --- START: debug tensor scales ---
+        if self.debug:
+            print(f"[AdaptiveDCoef][DEBUG] vectorized scales: {scales}")
+        # --- END: debug tensor scales ---
+
+        # --- START: verbose summary ---
+        if self.verbose:
+            for i, name in enumerate(names):
+                print(f"[AdaptiveDCoef] scale_vectorized {name} -> {scales[i].item():.6f}")
+        # --- END: verbose summary ---
+
         return {name: scales[i] for i, name in enumerate(names)}
     # END: Add vectorized scale method using torch
-
-### END AdaptiveDCoef.py ###################################################

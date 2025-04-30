@@ -439,7 +439,16 @@ class TrainConfig(BaseConfig):
     # dcoef pattern settings
     dcoef_pattern_path: str
     dcoef_pattern_use_it: bool
-
+    
+    # convctrl settings
+    convctrl_use_it: bool
+    
+		# dynrecorder settings
+    dynrec_use_it: bool
+    
+		# which run
+    run_number: int = 1
+    
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -811,6 +820,9 @@ class TrainConfig(BaseConfig):
         data.append(("delta_pattern_path", "", str, False))
         data.append(("dcoef_pattern_use_it", False, bool, False))
         data.append(("dcoef_pattern_path", "", str, False))
+        data.append(("dynrec_use_it", False, bool, False))
+        data.append(("convctrl_use_it", False, bool, False))
+        data.append(("run_number", 1, int, False))
         data.append(("log_cosh_strength", 0.0, float, False))
         data.append(("vb_loss_strength", 1.0, float, False))
         data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))

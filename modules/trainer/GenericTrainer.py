@@ -15,10 +15,12 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
-from modules.sangoi.ModuleDynRecorder import ModuleDynRecorder
+
+from modules.sangoi.logFun import logFun
+from modules.util import create, path_util
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
-from modules.util.DeltaGater import DeltaGater
+
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.SampleConfig import SampleConfig
@@ -28,7 +30,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
+from modules.sangoi.DynamicLossStrength import DeltaPatternRegularizer
 from modules.util.memory_util import TorchMemoryRecorder
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -45,6 +47,9 @@ import huggingface_hub
 from requests.exceptions import ConnectionError
 from tqdm import tqdm
 
+from modules.sangoi.ConvergeControl import ConvergeControl
+from modules.sangoi.AdaptiveDCoef import AdaptiveDCoef
+from modules.sangoi.ModuleDynRecorder import ModuleDynRecorder
 
 class GenericTrainer(BaseTrainer):
     model_loader: BaseModelLoader
@@ -63,6 +68,14 @@ class GenericTrainer(BaseTrainer):
     tensorboard: TensorBoardManager
 
     grad_hook_handles: list[RemovableHandle]
+
+    # START: Add attributes for dynamic components
+    adaptive_dcoef: AdaptiveDCoef | None
+    recorder: ModuleDynRecorder | None
+    converge_control: ConvergeControl | None
+    is_run2: bool # Flag to easily check run mode
+    _temp_recorder_data: collections.defaultdict # Temporary storage for recorder data before log_step
+    # END: Add attributes for dynamic components
 
     def __init__(
         self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands
@@ -85,32 +98,84 @@ class GenericTrainer(BaseTrainer):
 
         self.grad_hook_handles = []
 
-        # >>> CHATGPT ADD: inicializa histórico de módulos para evitar AttributeError
-        self.delta_gater = DeltaGater(
-            z_thresh=2.5,        # Threshold Z-score para considerar convergido
-            u_abs_thresh=5e-5,   # Threshold absoluto de UWR para considerar inativo
-            k_confirm=10,         # Quantas confirmações seguidas antes de congelar
-            warmup_frac=0.2,     # Só começa a congelar depois de 50% do treino
-            total_epochs=self.config.epochs,  # Número total de epochs do treino
-        )
-        self._event_log = collections.defaultdict(
-            list
-        )  # módulo → [(epoch, step, state)]
-        self._log_dir = Path(self.config.workspace_dir) / "module_state_logs"
-        self._log_dir.mkdir(exist_ok=True)
-        self._last_dump_epoch = -1
-        self.recorder = ModuleDynRecorder(k_stride=10)
-        if getattr(self.config, "dcoef_pattern_use_it", False):
-            from modules.sangoi.AdaptiveDCoef import AdaptiveDCoef  
-            self.adaptive_dcoef = AdaptiveDCoef(
-                profile_path=self.config.dcoef_pattern_path,
-                gamma=2.0,
-                alpha=1.0,
-                min_scale=1e-3
+        # START: Modificação solicitada - Initialize dynamic components based on run mode
+        self.adaptive_dcoef = None
+        self.recorder = None
+        self.converge_control = None
+
+        # Component initialization flags (from config, with defaults)
+        dcoef_debug = getattr(self.config, "dcoef_debug", False)
+        dcoef_verbose = getattr(self.config, "dcoef_verbose", False)
+        recorder_debug = getattr(self.config, "recorder_debug", False)
+        recorder_verbose = getattr(self.config, "recorder_verbose", False)
+        converge_debug = getattr(self.config, "converge_debug", False)
+        converge_verbose = getattr(self.config, "converge_verbose", False)
+
+        # Determine the current run number
+        self.run_number = getattr(self.config, "run_number", 1) # Default to 1 if not set
+        logFun(f"[Trainer] Configurando para Run {self.run_number}.", lvl="debug")        
+        
+
+        self.recorder = None
+        if getattr(self.config, "dynrec_use_it", False):
+            # Recorder is active based on its flag. Its behavior (recording) is mainly for Run 1,
+            # but it might be optionally used in Run 2 for analysis if needed.
+            # No specific check for run_number needed here for activation, just for the 'purpose' log maybe.
+            self.recorder = ModuleDynRecorder(
+                k_stride=getattr(self.config, "recorder_k_stride", 10),
+                debug=recorder_debug,
+                verbose=recorder_verbose
             )
+            purpose = "coleta de dados" if self.run_number == 1 else "gravação opcional de dinâmica"
+            logFun(f"[ModuleDynRecorder] Inicializado (flag dynrec_use_it=True) para {purpose} na Run {self.run_number}.", lvl="debug")             
         else:
-            self.adaptive_dcoef = None    
-        # <<< FIM CHATGPT ADD
+            logFun("[ModuleDynRecorder] Desativado (flag dynrec_use_it=False).", lvl="debug") 
+
+        # 2. ConvergeControl
+        self.converge_control = None
+        if getattr(self.config, "convctrl_pattern_use_it", False):
+            self.converge_control = ConvergeControl(
+                z_thresh=getattr(self.config, "z_thresh", 2.0),
+                u_abs_thresh=getattr(self.config, "u_abs_thresh", 1e-4),
+                k_confirm=getattr(self.config, "k_confirm", 3),
+                warmup_frac=getattr(self.config, "warmup_frac", 0),
+                total_epochs=getattr(self.config, "epochs", 100),
+                debug=converge_debug,
+                verbose=converge_verbose,
+                min_history=getattr(self.config, "converge_min_history", 30),
+                min_buffer_epochs=getattr(self.config, "converge_min_buffer_epochs", 0.1)
+            )
+            # The actual freezing action only happens if it's Run 2, handled inside the train loop logic.
+            # Here we just initialize if the flag is True.
+            purpose = "coleta de dados de convergência" if self.run_number == 1 else "lógica de congelamento"
+            logFun(f"[ConvergeControl] Inicializado (flag convctrl_pattern_use_it=True) para {purpose} na Run {self.run_number}.", lvl="debug")             
+        else:
+            logFun("[ConvergeControl] Desativado (flag convctrl_pattern_use_it=False).", lvl="debug") 
+
+        # 3. AdaptiveDCoef
+        self.adaptive_dcoef = None
+        # AdaptiveDCoef only makes sense and should only be activated in Run 2 AND if its flag is True.
+        if self.run_number == 2 and getattr(self.config, "dcoef_pattern_use_it", False):
+            profile_path = getattr(self.config, "dcoef_profile_path", None)
+            if profile_path:
+                try:
+                    self.adaptive_dcoef = AdaptiveDCoef(
+                        profile_path=profile_path,
+                        gamma=getattr(self.config, "dcoef_gamma", 2.0),
+                        alpha=getattr(self.config, "dcoef_alpha", 1.0),
+                        min_scale=getattr(self.config, "dcoef_min_scale", 1e-3),
+                        debug=dcoef_debug,
+                        verbose=dcoef_verbose
+                    )
+                    logFun(f"[AdaptiveDCoef] Inicializado com sucesso para Run 2 usando perfil: {profile_path}", lvl="debug") 
+                except (FileNotFoundError, ValueError, Exception) as e:
+                    logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="debug") 
+                    self.adaptive_dcoef = None # Ensure it's None if init fails
+            else:
+                logFun("[Trainer Aviso] 'dcoef_pattern_use_it' ativo para Run 2, mas 'dcoef_profile_path' não especificado ou inválido. d_coef dinâmico desativado.", lvl="debug") 
+                self.adaptive_dcoef = None
+        elif getattr(self.config, "dcoef_pattern_use_it", False):
+            logFun("[AdaptiveDCoef] Desativado (não é Run 2 ou flag dcoef_pattern_use_it=False).", lvl="debug") 
 
     def start(self):
         self.__save_config_to_workspace()
@@ -169,6 +234,7 @@ class GenericTrainer(BaseTrainer):
         self.model.to(self.temp_device)
         self.model.eval()
         torch_gc()
+
 
         self.callbacks.on_update_status("creating the data loader/caching")
 
@@ -705,7 +771,6 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         scheduler_step_counter = 0
-        self.delta_gater.set_current_epoch(self.model.train_progress.epoch)
 
         def wrap_scheduler_step(orig_step):
             def wrapped(*args, **kwargs):
@@ -791,9 +856,8 @@ class GenericTrainer(BaseTrainer):
                 total=current_epoch_length,
                 initial=train_progress.epoch_step,
             )
-            delta_instance: DeltaPatternRegularizer | None = getattr(
-                self.model, "deltas", None
-            )
+            
+            delta_instance: DeltaPatternRegularizer | None = getattr(self.model, "deltas", None)
             for batch in step_tqdm:
                 if (
                     self.__needs_sample(train_progress)
@@ -919,142 +983,127 @@ class GenericTrainer(BaseTrainer):
                                 nn.utils.clip_grad_norm_(
                                     self.parameters, self.config.clip_grad_norm
                                 )
+                        # START: Modificação solicitada - Apply AdaptiveDCoef (Run 2 only) before optimizer step
+                        if self.run_number == 2 and self.adaptive_dcoef:
+                            try:
+                                # Determine target device and dtype from a model parameter
+                                sample_param = next(iter(self.parameters), None)
+                                if sample_param is not None:
+                                    target_device = sample_param.device
+                                    target_dtype = sample_param.dtype # Use parameter's dtype
 
-                        # START: Modify AdaptiveDCoef application for vectorization
-                        if self.adaptive_dcoef:
-                            # Determine target device and dtype from a model parameter
-                            # Assuming at least one parameter exists
-                            sample_param = next(iter(self.parameters), None)
-                            if sample_param is not None:
-                                target_device = sample_param.device
-                                target_dtype = sample_param.dtype # Or use a specific one like torch.float32
+                                    total_steps = (
+                                        self.config.epochs
+                                        * self.data_loader.get_data_set().approximate_length()
+                                    )
+                                    current_step = self.model.train_progress.global_step
 
-                                # --- Vectorized d_coef calculation ---
-                                total_steps = self.config.epochs * self.data_loader.get_data_set().approximate_length()
-                                current_step = self.model.train_progress.global_step
+                                    # Collect unique names of modules with parameters in the optimizer and a base d_coef
+                                    module_names_to_scale = list(set(
+                                        g.get("name") for g in self.model.optimizer.param_groups
+                                        if g.get("name") and g.get("name") in self.adaptive_dcoef.d_coef_base
+                                    ))
 
-                                # 1. Collect names of modules needing scaling
-                                module_names_to_scale = []
-                                for g in self.model.optimizer.param_groups:
-                                    module_name = g.get("name")
-                                    # Only include if name exists and has a base d_coef entry
-                                    if module_name and module_name in self.adaptive_dcoef.d_coef_base:
-                                        module_names_to_scale.append(module_name)
-                                module_names_to_scale = list(set(module_names_to_scale)) # Unique names
+                                    scale_factors = {}
+                                    if module_names_to_scale:
+                                        # Call vectorized scaling once
+                                        scale_factors = self.adaptive_dcoef.scale_vectorized(
+                                            names=module_names_to_scale,
+                                            step=current_step,
+                                            total_steps=total_steps,
+                                            device=target_device,
+                                            dtype=target_dtype # Pass correct dtype
+                                        )
 
-                                # 2. Call vectorized scaling function once
-                                scale_factors = {} # Default empty
-                                if module_names_to_scale:
-                                     try:
-                                         scale_factors = self.adaptive_dcoef.scale_vectorized(
-                                             names=module_names_to_scale,
-                                             step=current_step,
-                                             total_steps=total_steps,
-                                             device=target_device,
-                                             dtype=target_dtype
-                                         )
-                                     except Exception as e:
-                                         print(f"[AdaptiveDCoef Error] Failed vectorized scaling: {e}")
-                                         traceback.print_exc()
-                                         # Fallback or skip update might be needed here depending on requirements
-                                         # For now, we'll proceed with potentially empty scale_factors
+                                    # Apply scales (or fallback to base if scaling failed/not applicable)
+                                    for g in self.model.optimizer.param_groups:
+                                        name = g.get("name")
+                                        if name in scale_factors:
+                                            # Ensure base d_coef exists before scaling
+                                            base_d_coef = self.adaptive_dcoef.d_coef_base.get(name)
+                                            if base_d_coef is not None:
+                                                scale_tensor = scale_factors[name] # This is a Tensor
+                                                # Multiply base (float) by scale (Tensor), then get float item
+                                                g["d_coef"] = (float(base_d_coef) * scale_tensor).item()
+                                                if self.adaptive_dcoef.debug:
+                                                    print(
+                                                        f"[AdaptiveDCoef-Apply][DEBUG] "
+                                                        f"Updated d_coef for '{name}': {base_d_coef:.6f} * {scale_tensor.item():.6f} = {g['d_coef']:.6f}"
+                                                    )
+                                        elif name and name in self.adaptive_dcoef.d_coef_base:
+                                            # Fallback to base if name exists but wasn't in scale_factors (e.g., error)
+                                            g["d_coef"] = float(self.adaptive_dcoef.d_coef_base[name])
+                                            if self.adaptive_dcoef.debug:
+                                                print(f"[AdaptiveDCoef-Apply][DEBUG] Fallback to base d_coef for '{name}': {g['d_coef']:.6f}")
 
-                                # 3. Apply pre-calculated scales
-                                for g in self.model.optimizer.param_groups:
-                                    module_name = g.get("name")
-                                    if module_name and module_name in scale_factors:
-                                        # Get pre-calculated scale (tensor scalar on GPU)
-                                        scale_tensor = scale_factors[module_name]
-                                        # Get base d_coef (float)
-                                        base_d_coef = self.adaptive_dcoef.d_coef_base.get(module_name) # Already fetched/checked
+                                else:
+                                    if self.adaptive_dcoef.debug or self.adaptive_dcoef.verbose:
+                                        print("[AdaptiveDCoef Warning] Nenhum parâmetro encontrado para determinar device/dtype. Update pulado.")
 
-                                        # Ensure base_d_coef is valid before multiplication
-                                        if base_d_coef is not None:
-                                            # Perform multiplication. Result stays on GPU for a moment.
-                                            # Move the final scalar value to CPU as optimizer expects float.
-                                            g["d_coef"] = (float(base_d_coef) * scale_tensor).item()
-                                        else:
-                                            # Should not happen due to check above, but good practice
-                                            pass # Or log a warning
-                                    elif module_name and module_name in self.adaptive_dcoef.d_coef_base:
-                                        # Handle case where scaling failed but module expected it
-                                        # Maybe keep old value or set to base? Setting to base:
-                                        base_d_coef = self.adaptive_dcoef.d_coef_base.get(module_name)
-                                        if base_d_coef is not None:
-                                             g["d_coef"] = float(base_d_coef)
-                                        # print(f"[AdaptiveDCoef Warning] Scale factor not found for {module_name}, using base.")
-
-                            else:
-                                print("[AdaptiveDCoef Warning] Could not determine target device/dtype, skipping update.")
-                        # END: Modify AdaptiveDCoef application for vectorization
+                            except Exception as e:
+                                if not hasattr(self, '_adc_error_logged') or not self._adc_error_logged:
+                                    print(f"[AdaptiveDCoef Error] Falha ao aplicar d_coef dinâmico: {e}. Desativando para esta run.")
+                                    traceback.print_exc()
+                                    self.adaptive_dcoef = None # Disable further attempts
+                                    self._adc_error_logged = True # Log only once
+                        # END: Modificação solicitada - Apply AdaptiveDCoef (Run 2 only) before optimizer step
 
                         self.model.optimizer.step()
 
                         try:
-                            # Pop stats ONCE after the step
-                            current_stats = self.model.optimizer.pop_stats()
+                            current_stats_list = self.model.optimizer.pop_stats()
 
-                            # Process stats for Recorder (Run 1) and Gater (Run 2)
-                            if current_stats: # Only proceed if stats were generated
-                                # Define K for gating step frequency (e.g., every step or less often)
-                                step_k = 1 # Gate check every step in this example
-                                is_gate_step = (self.model.train_progress.global_step % step_k == 0)
+                            if current_stats_list: # Only proceed if stats were generated
+                                global_step = self.model.train_progress.global_step
+                                current_epoch = self.model.train_progress.epoch # Obter época atual
 
-                                for stat in current_stats:
-                                    # Map group_idx to name robustly
-                                    group_name = self.model.param_group_mapping[stat["group_idx"]] # can't use get here, its a list
-                                    if not group_name:
-                                        # print(f"[Warning] No name mapping for group index {stat['group_idx']}")
-                                        continue # Skip if no name found
+                                # --- Mapear group_idx para name (usando acesso direto à lista) ---
+                                mapped_stats_list = []
+                                for stat in current_stats_list:
+                                    # Confia que group_idx existe e é um índice válido para a lista
+                                    group_idx = stat["group_idx"] # Acesso direto, pode dar KeyError se não existir
+                                    # Acesso direto à lista pelo índice
+                                    # Adicionar verificação de índice para robustez extra, embora a nota sugira que não é necessário
+                                    if 0 <= group_idx < len(self.model.param_group_mapping):
+                                        name = self.model.param_group_mapping[group_idx]
+                                        if name: # Garante que o nome não é vazio ou None
+                                            stat_with_name = stat.copy()
+                                            stat_with_name["name"] = name
+                                            mapped_stats_list.append(stat_with_name)
+                                        else: # Opcional: Logar se o nome mapeado for inválido
+                                            if hasattr(self.config, 'debug') and self.config.debug:
+                                                  print(f"[Trainer][DEBUG] Nome inválido mapeado para group_idx {group_idx}")
+                                    else: # Opcional: Logar se o índice estiver fora do range
+                                        if hasattr(self.config, 'debug') and self.config.debug:
+                                            print(f"[Trainer][DEBUG] group_idx {group_idx} fora do range do mapeamento (tam: {len(self.model.param_group_mapping)})")
 
-                                    # 1. Recorder (Run 1): Log stats every step if active
+                                if mapped_stats_list: # Procede apenas se houver stats válidos mapeados
+                                    # 1. ConvergeControl processa e armazena métricas (Se ativo)
+                                    if self.converge_control:
+                                        self.converge_control.set_current_time(current_epoch, global_step)
+                                        self.converge_control.ingest_and_process(mapped_stats_list) # Passa a lista já mapeada
+
+                                    # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
                                     if self.recorder:
-                                        # Determine convergence based on DeltaGater state (if available)
-                                        converged = (self.delta_gater is not None) and (group_name in self.delta_gater.perma_frozen)
-                                        # Get d_coef actually used in the step (from optimizer state if possible, or group dict)
-                                        # Note: Pop_stats might already contain the d_coef used. Check optimizer impl.
-                                        # Assuming stat['d_coef'] holds the value used in the step:
-                                        d_coef_used = stat.get("d_coef", 0.0) # Default if not present
+                                        for mapped_stat in mapped_stats_list: # Itera sobre a lista já mapeada
+                                            self.recorder.log_step(
+                                                name=mapped_stat["name"], # Usa o nome já adicionado
+                                                step=global_step,
+                                                uwr=mapped_stat.get("uwr", 0.0), # .get() é seguro aqui para outras chaves
+                                                d_hat=mapped_stat.get("d_hat", 0.0),
+                                                d_coef=mapped_stat.get("d_coef", 0.0),
+                                                converged=False
+                                            )
 
-                                        self.recorder.log_step(
-                                            name       = group_name,
-                                            step       = self.model.train_progress.global_step,
-                                            uwr        = stat["uwr"],
-                                            d_hat      = stat.get("d_hat", 0.0), # Use .get for safety
-                                            d_coef     = d_coef_used,
-                                            converged  = converged,
-                                        )
-
-                                    # 2. Delta Gater Ingest (Run 2): Ingest UWR every step if active
-                                    if self.delta_gater:
-                                        self.delta_gater.ingest(group_name, stat["uwr"])
-
-                                # 3. Delta Gater Decision/Action (Run 2): Decide/Act every K steps
-                                # Ensure epoch is at least 1 before gating starts making decisions
-                                if self.delta_gater and is_gate_step and self.model.train_progress.epoch >= 1:
-                                    # Update epoch for DeltaGater before deciding
-                                    self.delta_gater.set_current_epoch(self.model.train_progress.epoch)
-
-                                    # Decide which modules to freeze based on UWR history
-                                    uwr_decisions = self.delta_gater.decide()
-
-                                    # Apply decisions: enable/disable gradients
-                                    for group_name, freeze in uwr_decisions.items():
-                                        param_group = self.model.parameters.by_unique_name(group_name)
-                                        if not param_group:
-                                            # print(f"[DeltaGater Warning] Param group '{group_name}' not found.")
-                                            continue
-
-                                        desired_grad_state = not freeze # True if should require grad, False if frozen
-                                        if param_group.is_enabled != desired_grad_state:
-                                            param_group.set_requires_grad(desired_grad_state)
-                                            # print(f"[DeltaGater] Setting {group_name} requires_grad={desired_grad_state}")
-
-
-                        except Exception as e:
-                            print(f"[Post-Step Error] Failed during gating/recording: {e}")
+                        except KeyError as e:
+                            print(f"[Trainer Error] KeyError ao acessar stat['group_idx'] ou mapeamento. Chave ausente? Erro: {e}")
+                            traceback.print_exc() # Descomentar para mais detalhes
+                        except IndexError as e:
+                            print(f"[Trainer Error] IndexError ao acessar self.model.param_group_mapping. group_idx fora do range? Erro: {e}")
                             traceback.print_exc()
-                        # END CHANGE: Refactor Gating/Recording Logic (No changes here, just context)
+                        except Exception as e:
+                            print(f"[Trainer Error] Falha no processamento pós-step (Recorder/Converge): {e}")
+                            traceback.print_exc()
 
                         # --- LR Scheduler Step ---
                         lr_scheduler.step() # Often done after optimizer step
@@ -1195,46 +1244,48 @@ class GenericTrainer(BaseTrainer):
         elif self.model is not None:
             self.model.to(self.temp_device)
 
+        # START: Modificação solicitada - Save DeltaPattern and Recorder profiles (Run 1 only) at the end
         model_filename = os.path.basename(save_path)
-        model_name, _ = os.path.splitext(model_filename)
+        model_name, _ = os.path.splitext(model_filename) # Get model name without extension
 
-        delta_instance: DeltaPatternRegularizer | None = getattr(
-            self.model, "deltas", None
-        )
-        if delta_instance is not None and self.config.delta_pattern_save_it:
+        # --- Save Delta Pattern (If delta_pattern_save_it is True AND instance exists) ---
+        delta_instance: DeltaPatternRegularizer | None = getattr(self.model, "deltas", None)
+        # A condição agora é apenas checar a flag de salvar e se o módulo foi inicializado
+        if getattr(self.config, "delta_pattern_save_it", False) and delta_instance is not None:
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_dir = os.path.join(
-                    self.config.workspace_dir, "training_deltas"
-                )  # Garante que o diretório existe
+                # Incluir o número da Run no nome do arquivo para clareza
+                output_dir = os.path.join(self.config.workspace_dir, f"training_deltas_run{self.run_number}")
                 os.makedirs(output_dir, exist_ok=True)
-                # Início do trecho alterado (nome de arquivo de deltas baseado no modelo)
-                delta_filename = f"{model_name}_Deltas_{timestamp}.json"
-                save_path = os.path.join(output_dir, delta_filename)
-                # Fim do trecho alterado
-                print(
-                    f"[DeltaPattern] Salvando deltas finais por grupo em: {save_path}"
-                )
-                delta_instance.save_group_deltas(save_path)
+                delta_filename = f"{model_name}_Deltas_Run{self.run_number}_{timestamp}.json"
+                delta_save_path = os.path.join(output_dir, delta_filename)
+
+                print(f"[DeltaPattern] Salvando deltas (Run {self.run_number}) em: {delta_save_path}")
+                # A função save_group_deltas salva o estado atual do delta_log_by_module
+                # que foi acumulado durante esta run específica.
+                delta_instance.save_group_deltas(delta_save_path)
             except Exception as e:
-                print(f"[DeltaPattern] Erro ao salvar deltas finais: {e}")
+                print(f"[DeltaPattern] Erro ao salvar deltas (Run {self.run_number}): {e}")
                 traceback.print_exc()
 
+        # A condição agora é apenas checar se a instância foi criada (implica dynrec_pattern_use_it foi True)
+        if self.recorder: # <-- CHECA APENAS A INSTÂNCIA
             try:
-              dcoef_output_dir = os.path.join(
-                  self.config.workspace_dir, "dcoef_stats"
-              )  # Garante que o diretório existe        
-              os.makedirs(output_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                # Incluir o número da Run no nome do arquivo
+                output_dir = os.path.join(self.config.workspace_dir, f"dcoef_stats_run{self.run_number}")
+                os.makedirs(output_dir, exist_ok=True)
+                dcoef_filename = f"{model_name}_DynDcoef_Run{self.run_number}_{timestamp}.json.gz"
+                dcoef_save_path = os.path.join(output_dir, dcoef_filename)
 
-              dcoef_filename = f"{model_name}_DynDcoef_{timestamp}.json.gz"
-              dcoef_save_path = os.path.join(dcoef_output_dir, dcoef_filename)
-              self.recorder.dump(dcoef_save_path)
-              print(
-                  f"[DynDcoef] Salvando dynamic dcoef stats em: {dcoef_save_path}"
-              )
+                print(f"[ModuleDynRecorder] Salvando perfil de dinâmica (Run {self.run_number}) em: {dcoef_save_path}")
+                # A função dump salva o estado atual do recorder (uwr_hist, conv_step, etc.)
+                # acumulado durante esta run específica.
+                self.recorder.dump(dcoef_save_path)
             except Exception as e:
-                print(f"[DynDcoef] Deu pau aqui: {e}")
+                print(f"[ModuleDynRecorder] Erro ao salvar perfil de dinâmica (Run {self.run_number}): {e}")
                 traceback.print_exc()
+        # END: Save DeltaPattern and Recorder profiles ALWAYS at the end if active
 
         self.tensorboard.close()
 
