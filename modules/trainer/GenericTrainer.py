@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import os
 import shutil
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -69,13 +70,17 @@ class GenericTrainer(BaseTrainer):
 
     grad_hook_handles: list[RemovableHandle]
 
-    # START: Add attributes for dynamic components
+
     adaptive_dcoef: AdaptiveDCoef | None
     recorder: ModuleDynRecorder | None
     converge_control: ConvergeControl | None
     is_run2: bool # Flag to easily check run mode
     _temp_recorder_data: collections.defaultdict # Temporary storage for recorder data before log_step
-    # END: Add attributes for dynamic components
+    
+    # atributos para pause
+    pause_requested_at_epoch_end: bool
+    is_paused: bool
+    pause_request_locked: bool # Para travar o switch da UI
 
     def __init__(
         self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands
@@ -97,8 +102,11 @@ class GenericTrainer(BaseTrainer):
         self.one_step_trained = False
 
         self.grad_hook_handles = []
+        
+        self.pause_requested_at_epoch_end = False
+        self.is_paused = False
+        self.pause_request_locked = False
 
-        # START: Modificação solicitada - Initialize dynamic components based on run mode
         self.adaptive_dcoef = None
         self.recorder = None
         self.converge_control = None
@@ -115,7 +123,6 @@ class GenericTrainer(BaseTrainer):
         self.run_number = getattr(self.config, "run_number", 1) # Default to 1 if not set
         logFun(f"[Trainer] Configurando para Run {self.run_number}.", lvl="debug")        
         
-
         self.recorder = None
         if getattr(self.config, "dynrec_use_it", False):
             # Recorder is active based on its flag. Its behavior (recording) is mainly for Run 1,
@@ -769,6 +776,74 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+    def _handle_pause_logic(self):
+        """Executa a lógica de pausa, movendo o modelo e esperando."""
+        if not self.is_paused: # Segurança extra
+            return
+
+        logFun("[Trainer] Iniciando Pausa...", lvl="info")
+        self.callbacks.on_update_status("Pausing... Moving model to CPU")
+        try:
+            self.model.to(self.temp_device) # Mover para CPU
+            self.model.eval() # Garantir modo eval
+            torch_gc() # Limpar VRAM
+            logFun(f"[Trainer] Modelo movido para {self.temp_device}. VRAM liberada.", lvl="info")
+            self.callbacks.on_update_status(f"Paused. Model on {self.temp_device}. Toggle switch to resume.")
+            # Notificar UI que a pausa iniciou e o switch pode ser reativado (para desligar)
+            if hasattr(self.callbacks, 'on_pause_initiated'):
+                self.callbacks.on_pause_initiated()
+
+
+            # Loop de espera pela retomada
+            while self.is_paused:
+                if self.commands.get_stop_command():
+                    logFun("[Trainer] Comando STOP recebido durante a pausa. Interrompendo.", lvl="warning")
+                    self.is_paused = False # Força a saída do loop de pausa
+                    # Mantém o comando de stop ativo para o loop principal
+                    break
+
+                if self.commands.get_and_reset_resume_request():
+                    logFun("[Trainer] Comando RESUME recebido.", lvl="info")
+                    self.is_paused = False # Sinaliza para sair do loop
+                    self.pause_request_locked = False # Desbloqueia a UI
+                    # Notificar UI que o resume começou (switch ainda ativo)
+                    if hasattr(self.callbacks, 'on_resume_started'):
+                        self.callbacks.on_resume_started()
+                    break # Sai do loop de espera
+
+                time.sleep(0.5) # Evita busy-waiting, checa a cada 0.5s
+
+            if not self.commands.get_stop_command(): # Só retoma se não for parar
+                logFun("[Trainer] Retomando treinamento...", lvl="info")
+                self.callbacks.on_update_status("Resuming... Moving model to GPU")
+                try:
+                    # Recarregar para o dispositivo de treino
+                    self.model_setup.setup_train_device(self.model, self.config)
+                    torch_gc() # Limpeza extra
+                    logFun(f"[Trainer] Modelo movido de volta para {self.config.train_device}.", lvl="info")
+                    self.callbacks.on_update_status("Training resumed.")
+                    # Notificar UI que o resume foi concluído
+                    if hasattr(self.callbacks, 'on_resume_completed'):
+                        self.callbacks.on_resume_completed()
+
+                except Exception as e:
+                    logFun(f"[Trainer] Erro ao mover modelo de volta para GPU: {e}", lvl="error")
+                    traceback.print_exc()
+                    # Tentar continuar mesmo assim? Ou parar? Por segurança, parar.
+                    self.commands.stop()
+            else:
+                 logFun("[Trainer] Retomada cancelada devido ao comando STOP.", lvl="info")
+
+
+        except Exception as e:
+            logFun(f"[Trainer] Erro durante o processo de pausa/retomada: {e}", lvl="error")
+            traceback.print_exc()
+            self.is_paused = False # Garante que não fique preso no estado pausado
+            self.pause_request_locked = False
+            # Considerar parar o treino em caso de erro grave aqui
+            self.commands.stop()
+            self.callbacks.on_update_status(f"Error during pause/resume: {e}")
+
     def train(self):
         scheduler_step_counter = 0
 
@@ -816,7 +891,15 @@ class GenericTrainer(BaseTrainer):
         for _epoch in tqdm(
             range(train_progress.epoch, self.config.epochs, 1), desc="epoch"
         ):
-            self.callbacks.on_update_status("starting epoch/caching")
+            
+            if self.is_paused:
+                logFun(f"[Trainer] Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info")
+                self._handle_pause_logic()
+                if self.commands.get_stop_command(): # Se o stop foi dado durante a pausa inicial
+                      logFun("[Trainer] Comando STOP ativo após pausa inicial. Encerrando.", lvl="info")
+                      break # Sai do loop de épocas
+
+            self.callbacks.on_update_status(f"Starting Epoch {train_progress.epoch + 1}/{self.config.epochs}")
 
             if self.config.latent_caching:
                 self.data_loader.get_data_set().start_next_epoch()
@@ -910,7 +993,8 @@ class GenericTrainer(BaseTrainer):
                     if transferred_to_temp_device:
                         self.model_setup.setup_train_device(self.model, self.config)
 
-                self.callbacks.on_update_status("training")
+                self.callbacks.on_update_status(f"Epoch {train_progress.epoch + 1}, Step {train_progress.epoch_step + 1}/{current_epoch_length}")
+
 
                 # with TorchMemoryRecorder(enabled=False):
                 #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
@@ -1161,12 +1245,39 @@ class GenericTrainer(BaseTrainer):
                 )
 
                 if self.commands.get_stop_command():
-                    return
+                    logFun("[Trainer] Comando STOP recebido durante a época. Encerrando...", lvl="warning")
+                    # Limpar handles de gradiente antes de sair se necessário
+                    for handle in self.grad_hook_handles:
+                        handle.remove()
+                    self.grad_hook_handles.clear()
+                    return # Sai do método train
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(
                 train_progress, current_epoch_length, self.config.epochs
             )
+            
+            if self.commands.get_and_reset_pause_request():
+                logFun(f"[Trainer] Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info")
+                self.pause_requested_at_epoch_end = True
+                self.pause_request_locked = True # Trava a UI
+                # Notificar a UI que a requisição foi aceita e o switch está travado
+                if hasattr(self.callbacks, 'on_pause_request_accepted'):
+                    self.callbacks.on_pause_request_accepted()						
+
+            # 2. Executar a pausa se foi agendada
+            if self.pause_requested_at_epoch_end and not self.is_paused:
+                self.is_paused = True # Marca como pausado
+                self.pause_requested_at_epoch_end = False # Limpa a flag de agendamento
+                # A trava (pause_request_locked) continua TRUE até o resume
+
+                # Chama a função que move o modelo e entra no loop de espera
+                self._handle_pause_logic()
+
+            # --- Checagem de STOP ao final da época ---
+            if self.commands.get_stop_command():
+                logFun("[Trainer] Comando STOP ativo no final da época. Encerrando...", lvl="info")
+                break # Sai do loop de épocas
 
             if delta_instance is not None:
                 # Logar deltas do grupo se a opção estiver ativa
@@ -1208,8 +1319,30 @@ class GenericTrainer(BaseTrainer):
                 return
 
     def end(self):
+        if self.is_paused:
+            logFun("[Trainer] Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.", lvl="warning")
+            # Força a saída da pausa (sem esperar comando) e tenta mover para GPU para salvar
+            self.is_paused = False
+            self.pause_request_locked = False
+            try:
+                # Tenta mover de volta pra GPU rapidamente
+                self.model_setup.setup_train_device(self.model, self.config)
+                torch_gc()
+                logFun("[Trainer] Modelo movido para GPU para salvamento final.", lvl="info")
+            except Exception as e:
+                logFun(f"[Trainer] Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).", lvl="error")
+                # O modelo já está no self.temp_device, o save deve funcionar
+                pass # Continua para salvar do CPU
+
         if self.one_step_trained:
             self.model.to(self.temp_device)
+            if self.model.train_device != self.temp_device:
+                logFun(f"[Trainer] Movendo modelo para {self.temp_device} antes do salvamento final.", lvl="debug")
+                self.model.to(self.temp_device)
+                torch_gc()
+
+            if self.config.backup_before_save:
+                self.backup(self.model.train_progress) # Backup já usa o modelo no temp_device            
 
             if self.config.backup_before_save:
                 self.backup(self.model.train_progress)
@@ -1244,7 +1377,6 @@ class GenericTrainer(BaseTrainer):
         elif self.model is not None:
             self.model.to(self.temp_device)
 
-        # START: Modificação solicitada - Save DeltaPattern and Recorder profiles (Run 1 only) at the end
         model_filename = os.path.basename(save_path)
         model_name, _ = os.path.splitext(model_filename) # Get model name without extension
 

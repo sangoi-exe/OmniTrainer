@@ -424,6 +424,7 @@ class TrainConfig(BaseConfig):
     save_every_unit: TimeUnit
     save_skip_first: int
     save_filename_prefix: str
+    paused_train: bool
 
     # secrets - not saved into config file
     secrets: SecretsConfig
