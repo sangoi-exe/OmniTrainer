@@ -36,6 +36,7 @@ import torch
 import customtkinter as ctk
 from customtkinter import AppearanceModeTracker
 
+
 class TrainUI(ctk.CTk):
     set_step_progress: Callable[[int, int], None]
     set_epoch_progress: Callable[[int, int], None]
@@ -50,16 +51,16 @@ class TrainUI(ctk.CTk):
     data_tab: ctk.CTkFrame | None = None
     concepts_tab: ConceptTab | None = None
     training_tab: TrainingTab | None = None
-    sampling_tab_content: ctk.CTkFrame | None = None # Renomeado para evitar conflito com o método
+    sampling_tab_content: ctk.CTkFrame | None = None  # Renomeado para evitar conflito com o método
     backup_tab: ctk.CTkFrame | None = None
     tools_tab: ctk.CTkFrame | None = None
     additional_embeddings_tab: AdditionalEmbeddingsTab | None = None
     cloud_tab: CloudTab | None = None
-    lora_tab_content: LoraTab | None = None # Renomeado para evitar conflito com o método
-    embedding_tab_content: ctk.CTkFrame | None = None # Renomeado para evitar conflito com o método
+    lora_tab_content: LoraTab | None = None  # Renomeado para evitar conflito com o método
+    embedding_tab_content: ctk.CTkFrame | None = None  # Renomeado para evitar conflito com o método
     tabview: ctk.CTkTabview | None = None
     pause_switch_widget: ctk.CTkSwitch | None = None
-    pause_switch_var: ctk.BooleanVar | None = None # Nova variável
+    pause_switch_var: ctk.BooleanVar | None = None  # Nova variável
 
     def __init__(self):
         super().__init__()
@@ -68,13 +69,13 @@ class TrainUI(ctk.CTk):
         try:
             self.iconbitmap("resources/icons/icon.ico")
         except Exception as e:
-            print(f"Warn: Could not load iconbitmap: {e}") # Melhor log
+            print(f"Warn: Could not load iconbitmap: {e}")  # Melhor log
 
         try:
             self._icon_photo = PhotoImage(file="resources/icons/icon.png")
             self.wm_iconphoto(True, self._icon_photo)
         except Exception as e:
-             print(f"Warn: Could not load icon photo: {e}") # Melhor log
+            print(f"Warn: Could not load icon photo: {e}")  # Melhor log
 
         self.geometry("1100x740")
 
@@ -96,7 +97,7 @@ class TrainUI(ctk.CTk):
 
         # Inicialização das barras superior e inferior (sem alterações significativas)
         self.top_bar_component = self.top_bar(self)
-        self.content_frame(self) # Cria a estrutura das abas e carrega a primeira
+        self.content_frame(self)  # Cria a estrutura das abas e carrega a primeira
         self.bottom_bar(self)
 
         self.training_thread = None
@@ -141,12 +142,17 @@ class TrainUI(ctk.CTk):
 
         self.status_label = components.label(frame, 0, 1, "", tooltip="Current status of the training run")
 
-        frame.grid_columnconfigure(2, weight=1) # padding
+        frame.grid_columnconfigure(2, weight=1)  # padding
 
         components.button(frame, 0, 3, "Tensorboard", self.open_tensorboard)
         self.training_button = components.button(frame, 0, 4, "Start Training", self.start_training)
         self.export_button = components.button(
-            frame, 0, 5, "Export", self.export_training, tooltip="Export the current configuration as a script to run without a UI"
+            frame,
+            0,
+            5,
+            "Export",
+            self.export_training,
+            tooltip="Export the current configuration as a script to run without a UI",
         )
 
         return frame
@@ -158,7 +164,7 @@ class TrainUI(ctk.CTk):
         frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
-        self.tabview = ctk.CTkTabview(frame, command=self._on_tab_change) # Adiciona comando para lazy loading
+        self.tabview = ctk.CTkTabview(frame, command=self._on_tab_change)  # Adiciona comando para lazy loading
         self.tabview.grid(row=0, column=0, sticky="nsew")
 
         # START: Otimização - Adicionar apenas os nomes das abas
@@ -185,10 +191,12 @@ class TrainUI(ctk.CTk):
     # START: Otimização - Handler para carregar conteúdo da aba sob demanda
     def _on_tab_change(self):
         """Callback executado quando o usuário troca de aba. Carrega o conteúdo da aba selecionada se ainda não foi carregado."""
-        if not self.tabview: return # Segurança
+        if not self.tabview:
+            return  # Segurança
 
         selected_tab_name = self.tabview.get()
-        if selected_tab_name is None: return # Pode acontecer durante a inicialização/destruição
+        if selected_tab_name is None:
+            return  # Pode acontecer durante a inicialização/destruição
 
         tab_widget = self.tabview.tab(selected_tab_name)
         if not tab_widget:
@@ -219,7 +227,7 @@ class TrainUI(ctk.CTk):
                 # Cria o conteúdo da aba e armazena na variável de instância
                 created_content = creation_func(tab_widget)
                 setattr(self, attr_name, created_content)
-    
+
     # Métodos create_*_tab permanecem quase idênticos,
     # apenas garantindo que usem o 'master' recebido corretamente.
     # O retorno do frame/widget criado é importante para o lazy loading.
@@ -232,7 +240,9 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(2, weight=0)
         frame.grid_columnconfigure(3, weight=1)
 
-        components.label(frame, 0, 0, "Workspace Directory", tooltip="The directory where all files of this training run are saved")
+        components.label(
+            frame, 0, 0, "Workspace Directory", tooltip="The directory where all files of this training run are saved"
+        )
         components.dir_entry(frame, 0, 1, self.ui_state, "workspace_dir")
         components.label(frame, 1, 0, "Cache Directory", tooltip="The directory where cached data is saved")
         components.dir_entry(frame, 1, 1, self.ui_state, "cache_dir")
@@ -263,13 +273,13 @@ class TrainUI(ctk.CTk):
 
         # Importante: Usar pack/grid dentro do frame criado, relativo ao 'master'
         frame.pack(fill="both", expand=True)
-        return frame # Retorna o frame criado
+        return frame  # Retorna o frame criado
 
     def create_model_tab(self, master) -> ModelTab:
-         # A classe ModelTab já deve lidar com seu próprio 'master'
+        # A classe ModelTab já deve lidar com seu próprio 'master'
         model_tab_instance = ModelTab(master, self.train_config, self.ui_state)
         # ModelTab provavelmente chama pack/grid internamente, não precisamos fazer aqui
-        return model_tab_instance # Retorna a instância criada
+        return model_tab_instance  # Retorna a instância criada
 
     def create_data_tab(self, master):
         # Conteúdo original do método, garantindo usar 'master'
@@ -288,25 +298,25 @@ class TrainUI(ctk.CTk):
         components.switch(frame, 2, 1, self.ui_state, "clear_cache_before_training")
 
         frame.pack(fill="both", expand=True)
-        return frame # Retorna o frame criado
+        return frame  # Retorna o frame criado
 
     def create_concepts_tab(self, master) -> ConceptTab:
         # A classe ConceptTab já deve lidar com seu próprio 'master'
         concepts_tab_instance = ConceptTab(master, self.train_config, self.ui_state)
         # ConceptTab provavelmente chama pack/grid internamente
-        return concepts_tab_instance # Retorna a instância criada
+        return concepts_tab_instance  # Retorna a instância criada
 
     def create_training_tab(self, master) -> TrainingTab:
-         # A classe TrainingTab já deve lidar com seu próprio 'master'
+        # A classe TrainingTab já deve lidar com seu próprio 'master'
         training_tab_instance = TrainingTab(master, self.train_config, self.ui_state)
         # TrainingTab provavelmente chama pack/grid internamente
-        return training_tab_instance # Retorna a instância criada
+        return training_tab_instance  # Retorna a instância criada
 
     def create_cloud_tab(self, master) -> CloudTab:
         # A classe CloudTab já deve lidar com seu próprio 'master'
         cloud_tab_instance = CloudTab(master, self.train_config, self.ui_state, parent=self)
         # CloudTab provavelmente chama pack/grid internamente
-        return cloud_tab_instance # Retorna a instância criada
+        return cloud_tab_instance  # Retorna a instância criada
 
     def create_sampling_tab(self, master):
         # --- Início do conteúdo original de create_sampling_tab ---
@@ -322,24 +332,26 @@ class TrainUI(ctk.CTk):
         tab_frame.grid_columnconfigure(0, weight=1)
 
         # sample after (Top Frame)
-        top_frame = ctk.CTkFrame(master=tab_frame, corner_radius=0) # Use tab_frame como master
+        top_frame = ctk.CTkFrame(master=tab_frame, corner_radius=0)  # Use tab_frame como master
         top_frame.grid(row=0, column=0, sticky="nsew")
         # --- Configuração do top_frame ---
-        top_frame.grid_columnconfigure(8, weight=1) # Adiciona weight para empurrar botões para esquerda
+        top_frame.grid_columnconfigure(8, weight=1)  # Adiciona weight para empurrar botões para esquerda
 
         components.label(top_frame, 0, 0, "Sample After", tooltip="...")
         components.time_entry(top_frame, 0, 1, self.ui_state, "sample_after", "sample_after_unit")
         components.label(top_frame, 0, 2, "Skip First", tooltip="...")
         components.entry(top_frame, 0, 3, self.ui_state, "sample_skip_first", width=50, sticky="nw")
         components.label(top_frame, 0, 4, "Format", tooltip="...")
-        components.options_kv(top_frame, 0, 5, [("PNG", ImageFormat.PNG), ("JPG", ImageFormat.JPG)], self.ui_state, "sample_image_format")
+        components.options_kv(
+            top_frame, 0, 5, [("PNG", ImageFormat.PNG), ("JPG", ImageFormat.JPG)], self.ui_state, "sample_image_format"
+        )
         components.button(top_frame, 0, 6, "sample now", self.sample_now)
         components.button(top_frame, 0, 7, "manual sample", self.open_sample_ui)
 
         # Sub Frame dentro do top_frame
         sub_frame = ctk.CTkFrame(master=top_frame, corner_radius=0, fg_color="transparent")
         # Coloca sub_frame abaixo dos controles principais no top_frame
-        sub_frame.grid(row=1, column=0, sticky="nsew", columnspan=8) # Span all columns used above
+        sub_frame.grid(row=1, column=0, sticky="nsew", columnspan=8)  # Span all columns used above
         # --- Configuração do sub_frame ---
         components.label(sub_frame, 0, 0, "Non-EMA Sampling", tooltip="...")
         components.switch(sub_frame, 0, 1, self.ui_state, "non_ema_sampling")
@@ -350,14 +362,14 @@ class TrainUI(ctk.CTk):
 
         # Tabela (SamplingTab)
         # Frame para conter a tabela, abaixo do top_frame
-        table_container_frame = ctk.CTkFrame(master=tab_frame, corner_radius=0) # Use tab_frame como master
+        table_container_frame = ctk.CTkFrame(master=tab_frame, corner_radius=0)  # Use tab_frame como master
         table_container_frame.grid(row=1, column=0, sticky="nsew")
 
         # Instancia SamplingTab dentro do container apropriado
         SamplingTab(table_container_frame, self.train_config, self.ui_state)
         # --- Fim do conteúdo original de create_sampling_tab ---
 
-        return tab_frame # Retorna o frame principal da aba
+        return tab_frame  # Retorna o frame principal da aba
 
     def create_backup_tab(self, master):
         # Conteúdo original do método, garantindo usar 'master'
@@ -385,23 +397,18 @@ class TrainUI(ctk.CTk):
         components.entry(frame, 4, 1, self.ui_state, "save_skip_first", width=50, sticky="nw")
         components.label(frame, 5, 0, "Save Filename Prefix", tooltip="...")
         components.entry(frame, 5, 1, self.ui_state, "save_filename_prefix")
-        
-        # --- NOVA LINHA PARA O SWITCH DE PAUSA ---
-        components.label(frame, row_index, 0, "Pause Training", tooltip="Pause after the current epoch finishes and move model to CPU. Toggle again to resume.")
-        # Usa 'pause_training' no ui_state para o valor ON/OFF visual inicial
-        # Mas a lógica principal está no command=self.toggle_pause e nos callbacks
-        self.pause_switch_widget = ctk.CTkSwitch(
-            master=frame,
-            text="",  # O texto está no label separado
-            variable=self.pause_switch_var, # Associa à variável dedicada
-            onvalue=True,
-            offvalue=False,
-            command=self.toggle_pause # O comando permanece o mesmo
+
+        components.label(
+            frame,
+            6,
+            0,
+            "Pause Training",
+            tooltip="Pause after the current epoch finishes and move model to CPU. Toggle again to resume.",
         )
-        self.pause_switch_widget.grid(row=row_index, column=1, padx=(0, 20), pady=5, sticky="w")     
+        components.switch(frame, 6, 1, self.ui_state, "pause_training", command=self.toggle_pause)
 
         frame.pack(fill="both", expand=True)
-        return frame # Retorna o frame criado
+        return frame  # Retorna o frame criado
 
     def _update_pause_switch_initial_state(self):
         """Atualiza o estado inicial/atual do switch de pausa se ele existir."""
@@ -415,9 +422,9 @@ class TrainUI(ctk.CTk):
         resume_pending = False
 
         # Acessa comandos e trainer de forma segura (podem ser None)
-        commands = self.training_commands # Pode ser None se não estiver treinando
-        trainer_instance = None # Precisaria de acesso ao objeto trainer, o que não é direto aqui.
-                               # Vamos confiar nos comandos e callbacks.
+        commands = self.training_commands  # Pode ser None se não estiver treinando
+        trainer_instance = None  # Precisaria de acesso ao objeto trainer, o que não é direto aqui.
+        # Vamos confiar nos comandos e callbacks.
 
         if commands:
             pause_pending = commands.is_pause_pending()
@@ -431,19 +438,18 @@ class TrainUI(ctk.CTk):
         if pause_pending:
             self.ui_state["pause_training"] = True
             self.pause_switch_widget.select()
-            self.pause_switch_widget.configure(state="disabled") # Assume travado se pendente
+            self.pause_switch_widget.configure(state="disabled")  # Assume travado se pendente
             print("[UI Init] Pause request pending, setting switch ON and DISABLED.")
-        elif resume_pending: # Menos provável de acontecer no início, mas por segurança
-             self.ui_state["pause_training"] = False
-             self.pause_switch_widget.deselect()
-             self.pause_switch_widget.configure(state="normal")
-             print("[UI Init] Resume request pending, setting switch OFF and NORMAL.")
-        else: # Nenhuma requisição pendente, estado inicial normal
-             self.ui_state["pause_training"] = False
-             self.pause_switch_widget.deselect()
-             self.pause_switch_widget.configure(state="normal")
-             print("[UI Init] No pending requests, setting switch OFF and NORMAL.")
-
+        elif resume_pending:  # Menos provável de acontecer no início, mas por segurança
+            self.ui_state["pause_training"] = False
+            self.pause_switch_widget.deselect()
+            self.pause_switch_widget.configure(state="normal")
+            print("[UI Init] Resume request pending, setting switch OFF and NORMAL.")
+        else:  # Nenhuma requisição pendente, estado inicial normal
+            self.ui_state["pause_training"] = False
+            self.pause_switch_widget.deselect()
+            self.pause_switch_widget.configure(state="normal")
+            print("[UI Init] No pending requests, setting switch OFF and NORMAL.")
 
     # Em TrainUI.toggle_pause
     def toggle_pause(self):
@@ -453,7 +459,7 @@ class TrainUI(ctk.CTk):
             # Reverte visualmente o switch se não estiver treinando
             # Lê o valor ATUAL da variável antes de reverter
             current_val = self.pause_switch_var.get()
-            self.pause_switch_var.set(not current_val) # Inverte o valor na variável
+            self.pause_switch_var.set(not current_val)  # Inverte o valor na variável
             return
 
         # Obtém o estado DESEJADO pelo clique (o valor que a variável terá APÓS o clique)
@@ -461,7 +467,7 @@ class TrainUI(ctk.CTk):
         is_checked = self.pause_switch_var.get()
         print(f"[UI] Toggle Pause clicked. Switch variable is now: {is_checked}")
 
-        if is_checked: # Usuário quer PAUSAR (variável agora é True)
+        if is_checked:  # Usuário quer PAUSAR (variável agora é True)
             print("[UI] Requesting pause...")
             success = self.training_commands.request_pause()
             if success:
@@ -471,7 +477,7 @@ class TrainUI(ctk.CTk):
                 print("[UI] Pause request rejected by commands. Reverting switch variable.")
                 # Reverte o estado da variável Tkinter
                 self.pause_switch_var.set(False)
-        else: # Usuário quer RETOMAR (variável agora é False)
+        else:  # Usuário quer RETOMAR (variável agora é False)
             print("[UI] Requesting resume...")
             success = self.training_commands.request_resume()
             if success:
@@ -502,21 +508,21 @@ class TrainUI(ctk.CTk):
     def _handle_pause_request_accepted_ui(self):
         print("[UI Thread] Updating UI for pause request accepted: Switch ON, DISABLED.")
         if self.pause_switch_widget:
-            self.pause_switch_var.set(True) # Confirma estado lógico/visual ON
-            self.pause_switch_widget.configure(state="disabled") # Trava
+            self.pause_switch_var.set(True)  # Confirma estado lógico/visual ON
+            self.pause_switch_widget.configure(state="disabled")  # Trava
 
     # Em TrainUI._handle_pause_initiated_ui
     def _handle_pause_initiated_ui(self):
         print("[UI Thread] Updating UI for pause initiated: Switch ON, NORMAL (can resume).")
         if self.pause_switch_widget:
-            self.pause_switch_var.set(True) # Continua ON (está pausado)
-            self.pause_switch_widget.configure(state="normal") # Libera para clicar e retomar
+            self.pause_switch_var.set(True)  # Continua ON (está pausado)
+            self.pause_switch_widget.configure(state="normal")  # Libera para clicar e retomar
 
     # Em TrainUI._handle_resume_started_ui
     def _handle_resume_started_ui(self):
         print("[UI Thread] Updating UI for resume started: Switch OFF, DISABLED (optional).")
         if self.pause_switch_widget:
-            self.pause_switch_var.set(False) # Estado lógico/visual vai pra OFF
+            self.pause_switch_var.set(False)  # Estado lógico/visual vai pra OFF
             # Opcional: desabilitar enquanto move de volta pra GPU
             # self.pause_switch_widget.configure(state="disabled")
 
@@ -524,16 +530,16 @@ class TrainUI(ctk.CTk):
     def _handle_resume_completed_ui(self):
         print("[UI Thread] Updating UI for resume completed: Switch OFF, NORMAL.")
         if self.pause_switch_widget:
-            self.pause_switch_var.set(False) # Garante estado lógico/visual OFF
-            self.pause_switch_widget.configure(state="normal") # Garante habilitado
+            self.pause_switch_var.set(False)  # Garante estado lógico/visual OFF
+            self.pause_switch_widget.configure(state="normal")  # Garante habilitado
 
-    def lora_tab(self, master) -> LoraTab: # Note: Renomeado de create_lora_tab se necessário
-         # A classe LoraTab já deve lidar com seu próprio 'master'
+    def lora_tab(self, master) -> LoraTab:  # Note: Renomeado de create_lora_tab se necessário
+        # A classe LoraTab já deve lidar com seu próprio 'master'
         lora_tab_instance = LoraTab(master, self.train_config, self.ui_state)
         # LoraTab provavelmente chama pack/grid internamente
-        return lora_tab_instance # Retorna a instância criada
+        return lora_tab_instance  # Retorna a instância criada
 
-    def embedding_tab(self, master): # Note: Renomeado de create_embedding_tab se necessário
+    def embedding_tab(self, master):  # Note: Renomeado de create_embedding_tab se necessário
         # Conteúdo original do método, garantindo usar 'master'
         frame = ctk.CTkScrollableFrame(master, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=0)
@@ -549,20 +555,27 @@ class TrainUI(ctk.CTk):
         components.label(frame, 2, 0, "Initial embedding text", tooltip="...")
         components.entry(frame, 2, 1, self.ui_state, "embedding.initial_embedding_text")
         components.label(frame, 3, 0, "Embedding Weight Data Type", tooltip="...")
-        components.options_kv(frame, 3, 1, [("float32", DataType.FLOAT_32), ("bfloat16", DataType.BFLOAT_16)], self.ui_state, "embedding_weight_dtype")
+        components.options_kv(
+            frame,
+            3,
+            1,
+            [("float32", DataType.FLOAT_32), ("bfloat16", DataType.BFLOAT_16)],
+            self.ui_state,
+            "embedding_weight_dtype",
+        )
         components.label(frame, 4, 0, "Placeholder", tooltip="...")
         components.entry(frame, 4, 1, self.ui_state, "embedding.placeholder")
         components.label(frame, 5, 0, "Output embedding", tooltip="...")
         components.switch(frame, 5, 1, self.ui_state, "embedding.is_output_embedding")
 
         frame.pack(fill="both", expand=True)
-        return frame # Retorna o frame criado
+        return frame  # Retorna o frame criado
 
     def create_additional_embeddings_tab(self, master) -> AdditionalEmbeddingsTab:
         # A classe AdditionalEmbeddingsTab já deve lidar com seu próprio 'master'
         add_emb_tab_instance = AdditionalEmbeddingsTab(master, self.train_config, self.ui_state)
         # AdditionalEmbeddingsTab provavelmente chama pack/grid internamente
-        return add_emb_tab_instance # Retorna a instância criada
+        return add_emb_tab_instance  # Retorna a instância criada
 
     def create_tools_tab(self, master):
         # Conteúdo original do método, garantindo usar 'master'
@@ -583,23 +596,22 @@ class TrainUI(ctk.CTk):
         components.button(frame, 3, 1, "Open", self.open_profiling_tool)
 
         frame.pack(fill="both", expand=True)
-        return frame # Retorna o frame criado
+        return frame  # Retorna o frame criado
 
     def change_model_type(self, model_type: ModelType):
         # A lógica original já verifica se as abas existem (são None ou não)
         # Nenhuma alteração necessária aqui devido ao lazy loading
-        if self.model_tab: # Verifica se a aba já foi criada
+        if self.model_tab:  # Verifica se a aba já foi criada
             self.model_tab.refresh_ui()
-        if self.training_tab: # Verifica se a aba já foi criada
+        if self.training_tab:  # Verifica se a aba já foi criada
             self.training_tab.refresh_ui()
         # O lora_tab original não existia aqui, mas se existisse, seria:
         # if self.lora_tab_content:
         #    self.lora_tab_content.refresh_ui()
 
-
     def change_training_method(self, training_method: TrainingMethod):
         if not self.tabview:
-            return # Segurança
+            return  # Segurança
 
         # START: Otimização - Modificar apenas a *existência* da aba no tabview
         # A criação do *conteúdo* será tratada pelo _on_tab_change quando/se selecionada.
@@ -608,11 +620,11 @@ class TrainUI(ctk.CTk):
         if training_method != TrainingMethod.LORA and "LoRA" in self.tabview._tab_dict:
             print("[UI] Removing LoRA tab structure.")
             self.tabview.delete("LoRA")
-            self.lora_tab_content = None # Garante que será recriado se necessário
+            self.lora_tab_content = None  # Garante que será recriado se necessário
         if training_method != TrainingMethod.EMBEDDING and "embedding" in self.tabview._tab_dict:
             print("[UI] Removing Embedding tab structure.")
             self.tabview.delete("embedding")
-            self.embedding_tab_content = None # Garante que será recriado
+            self.embedding_tab_content = None  # Garante que será recriado
 
         # Lógica para adicionar abas se o método for LORA/Embedding e a aba não existir
         if training_method == TrainingMethod.LORA and "LoRA" not in self.tabview._tab_dict:
@@ -634,7 +646,7 @@ class TrainUI(ctk.CTk):
         if not self.tabview:
             return
 
-        if self.additional_embeddings_tab: # Verifica se já foi criada
+        if self.additional_embeddings_tab:  # Verifica se já foi criada
             self.additional_embeddings_tab.refresh_ui()
         # Se outras abas precisassem de refresh no load_preset, adicionar verificações similares:
         # if self.general_tab: self.general_tab...
@@ -653,11 +665,12 @@ class TrainUI(ctk.CTk):
         self.set_epoch_progress(train_progress.epoch, max_epoch)
 
     def on_update_status(self, status: str):
-        if self.status_label: # Adiciona verificação
+        if self.status_label:  # Adiciona verificação
             self.status_label.configure(text=status)
 
     def open_dataset_tool(self):
-        from modules.ui.CaptionUI import CaptionUI        
+        from modules.ui.CaptionUI import CaptionUI
+
         window = CaptionUI(self, None, False)
         self.wait_window(window)
 
@@ -688,13 +701,14 @@ class TrainUI(ctk.CTk):
                 commands=training_commands,
             )
             self.wait_window(window)
-            if training_callbacks: # Adiciona verificação
+            if training_callbacks:  # Adiciona verificação
                 training_callbacks.set_on_sample_custom()
 
     def __training_thread_function(self):
         from modules.trainer.GenericTrainer import GenericTrainer
+
         error_caught = False
-        trainer = None # Inicializa para garantir que o del funcione no finally
+        trainer = None  # Inicializa para garantir que o del funcione no finally
 
         try:
             self.training_callbacks = TrainCallbacks(
@@ -708,20 +722,22 @@ class TrainUI(ctk.CTk):
 
             # Garante que training_commands existe antes de passar
             if not self.training_commands:
-                 self.training_commands = TrainCommands() # Cria se não existir (embora start_training deva criar)
-                 print("Warn: Training commands were None in thread function, created new.")
-
+                self.training_commands = TrainCommands()  # Cria se não existir (embora start_training deva criar)
+                print("Warn: Training commands were None in thread function, created new.")
 
             if self.train_config.cloud.enabled:
-                from modules.trainer.CloudTrainer import CloudTrainer	
+                from modules.trainer.CloudTrainer import CloudTrainer
+
                 # Garante que self.cloud_tab (e seu reattach) exista se cloud estiver habilitada
                 # Se cloud pode ser habilitada sem a aba ser visível, pode precisar forçar a criação
                 if not self.cloud_tab and "cloud" in self.tabview._name_list:
-                     print("[UI] Forcing lazy load of Cloud tab for CloudTrainer.")
-                     self._on_tab_change() # Força o carregamento se a aba existir mas não foi clicada
+                    print("[UI] Forcing lazy load of Cloud tab for CloudTrainer.")
+                    self._on_tab_change()  # Força o carregamento se a aba existir mas não foi clicada
 
-                reattach_val = self.cloud_tab.reattach if self.cloud_tab else False # Default seguro
-                trainer = CloudTrainer(self.train_config, self.training_callbacks, self.training_commands, reattach=reattach_val)
+                reattach_val = self.cloud_tab.reattach if self.cloud_tab else False  # Default seguro
+                trainer = CloudTrainer(
+                    self.train_config, self.training_callbacks, self.training_commands, reattach=reattach_val
+                )
             else:
                 ZLUDA.initialize_devices(self.train_config)
                 trainer = GenericTrainer(self.train_config, self.training_callbacks, self.training_commands)
@@ -730,25 +746,25 @@ class TrainUI(ctk.CTk):
             if self.train_config.cloud.enabled:
                 # UIState pode não estar totalmente sincronizado se a aba cloud não foi vista
                 # Idealmente, a config passada para o trainer é a fonte da verdade
-                pass # A lógica de secrets pode precisar de revisão se depender do UIState atualizado pela UI
+                pass  # A lógica de secrets pode precisar de revisão se depender do UIState atualizado pela UI
             trainer.train()
 
         except Exception:
             error_caught = True
             traceback.print_exc()
-            self.on_update_status("Error: Check console") # Atualiza status no erro
+            self.on_update_status("Error: Check console")  # Atualiza status no erro
         finally:
             # Bloco finally garante a limpeza
             if trainer:
-                if self.train_config.cloud.enabled and hasattr(self.train_config, 'secrets'):
-                     # Tenta atualizar secrets mesmo em caso de erro ou sucesso
+                if self.train_config.cloud.enabled and hasattr(self.train_config, "secrets"):
+                    # Tenta atualizar secrets mesmo em caso de erro ou sucesso
                     try:
                         self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
                     except Exception as e:
-                         print(f"Warn: Failed to update cloud secrets state after training: {e}")
+                        print(f"Warn: Failed to update cloud secrets state after training: {e}")
 
                 trainer.end()
-                del trainer # Libera referência
+                del trainer  # Libera referência
 
             self.training_thread = None
             # self.training_commands = None # Mantém os comandos? Ou reseta? Depende da lógica de stop/restart
@@ -761,7 +777,6 @@ class TrainUI(ctk.CTk):
             # Garante que o botão seja reativado na thread principal (usando self.after)
             self.after(0, self._reset_training_button)
 
-
     def _reset_training_button(self):
         """Helper para resetar os botões e switches de controle na thread principal."""
         print("[UI Thread] Resetting training control buttons/switches.")
@@ -769,7 +784,7 @@ class TrainUI(ctk.CTk):
             self.training_button.configure(text="Start Training", state="normal")
             # Se o estado for 'stopping' (disabled), força para 'normal'
             if self.training_button.cget("state") == "disabled":
-                 self.training_button.configure(state="normal")
+                self.training_button.configure(state="normal")
 
         # Reseta o switch de pausa para OFF e NORMAL
         if self.pause_switch_widget:
@@ -779,55 +794,55 @@ class TrainUI(ctk.CTk):
         # Reseta os comandos AQUI para garantir que não haja comandos pendentes após parada/erro
         # Isso evita que um pause_request antigo seja processado se o treino for reiniciado
         self.training_commands = None
-        self.training_callbacks = None # Limpa callbacks também
-
+        self.training_callbacks = None  # Limpa callbacks também
 
     def start_training(self):
         if self.training_thread is None:
             self.top_bar_component.save_default()
 
-            self.training_commands = TrainCommands() # Cria novos comandos para a sessão
+            self.training_commands = TrainCommands()  # Cria novos comandos para a sessão
 
             if self.pause_switch_widget:
                 self.ui_state["pause_training"] = False
                 self.pause_switch_widget.deselect()
                 self.pause_switch_widget.configure(state="normal")
 
-            if self.training_button: # Verifica se existe
+            if self.training_button:  # Verifica se existe
                 self.training_button.configure(text="Stop Training", state="normal")
 
-            self.training_thread = threading.Thread(target=self.__training_thread_function, daemon=True) # Use daemon=True?
+            self.training_thread = threading.Thread(
+                target=self.__training_thread_function, daemon=True
+            )  # Use daemon=True?
             self.training_thread.start()
-        elif self.training_commands: # Verifica se comandos existem para parar
-            if self.training_button: # Verifica se existe
-                 # Muda o texto para indicar que está parando e desabilita
-                 self.training_button.configure(text="Stopping...", state="disabled")
-            self.after(0, lambda: self.on_update_status("Stopping...")) # Atualiza status via after
-            self.training_commands.stop() # Envia o comando de parada
+        elif self.training_commands:  # Verifica se comandos existem para parar
+            if self.training_button:  # Verifica se existe
+                # Muda o texto para indicar que está parando e desabilita
+                self.training_button.configure(text="Stopping...", state="disabled")
+            self.after(0, lambda: self.on_update_status("Stopping..."))  # Atualiza status via after
+            self.training_commands.stop()  # Envia o comando de parada
         else:
             print("Warn: Stop training called but no training commands object exists.")
             # Possivelmente resetar o botão se estiver em estado inconsistente
-            self._reset_training_button() # Usa o método de reset
+            self._reset_training_button()  # Usa o método de reset
 
     def export_training(self):
         file_path = filedialog.asksaveasfilename(
             filetypes=[("JSON config", "*.json"), ("All Files", "*.*")],
             initialdir=".",
             initialfile="config.json",
-            defaultextension=".json" # Adiciona extensão padrão
+            defaultextension=".json",  # Adiciona extensão padrão
         )
 
         if file_path:
             try:
                 # Usar secrets=False diretamente no to_pack_dict
                 config_dict = self.train_config.to_pack_dict(secrets=False)
-                with open(file_path, "w", encoding='utf-8') as f: # Especifica encoding
+                with open(file_path, "w", encoding="utf-8") as f:  # Especifica encoding
                     json.dump(config_dict, f, indent=4)
                 self.on_update_status(f"Config exported to {Path(file_path).name}")
             except Exception as e:
                 traceback.print_exc()
                 self.on_update_status(f"Error exporting config: {e}")
-
 
     # Funções sample_now, backup_now, save_now não precisam mudar
     # Elas dependem de self.training_commands que é gerenciado pelo start/stop
@@ -851,5 +866,6 @@ class TrainUI(ctk.CTk):
             train_commands.save()
         else:
             self.on_update_status("Cannot save: Not training")
+
 
 # Fim da classe TrainUI
