@@ -400,12 +400,28 @@ class TrainUI(ctk.CTk):
 
         components.label(
             frame,
-            6,
+            6, # Deve ser 6
             0,
             "Pause Training",
             tooltip="Pause after the current epoch finishes and move model to CPU. Toggle again to resume.",
         )
-        components.switch(frame, 6, 1, self.ui_state, "pause_training", command=self.toggle_pause)
+
+        # Switch na coluna 1 da mesma linha (6)
+        self.pause_switch_widget = ctk.CTkSwitch(
+            master=frame,
+            text="",  # Texto vazio, pois a label está separada
+            variable=self.pause_switch_var,  # Usa a variável dedicada
+            onvalue=True,
+            offvalue=False,
+            command=self.toggle_pause,
+        )
+        self.pause_switch_widget.grid(
+            row=6, # Deve ser 6
+            column=1,      # Coluna correta ao lado da label
+            padx=(0, 20),
+            pady=5,
+            sticky="w"     # Alinha à esquerda na célula
+        )
 
         frame.pack(fill="both", expand=True)
         return frame  # Retorna o frame criado
@@ -802,10 +818,16 @@ class TrainUI(ctk.CTk):
 
             self.training_commands = TrainCommands()  # Cria novos comandos para a sessão
 
+            # --- CORREÇÃO AQUI ---
+            # Reseta o estado do switch de pausa usando a variável dedicada
+            if self.pause_switch_var: # Checa se a variável existe
+                self.pause_switch_var.set(False) # Define a variável como False (desligado)
+            # A atualização visual (deselect, configure) pode ser feita aqui ou confiar no _reset_training_button
+            # Para garantir, vamos fazer aqui também:
             if self.pause_switch_widget:
-                self.ui_state["pause_training"] = False
-                self.pause_switch_widget.deselect()
-                self.pause_switch_widget.configure(state="normal")
+                 self.pause_switch_widget.deselect()
+                 self.pause_switch_widget.configure(state="normal")
+            # --- FIM DA CORREÇÃO ---
 
             if self.training_button:  # Verifica se existe
                 self.training_button.configure(text="Stop Training", state="normal")

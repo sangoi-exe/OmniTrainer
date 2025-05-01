@@ -140,30 +140,23 @@ class GenericTrainer(BaseTrainer):
 
         # 2. ConvergeControl
         self.converge_control = None
-        if getattr(self.config, "convctrl_pattern_use_it", False):
+        if getattr(self.config, "convctrl_use_it", False):
             self.converge_control = ConvergeControl(
-                z_thresh=getattr(self.config, "z_thresh", 2.0),
-                u_abs_thresh=getattr(self.config, "u_abs_thresh", 1e-4),
-                k_confirm=getattr(self.config, "k_confirm", 3),
                 warmup_frac=getattr(self.config, "warmup_frac", 0),
                 total_epochs=getattr(self.config, "epochs", 100),
-                debug=converge_debug,
-                verbose=converge_verbose,
-                min_history=getattr(self.config, "converge_min_history", 30),
-                min_buffer_epochs=getattr(self.config, "converge_min_buffer_epochs", 0.1)
             )
             # The actual freezing action only happens if it's Run 2, handled inside the train loop logic.
             # Here we just initialize if the flag is True.
             purpose = "coleta de dados de convergência" if self.run_number == 1 else "lógica de congelamento"
-            logFun(f"[ConvergeControl] Inicializado (flag convctrl_pattern_use_it=True) para {purpose} na Run {self.run_number}.", lvl="debug")             
+            logFun(f"[ConvergeControl] Inicializado (flag convctrl_use_it=True) para {purpose} na Run {self.run_number}.", lvl="debug")             
         else:
-            logFun("[ConvergeControl] Desativado (flag convctrl_pattern_use_it=False).", lvl="debug") 
+            logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug") 
 
         # 3. AdaptiveDCoef
         self.adaptive_dcoef = None
         # AdaptiveDCoef only makes sense and should only be activated in Run 2 AND if its flag is True.
         if self.run_number == 2 and getattr(self.config, "dcoef_pattern_use_it", False):
-            profile_path = getattr(self.config, "dcoef_profile_path", None)
+            profile_path = getattr(self.config, "dcoef_pattern_path", None)
             if profile_path:
                 try:
                     self.adaptive_dcoef = AdaptiveDCoef(
@@ -179,7 +172,7 @@ class GenericTrainer(BaseTrainer):
                     logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="debug") 
                     self.adaptive_dcoef = None # Ensure it's None if init fails
             else:
-                logFun("[Trainer Aviso] 'dcoef_pattern_use_it' ativo para Run 2, mas 'dcoef_profile_path' não especificado ou inválido. d_coef dinâmico desativado.", lvl="debug") 
+                logFun("[Trainer Aviso] 'dcoef_pattern_use_it' ativo para Run 2, mas 'dcoef_pattern_path' não especificado ou inválido. d_coef dinâmico desativado.", lvl="debug") 
                 self.adaptive_dcoef = None
         elif getattr(self.config, "dcoef_pattern_use_it", False):
             logFun("[AdaptiveDCoef] Desativado (não é Run 2 ou flag dcoef_pattern_use_it=False).", lvl="debug") 
@@ -1336,10 +1329,7 @@ class GenericTrainer(BaseTrainer):
 
         if self.one_step_trained:
             self.model.to(self.temp_device)
-            if self.model.train_device != self.temp_device:
-                logFun(f"[Trainer] Movendo modelo para {self.temp_device} antes do salvamento final.", lvl="debug")
-                self.model.to(self.temp_device)
-                torch_gc()
+            torch_gc()
 
             if self.config.backup_before_save:
                 self.backup(self.model.train_progress) # Backup já usa o modelo no temp_device            
