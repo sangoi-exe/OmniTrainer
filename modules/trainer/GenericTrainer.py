@@ -1105,19 +1105,10 @@ class GenericTrainer(BaseTrainer):
                                         self.converge_control.set_current_time(current_epoch, global_step)
                                         self.converge_control.ingest_and_process(mapped_stats_list)
 
-                                    for stat in current_stats_list:
-                                        group_idx = stat["group_idx"]
-                                        if 0 <= group_idx < len(self.model.param_group_mapping):
-                                            name = self.model.param_group_mapping[group_idx]
-                                            pg = self.model.parameters.by_unique_name(name)
-                                            if pg:
-                                                for param in pg.parameters:
-                                                    # só manda ao ConvergeControl se o grad existir
-                                                    if hasattr(param, "grad") and param.grad is not None:
-                                                        self.converge_control.update_step_metrics(name, param)
-                                                        # logFun(f"[ConvergeControl] ATUALIZOU O '{name}'", lvl="debug")
-                                                    # else:
-                                                    #     logFun(f"[ConvergeControl] NÃO ATUALIZOU O '{name}'", lvl="debug")
+                                    # 🔸 Substitui mapeamento por parameter-groups por atualização direta dos wrappers LoRA
+                                    for name, peft_mod in self.model.unet_lora.lora_modules.items():
+                                        # peft_mod é instância de PeftBase (nn.Module), que encapsula A, B, alpha…
+                                        self.converge_control.update_step_metrics(name, peft_mod)
                                     # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
                                     if self.recorder:
                                         # Pass necessary stats to recorder's log_step
@@ -1237,15 +1228,16 @@ class GenericTrainer(BaseTrainer):
                     return # Sai do método train
 
                 # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
+                # 🔸 Snapshot dos pesos CORRETOS dos wrappers LoRA
                 weights_dict: Dict[str, torch.Tensor] = {}
-                for s in mapped_stats_list:
-                    n = s["name"]
-                    pg = self.model.parameters.by_unique_name(n)
-                    if pg and pg.parameters:
-                        # pega o primeiro parâmetro do grupo (ou outro critério seu)
-                        w = pg.parameters[0].detach().clone()
-                        weights_dict[n] = w
-                        logFun(f"[Trainer] adding param do weight_dick {w}.", lvl="info")
+                logFun(dir(self.model), lvl="error")
+                
+                for name, peft_mod in self.model.unet_lora.lora_modules.items():
+                    snap = peft_mod.flat_params()                # concatena A, B, alpha…
+                    if snap.numel() == 0:
+                        continue
+                    weights_dict[name] = snap
+                    logFun(f"[Trainer] snapshot '{name}' ‖w‖={snap.norm():.3e}", lvl="debug")
                 self.converge_control.snapshot_epoch_weights(weights_dict)
 
             train_progress.next_epoch()
