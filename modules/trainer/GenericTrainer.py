@@ -1114,7 +1114,6 @@ class GenericTrainer(BaseTrainer):
                                         for param in pg.parameters:
                                             # só manda ao ConvergeControl se o grad existir
                                             if hasattr(param, "grad") and param.grad is not None:
-                                                logFun(f"[ConvergeControl] atualizando métricas de passo para '{name}'", lvl="debug")
                                                 self.converge_control.update_step_metrics(name, param)
                                     # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
                                     weights_dict: Dict[str, torch.Tensor] = {}
