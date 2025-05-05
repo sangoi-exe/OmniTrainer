@@ -1059,7 +1059,6 @@ class GenericTrainer(BaseTrainer):
                                     group_idx = stat["group_idx"] # Acesso direto, pode dar KeyError se não existir
                                     if 0 <= group_idx < len(self.model.param_group_mapping):
                                         name = self.model.param_group_mapping[group_idx]
-                                        logFun(dir(name), lvl="error")
                                         # AQUI TÁ SUAVE
                                         if name: # Garante que o nome não é vazio ou None
                                             stat_with_name = stat.copy()
