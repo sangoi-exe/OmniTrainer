@@ -9,6 +9,7 @@ import collections
 from pathlib import Path
 from datetime import datetime
 from collections.abc import Callable
+from typing import Dict
 
 from numpy import dtype, inf
 
@@ -1053,8 +1054,6 @@ class GenericTrainer(BaseTrainer):
                         try:
                             current_stats_list = self.model.optimizer.pop_stats()
                             if current_stats_list: # Only proceed if stats were generated
-                                global_step = self.model.train_progress.global_step
-                                current_epoch = self.model.train_progress.epoch
                                 mapped_stats_list = []
                                 for stat in current_stats_list:
                                     group_idx = stat["group_idx"] # Acesso direto, pode dar KeyError se não existir
@@ -1102,6 +1101,8 @@ class GenericTrainer(BaseTrainer):
                                                 logFun(f"[Trainer] Delta_L2 not found for module '{module_name}' in current_deltas from TrainGPS.", lvl="debug")
                                     if self.converge_control:
                                         # AQUI TÁ SUAVE
+                                        global_step = self.model.train_progress.global_step
+                                        current_epoch = self.model.train_progress.epoch                                        
                                         self.converge_control.set_current_time(current_epoch, global_step)
                                         self.converge_control.ingest_and_process(mapped_stats_list)
 
@@ -1109,17 +1110,22 @@ class GenericTrainer(BaseTrainer):
                                         group_idx = stat["group_idx"]
                                         if 0 <= group_idx < len(self.model.param_group_mapping):
                                             name = self.model.param_group_mapping[group_idx]
-                                            pg = self.model.parameters.by_unique_name(name)
-                                            if pg and pg.param is not None:
-                                                logFun(f"botar um log aqui pra saber se existe essa merda porque esse chatgpt tá de sacanagem", lvl="debug")
-                                                self.converge_control.update_step_metrics(name, pg.param)
+                                    pg = self.model.parameters.by_unique_name(name)
+                                    if pg:
+                                        for param in pg.parameters:
+                                            # só manda ao ConvergeControl se o grad existir
+                                            if hasattr(param, "grad") and param.grad is not None:
+                                                logFun(f"[ConvergeControl] atualizando métricas de passo para '{name}'", lvl="debug")
+                                                self.converge_control.update_step_metrics(name, param)
                                     # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
-                                    weights_dict = {}
+                                    weights_dict: Dict[str, torch.Tensor] = {}
                                     for s in mapped_stats_list:
                                         n = s["name"]
                                         pg = self.model.parameters.by_unique_name(n)
-                                        if pg and pg.param is not None:
-                                            weights_dict[n] = pg.param
+                                        if pg and pg.parameters:
+                                            # pega o primeiro parâmetro do grupo (ou outro critério seu)
+                                            w = pg.parameters[0].detach().clone()
+                                            weights_dict[n] = w
                                     self.converge_control.snapshot_epoch_weights(weights_dict)
                                     # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
                                     if self.recorder:
