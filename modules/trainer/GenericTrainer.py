@@ -1109,12 +1109,15 @@ class GenericTrainer(BaseTrainer):
                                         group_idx = stat["group_idx"]
                                         if 0 <= group_idx < len(self.model.param_group_mapping):
                                             name = self.model.param_group_mapping[group_idx]
-                                    pg = self.model.parameters.by_unique_name(name)
-                                    if pg:
-                                        for param in pg.parameters:
-                                            # só manda ao ConvergeControl se o grad existir
-                                            if hasattr(param, "grad") and param.grad is not None:
-                                                self.converge_control.update_step_metrics(name, param)
+                                            pg = self.model.parameters.by_unique_name(name)
+                                            if pg:
+                                                for param in pg.parameters:
+                                                    # só manda ao ConvergeControl se o grad existir
+                                                    if hasattr(param, "grad") and param.grad is not None:
+                                                        self.converge_control.update_step_metrics(name, param)
+                                                        # logFun(f"[ConvergeControl] ATUALIZOU O '{name}'", lvl="debug")
+                                                    # else:
+                                                    #     logFun(f"[ConvergeControl] NÃO ATUALIZOU O '{name}'", lvl="debug")
                                     # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
                                     weights_dict: Dict[str, torch.Tensor] = {}
                                     for s in mapped_stats_list:
