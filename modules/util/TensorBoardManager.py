@@ -6,6 +6,8 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Optional, Tuple, List, Union
 
+from modules.sangoi.logFun import logFun
+
 
 class TensorBoardManager:
     """
@@ -50,8 +52,8 @@ class TensorBoardManager:
 
         self._total_items_in_buffer = 0
 
-        print(f"[TensorBoardManager] Inicializado para o diretório: {log_dir}")
-        print(f"[TensorBoardManager] Flush automático a cada {flush_secs}s ou {max_queue_size} itens.")
+        logFun(f"[TensorBoardManager] Inicializado para o diretório: {log_dir}", lvl="success")
+        logFun(f"[TensorBoardManager] Flush automático a cada {flush_secs}s ou {max_queue_size} itens.", lvl="info")
 
     def add_scalar(
         self, tag: str, scalar_value: Any, global_step: Optional[int] = None

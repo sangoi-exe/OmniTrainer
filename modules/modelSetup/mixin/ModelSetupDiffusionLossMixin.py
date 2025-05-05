@@ -16,15 +16,13 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from modules.util.NamedParameterGroup import NamedParameterGroupCollection
-from typing import TYPE_CHECKING, Optional, Callable, Tuple, Union
+from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from modules.util.TensorBoardManager import TensorBoardManager
-    from modules.model.BaseModel import BaseModel # Para type hint do model
-    from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 
 from modules.util.TensorBoardManager import TensorBoardManager
-from modules.sangoi.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
+from modules.sangoi.DynamicLossControl import LossTracker, DynamicLossControl
+from modules.sangoi.TrainGPS import TrainGPS
 
 class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     __coefficients: DiffusionScheduleCoefficients | None
@@ -44,7 +42,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.config = None
         self.loaded_pattern_deltas = None
         self.loss_tracker = LossTracker(window_size=100, use_mad=False)
-        self.dynamic_loss_strengthing = DynamicLossStrength()
+        self.dynamic_loss_strengthing = DynamicLossControl()
 
     def __log_cosh_loss(
         self,
@@ -420,7 +418,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.progress = progress
         self.tensorboard = model.tensorboard
         
-        delta_instance: DeltaPatternRegularizer | None = getattr(model, 'deltas', None)
+        gps_instance: TrainGPS | None = getattr(model, 'deltas', None)
 
         loss_weight = batch["loss_weight"]
 
@@ -493,11 +491,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         self.progress.global_step,
                     )
 
-            if config.delta_pattern_use_it and delta_instance is not None and delta_instance.reference_deltas:
+            if config.train_gps_use_it and gps_instance is not None and gps_instance.reference_deltas:
               try:
                 # Calcula a penalidade usando os pesos *atuais* do modelo
                 # e comparando o delta *acumulado atual* com o delta de referência
-                penalty = delta_instance.compute_penalty(lambda_weight=config.delta_pattern_weight)
+                penalty = gps_instance.compute_penalty(lambda_weight=config.train_gps_weight)
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
@@ -507,7 +505,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 self.tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
 
               except Exception as e:
-                    print(f"[DeltaPattern] Erro ao calcular/aplicar penalidade: {e}")
+                    print(f"[TrainGPS] Erro ao calcular/aplicar penalidade: {e}")
                     traceback.print_exc() # Loga o traceback para depuração
 
         return losses

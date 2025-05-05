@@ -127,7 +127,7 @@ class LoraTab:
         # Use Delta Pattern (Novo) - Inserido na linha 3, colunas 3 e 4
         components.label(master, 3, 3, "Use Delta Pattern",
                          tooltip="Apply a pre-defined delta pattern during training.")
-        components.switch(master, 3, 4, self.ui_state, "delta_pattern_use_it")
+        components.switch(master, 3, 4, self.ui_state, "train_gps_use_it")
 
         # lora weight dtype
         components.label(master, 4, 0, f"{name} Weight Data Type",
@@ -141,7 +141,7 @@ class LoraTab:
         # Save Delta Pattern (Novo) - Inserido na linha 4, colunas 3 e 4
         components.label(master, 4, 3, "Save Delta Pattern",
                          tooltip="Save the calculated delta pattern after training.")
-        components.switch(master, 4, 4, self.ui_state, "delta_pattern_save_it")
+        components.switch(master, 4, 4, self.ui_state, "train_gps_save_it")
 
         # Movido para linha 5
         components.label(master, 5, 0, "Bundle Embeddings",
@@ -152,7 +152,7 @@ class LoraTab:
         # Delta Pattern Weight (Novo) - Inserido na linha 5, colunas 3 e 4
         components.label(master, 5, 3, "Delta Pattern Weight",
                          tooltip="Weight multiplier for the delta pattern application.")
-        components.entry(master, 5, 4, self.ui_state, "delta_pattern_weight")
+        components.entry(master, 5, 4, self.ui_state, "train_gps_weight")
 
         components.label(master, 6, 0, "Layer Preset",
                          tooltip="Select a preset defining which layers to train, or select 'Custom'")
@@ -192,20 +192,20 @@ class LoraTab:
         components.label(master, 9, 0, "Delta Pattern Path",
                          tooltip="Path to the delta pattern file (.pt, .safetensors). Leave empty if not using.")
         delta_path_entry = components.file_entry(
-            master, 9, 1, self.ui_state, "delta_pattern_path"
+            master, 9, 1, self.ui_state, "train_gps_path"
         )
         delta_path_entry.grid(row=9, column=1, columnspan=4, sticky="ew")
 
         # Switch para usar DCoef Pattern
         components.label(master, 10, 0, "Use DCoef Pattern",
                          tooltip="Apply a pre-defined dcoef pattern per module.")
-        components.switch(master, 10, 1, self.ui_state, "dcoef_pattern_use_it")
+        components.switch(master, 10, 1, self.ui_state, "adpt_dcoef_use_it")
 
         # Campo para path do DCoef Pattern
         components.label(master, 11, 0, "DCoef Pattern Path",
                          tooltip="Path to the dcoef pattern profile (.json.gz). Leave empty if not using.")
         dcoef_path_entry = components.file_entry(
-            master, 11, 1, self.ui_state, "dcoef_pattern_path"
+            master, 11, 1, self.ui_state, "adpt_dcoef_path"
         )
         dcoef_path_entry.grid(row=11, column=1, columnspan=4, sticky="ew")
 				

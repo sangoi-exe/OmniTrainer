@@ -10,6 +10,7 @@ from typing import Any, Union
 from datetime import datetime
 from abc import abstractmethod
 from collections.abc import Mapping
+from modules.sangoi.logFun import logFun
 from modules.util.enum.ModelType import PeftType
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
@@ -738,9 +739,7 @@ class LoRAModuleWrapper:
 
         self.default_rank = config.lora_rank
         self.default_alpha = config.lora_alpha
-        print(
-            f"[LoRA INFO] Global Rank = {self.default_rank}, Global Alpha = {self.default_alpha}"
-        )
+        logFun(f"[LoRA] Global Rank = {self.default_rank}, Global Alpha = {self.default_alpha}", lvl="info")
 
         self.lora_layer_rules: dict[str, dict[str, Union[int, float]]] = {}
 
@@ -750,115 +749,83 @@ class LoRAModuleWrapper:
         # print(f"[LoRA DEBUG] Value of rank_rules_list before loop: {rank_rules_list}") # Keep if needed
         for rule_item in rank_rules_list:  # Renamed variable for clarity
             # START CHANGE - Attempt to parse string items into dicts
-            print(
-                f"[LoRA DEBUG] Processing rank rule item: {rule_item} | Type: {type(rule_item)}"
-            )
+            # logFun(f"[LoRA] Processing rank rule item: {rule_item} | Type: {type(rule_item)}", lvl="debug")
             rule_dict = None
             if isinstance(rule_item, str):
                 try:
                     rule_dict = ast.literal_eval(rule_item)
-                    print(
-                        f"[LoRA DEBUG] Successfully parsed string rule into dict: {rule_dict}"
-                    )
+                    logFun(f"[LoRA] Successfully parsed string rule into dict: {rule_dict}", lvl="success")
                 except (ValueError, SyntaxError) as e:
-                    print(
-                        f"[LoRA WARNING] Failed to parse string rule item '{rule_item}': {e}. Skipping."
-                    )
+                    logFun(f"[LoRA] Failed to parse string rule item '{rule_item}': {e}. Skipping.", lvl="error")
                     continue  # Skip to the next item in the list
             elif isinstance(rule_item, dict):
                 rule_dict = rule_item  # It's already a dict
             else:
-                print(
-                    f"[LoRA WARNING] Unexpected item type in rank rules list: {type(rule_item)}. Skipping."
-                )
+                logFun(f"[LoRA] Unexpected item type in rank rules list: {type(rule_item)}. Skipping.", lvl="warning")
                 continue
 
             if not isinstance(rule_dict, dict):
                 # This warning might now catch cases where literal_eval resulted in non-dict or parsing failed implicitly
-                print(
-                    f"[LoRA WARNING] Skipping invalid rank rule entry: {rule_dict} (expected a dictionary after processing)"
-                )
+                logFun(f"[LoRA] Skipping invalid rank rule entry: {rule_dict} (expected a dictionary after processing)", lvl="warning")
                 continue
             # END CHANGE
 
             for pattern, rank in rule_dict.items():
                 if not isinstance(rank, int):
-                    print(
-                        f"[LoRA WARNING] Invalid rank type in rule '{pattern}': expected int, got {type(rank).__name__}. Skipping rule."
-                    )
+                    logFun( f"[LoRA] Invalid rank type in rule '{pattern}': expected int, got {type(rank).__name__}. Skipping rule.", lvl="warning")
                     continue
                 if not isinstance(pattern, str):
-                    print(
-                        f"[LoRA WARNING] Invalid pattern type in rank rule: expected str, got {type(pattern).__name__}. Skipping rule '{pattern}'."
-                    )
+                    logFun(f"[LoRA] Invalid pattern type in rank rule: expected str, got {type(pattern).__name__}. Skipping rule '{pattern}'.", lvl="warning")
                     continue
                 self.lora_layer_rules.setdefault(pattern.strip(), {})["rank"] = rank
 
         alpha_rules_list = getattr(config, "lora_modules_alpha_rules", []) or []
-        # print(f"[LoRA DEBUG] Type of alpha_rules_list before loop: {type(alpha_rules_list)}") # Keep if needed
-        # print(f"[LoRA DEBUG] Value of alpha_rules_list before loop: {alpha_rules_list}") # Keep if needed
+        # logFun(f"[LoRA DEBUG] Type of alpha_rules_list before loop: {type(alpha_rules_list)}") # Keep if needed
+        # logFun(f"[LoRA DEBUG] Value of alpha_rules_list before loop: {alpha_rules_list}") # Keep if needed
         for rule_item in alpha_rules_list:  # Renamed variable for clarity
-            # START CHANGE - Attempt to parse string items into dicts
-            print(
-                f"[LoRA DEBUG] Processing alpha rule item: {rule_item} | Type: {type(rule_item)}"
-            )
+            # logFun(f"[LoRA] Processing alpha rule item: {rule_item} | Type: {type(rule_item)}", lvl="debug")
             rule_dict = None
             if isinstance(rule_item, str):
                 try:
                     rule_dict = ast.literal_eval(rule_item)
-                    print(
-                        f"[LoRA DEBUG] Successfully parsed string rule into dict: {rule_dict}"
-                    )
+                    logFun(f"[LoRA] Successfully parsed string rule into dict: {rule_dict}", lvl="success")
                 except (ValueError, SyntaxError) as e:
-                    print(
-                        f"[LoRA WARNING] Failed to parse string rule item '{rule_item}': {e}. Skipping."
-                    )
+                    logFun(f"[LoRA] Failed to parse string rule item '{rule_item}': {e}. Skipping.", lvl="error")
                     continue  # Skip to the next item in the list
             elif isinstance(rule_item, dict):
                 rule_dict = rule_item  # It's already a dict
             else:
-                print(
-                    f"[LoRA WARNING] Unexpected item type in alpha rules list: {type(rule_item)}. Skipping."
-                )
+                logFun(f"[LoRA] Unexpected item type in alpha rules list: {type(rule_item)}. Skipping.", lvl="warning")
                 continue
 
             if not isinstance(rule_dict, dict):
-                print(
-                    f"[LoRA WARNING] Skipping invalid alpha rule entry: {rule_dict} (expected a dictionary after processing)"
-                )
+                logFun(f"[LoRA] Skipping invalid alpha rule entry: {rule_dict} (expected a dictionary after processing)", lvl="warning")
                 continue
-            # END CHANGE
 
             for pattern, alpha in rule_dict.items():
                 if not isinstance(
                     alpha, int
                 ):  # Still expecting int here based on previous request
-                    print(
-                        f"[LoRA WARNING] Invalid alpha type in rule '{pattern}': expected int, got {type(alpha).__name__}. Skipping rule."
-                    )
+                    logFun(f"[LoRA] Invalid alpha type in rule '{pattern}': expected int, got {type(alpha).__name__}. Skipping rule.", lvl="warning")
                     continue
                 if not isinstance(pattern, str):
-                    print(
-                        f"[LoRA WARNING] Invalid pattern type in alpha rule: expected str, got {type(pattern).__name__}. Skipping rule '{pattern}'."
-                    )
+                    logFun(f"[LoRA] Invalid pattern type in alpha rule: expected str, got {type(pattern).__name__}. Skipping rule '{pattern}'.", lvl="warning")
                     continue
                 self.lora_layer_rules.setdefault(pattern.strip(), {})["alpha"] = float(
                     alpha
                 )
 
         # Debug print for the combined rules
-        print("[LoRA INFO] Combined Layer Rules:")
+        logFun("[LoRA] Combined Layer Rules:", lvl="info")
         for pattern, cfg in sorted(
             self.lora_layer_rules.items()
         ):  # Sort for consistent output
-            print(f"  - {pattern} -> {cfg}")
+            logFun(f"  - {pattern} -> {cfg}", lvl="info")
 
         try:
             from modules.modelSetup.StableDiffusionXLLoRASetup import PRESETS
         except ImportError:
-            print(
-                "Warning: PRESETS dictionary not found. Presets filters will not be loaded."
-            )
+            logFun("PRESETS dictionary not found. Presets filters will not be loaded.", lvl="error")
             PRESETS = {}
 
         preset_inclusion_patterns = []
@@ -869,30 +836,20 @@ class LoRAModuleWrapper:
             preset_config_raw = PRESETS.get(preset_name)
             # Adaptação: No seu StableDiffusionXLLoRASetup, PRESETS parece ser List[str]
             if preset_config_raw is None and preset_name != "full":
-                print(
-                    f"[LoRA WARNING] Preset '{preset_name}' not found or is None. Using external filter/blacklist only."
-                )
+                logFun(f"[LoRA] Preset '{preset_name}' not found or is None. Using external filter/blacklist only.", lvl="warning")
             elif preset_name == "full":
-                print(
-                    "[LoRA INFO] Preset 'full' selected. No preset-specific inclusion filter applied."
-                )
+                logFun("[LoRA] Preset 'full' selected. No preset-specific inclusion filter applied.", lvl="info")
             # Verifica se é uma lista de strings (como parece ser no seu setup)
             elif isinstance(preset_config_raw, list):
-                print(
-                    f"[LoRA INFO] Using preset '{preset_name}' for inclusion filters."
-                )
+                logFun(f"[LoRA] Using preset '{preset_name}' for inclusion filters.", lvl="info")
                 # Os itens da lista são os padrões de inclusão
                 preset_inclusion_patterns = [
                     p for p in preset_config_raw if isinstance(p, str)
                 ]
             else:
-                print(
-                    f"[LoRA WARNING] Preset '{preset_name}' has unexpected format ({type(preset_config_raw)}). Expected list[str]. Ignoring preset filters."
-                )
+                logFun(f"[LoRA] Preset '{preset_name}' has unexpected format ({type(preset_config_raw)}). Expected list[str]. Ignoring preset filters.", lvl="error")
         else:
-            print(
-                "[LoRA INFO] No preset specified. Using external filter/blacklist only."
-            )
+            logFun("[LoRA] No preset specified. Using external filter/blacklist only.", lvl="warning")
 
         # Combina filtros de inclusão (Preset + Externo)
         combined_inclusion_patterns = set(
@@ -907,22 +864,15 @@ class LoRAModuleWrapper:
             )
 
         self.inclusion_filter_patterns = list(combined_inclusion_patterns)
-        print(
-            f"[LoRA INFO] Active inclusion patterns: {self.inclusion_filter_patterns if self.inclusion_filter_patterns else 'None (include all unless blacklisted)'}"
-        )
+        logFun(f"[LoRA] Active inclusion patterns: {self.inclusion_filter_patterns if self.inclusion_filter_patterns else 'None (include all unless blacklisted)'}", lvl="info")
 
         # Prepara filtro de exclusão (Blacklist)
         self.exclusion_filter_patterns = [
             b.strip() for b in (config.lora_layers_blacklist or []) if b.strip()
         ]
-        print(
-            f"[LoRA INFO] Active exclusion patterns (blacklist): {self.exclusion_filter_patterns if self.exclusion_filter_patterns else 'None'}"
-        )
+        logFun(f"[LoRA] Active exclusion patterns (blacklist): {self.exclusion_filter_patterns if self.exclusion_filter_patterns else 'None'}", lvl="info")
 
-        if not self.lora_layer_rules:
-            print(
-                "[LoRA INFO] No valid layer-specific rank/alpha rules found after processing. Using global defaults."
-            )
+        if not self.lora_layer_rules:logFun("[LoRA] No valid layer-specific rank/alpha rules found after processing. Using global defaults.", lvl="warning")
 
         self.global_additional_kwargs = {}
         if self.peft_type == PeftType.LORA:
@@ -933,25 +883,21 @@ class LoRAModuleWrapper:
                     "norm_epsilon": config.lora_decompose_norm_epsilon,
                     "train_device": torch.device(config.train_device),
                 }
-                print(
-                    f"[LoRA INFO] Using DoRA (decompose=True) with epsilon={self.global_additional_kwargs['norm_epsilon']}, device={self.global_additional_kwargs['train_device']}"
-                )
+                logFun(f"[LoRA] Using DoRA (decompose=True) with epsilon={self.global_additional_kwargs['norm_epsilon']}, device={self.global_additional_kwargs['train_device']}", lvl="info")
             else:
                 self.klass = LoRAModule
                 self.dummy_klass = DummyLoRAModule
-                print("[LoRA INFO] Using LoRA (decompose=False)")
+                logFun("[LoRA] Using LoRA (decompose=False)", lvl="info")
         elif self.peft_type == PeftType.LOHA:
             self.klass = LoHaModule
             self.dummy_klass = DummyLoHaModule
-            print("[LoRA INFO] Using LoHa")
+            logFun("[LoRA] Using LoHa", lvl="info")
         else:
             raise ValueError(f"Unsupported PeftType: {self.peft_type}")
 
         # Cria módulos PEFT (agora usará as regras)
         self.lora_modules = self._initialize_peft_modules(orig_module)
-        print(
-            f"[LoRA INFO] LoRAModuleWrapper '{self.prefix}' initialized with {len(self.lora_modules)} PEFT modules."
-        )
+        logFun(f"[LoRA] LoRAModuleWrapper '{self.prefix}' initialized with {len(self.lora_modules)} PEFT modules.", lvl="info")
         self.generate_keys_by_block_file()
 
     def _should_include_module(
@@ -992,12 +938,10 @@ class LoRAModuleWrapper:
         """Identifica, filtra e cria módulos PEFT usando regras de rank/alpha."""
         lora_modules: dict[str, PeftBase] = {}
         if root_module is None:
-            print(
-                "[LoRA WARNING] _initialize_peft_modules called without root_module. No PEFT modules created."
-            )
+            logFun("[LoRA] _initialize_peft_modules called without root_module. No PEFT modules created.", lvl="error")
             return lora_modules
 
-        print("[LoRA INFO] Identifying and creating PEFT modules...")
+        logFun("[LoRA] Identifying and creating PEFT modules...", lvl="info")
         modules_created_count = 0
         modules_skipped_type = 0
         modules_skipped_filter = 0
@@ -1078,12 +1022,13 @@ class LoRAModuleWrapper:
                 # Tenta criar o módulo PEFT
                 try:
                     # Atualiza log para mostrar rank/alpha aplicados e a regra
-                    log_msg = (
-                        f"[LoRA CREATE] {self.klass.__name__} for: '{original_layer_name}' "  # Loga o nome original
-                        f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use}) "
-                        f"| PEFT Prefix: {peft_module_prefix_for_constructor}"  # Loga o prefixo PEFT final
-                    )
-                    # print(log_msg)  # Mantém o log para feedback
+                    # log_msg = (
+                    #     f"[LoRA CREATE] {self.klass.__name__} for: '{original_layer_name}' "  # Loga o nome original
+                    #     f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use}) "
+                    #     f"| PEFT Prefix: {peft_module_prefix_for_constructor}",
+										# 		lvl="info" # Loga o prefixo PEFT final
+										# 		)
+                    # logFun(log_msg)  # Mantém o log para feedback
 
                     lora_modules[original_layer_name] = self.klass(
                         *args_for_this_module, **kwargs_for_this_module
@@ -1091,20 +1036,21 @@ class LoRAModuleWrapper:
                     modules_created_count += 1
 
                 except Exception as e:
-                    print(
-                        f"[LoRA ERROR] Failed to create PEFT module for layer '{name}' (prefix {peft_module_prefix_for_constructor}) "
-                        f"using Rank={rank_to_use}, Alpha={alpha_to_use}: {e}"
-                    )
+                    logFun(
+                        f"[LoRA] Failed to create PEFT module for layer '{name}' (prefix {peft_module_prefix_for_constructor}) "
+                        f"using Rank={rank_to_use}, Alpha={alpha_to_use}: {e}",
+                        lvl="error"
+												)
 
             else:
                 # Conta como skip de filtro SOMENTE se for Linear/Conv2d mas foi filtrado
                 modules_skipped_filter += 1
 
         # Resumo final
-        print(f"[LoRA INFO] Module Creation Summary for '{self.prefix}':")
-        print(f"  - Created: {modules_created_count} PEFT modules.")
-        print(f"  - Skipped (Filter): {modules_skipped_filter} Linear/Conv2d modules.")
-        print(f"  - Skipped (Type): {modules_skipped_type} non-Linear/Conv2d modules.")
+        logFun(f"[LoRA] Module Creation Summary for '{self.prefix}':", lvl="info")
+        logFun(f"  - Created: {modules_created_count} PEFT modules.", lvl="info")
+        logFun(f"  - Skipped (Filter): {modules_skipped_filter} Linear/Conv2d modules.", lvl="info")
+        logFun(f"  - Skipped (Type): {modules_skipped_type} non-Linear/Conv2d modules.", lvl="info")
         return lora_modules
 
     def load_state_dict(self, state_dict: dict[str, Tensor]):
@@ -1116,9 +1062,7 @@ class LoRAModuleWrapper:
         Uses the global default rank/alpha when creating dummies if needed.
         """
         if not self.lora_modules and self.orig_module is None:
-            print(
-                "[LoRA WARNING] load_state_dict called with no original module and no pre-existing PEFT modules. Attempting to load all as dummies."
-            )
+            logFun("[LoRA] load_state_dict called with no original module and no pre-existing PEFT modules. Attempting to load all as dummies.", lvl="warning")
 
         remaining_state_dict = copy.deepcopy(state_dict)
         loaded_module_prefixes = set()
@@ -1154,9 +1098,7 @@ class LoRAModuleWrapper:
                     k for k in unexpected_keys_overall if k not in module_keys_in_sd
                 ]
             except Exception as e:
-                print(
-                    f"Error loading state_dict into real module {name} (prefix {module.prefix}): {e}"
-                )
+                logFun(f"Error loading state_dict into real module {name} (prefix {module.prefix}): {e}", lvl="error")
 
         # Processa chaves restantes para criar dummies
         potential_dummy_keys = {
@@ -1245,11 +1187,12 @@ class LoRAModuleWrapper:
             dummy_kwargs = self.global_additional_kwargs.copy()
 
             try:
-                print(
-                    f"[LoRA Load] Creating dummy for prefix: {peft_prefix} "
+                logFun(
+                    f"[LoRA] Creating dummy for prefix: {peft_prefix} "
                     f"(Inferred orig: {original_layer_name}) "
-                    f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use})"  # Log atualizado
-                )
+                    f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use})",
+                    lvl="info" # Log atualizado
+										)
                 dummy_module = self.dummy_klass(*dummy_args, **dummy_kwargs)
 
                 # Passa o remaining_state_dict para que PeftBase.load_state_dict possa remover chaves
@@ -1270,16 +1213,12 @@ class LoRAModuleWrapper:
                 unexpected_keys_overall.extend(keys_still_unexpected)
 
                 if result.missing_keys:
-                    print(
-                        f"Warning: Dummy module {peft_prefix} reported missing keys: {result.missing_keys}"
-                    )
+                    logFun(f"Warning: Dummy module {peft_prefix} reported missing keys: {result.missing_keys}", lvl="warning")
                     missing_keys_overall.extend(
                         [peft_prefix + k for k in result.missing_keys]
                     )
                 if result.unexpected_keys:
-                    print(
-                        f"Warning: Dummy module {peft_prefix} reported unexpected keys: {result.unexpected_keys}"
-                    )
+                    logFun(f"Warning: Dummy module {peft_prefix} reported unexpected keys: {result.unexpected_keys}", lvl="warning")
                     unexpected_keys_overall.extend(
                         [
                             peft_prefix + k
@@ -1289,7 +1228,7 @@ class LoRAModuleWrapper:
                     )
 
             except Exception as e:
-                print(f"Error creating or loading dummy for prefix {peft_prefix}: {e}")
+                logFun(f"Error creating or loading dummy for prefix {peft_prefix}: {e}", lvl="error")
 
         final_unexpected = [
             k for k in unexpected_keys_overall if k.startswith(self.prefix)
@@ -1297,17 +1236,13 @@ class LoRAModuleWrapper:
         final_missing = [k for k in missing_keys_overall if k.startswith(self.prefix)]
 
         if final_unexpected:
-            print(
-                f"[LoRA WARNING] Unexpected keys found for prefix '{self.prefix}' after loading:"
-            )
+            logFun(f"[LoRA] Unexpected keys found for prefix '{self.prefix}' after loading:", lvl="warning")
             for k in sorted(list(set(final_unexpected))):
-                print(f"  - {k}")
+                logFun(f"  - {k}", lvl="warning")
         if final_missing:
-            print(
-                f"[LoRA WARNING] Missing keys for prefix '{self.prefix}' during state_dict load:"
-            )
+            logFun(f"[LoRA] Missing keys for prefix '{self.prefix}' during state_dict load:", lvl="warning")
             for k in sorted(list(set(final_missing))):
-                print(f"  - {k}")
+                logFun(f"  - {k}", lvl="warning")
 
     def state_dict(self) -> dict:
         """Returns the state dict containing keys from all managed modules (real and dummy)."""
@@ -1352,9 +1287,7 @@ class LoRAModuleWrapper:
                 ):
                     module.train_device = device
             except Exception as e:
-                print(
-                    f"Error moving module {name} (prefix {module.prefix}) to {device}/{dtype}: {e}"
-                )
+                logFun(f"Error moving module {name} (prefix {module.prefix}) to {device}/{dtype}: {e}", lvl="error")
         return self
 
     def modules(self) -> list[nn.Module]:
@@ -1364,7 +1297,7 @@ class LoRAModuleWrapper:
     def hook_to_module(self):
         """Applies the forward hook to the original modules corresponding to real PEFT modules."""
         if self.orig_module is None:
-            print("Warning: Cannot apply hooks without the original root module.")
+            logFun("Cannot apply hooks without the original root module.", lvl="warning")
             return
         hook_count = 0
         for name, module in self.lora_modules.items():
@@ -1377,9 +1310,7 @@ class LoRAModuleWrapper:
                     module.hook_to_module()
                     hook_count += 1
                 except Exception as e:
-                    print(
-                        f"Error applying hook for PEFT module {name} (prefix {module.prefix}): {e}"
-                    )
+                    logFun(f"Error applying hook for PEFT module {name} (prefix {module.prefix}): {e}", lvl="error")
 
     def remove_hook_from_module(self):
         """Removes the forward hook from the original modules."""
@@ -1396,14 +1327,12 @@ class LoRAModuleWrapper:
                     module.remove_hook_from_module()
                     remove_count += 1
                 except Exception as e:
-                    print(
-                        f"Error removing hook for PEFT module {name} (prefix {module.prefix}): {e}"
-                    )
+                    logFun(f"Error removing hook for PEFT module {name} (prefix {module.prefix}): {e}", lvl="error")
 
     def apply_to_module(self):
         """Applies (merges) PEFT weights directly into the original modules' weights (real modules only)."""
         if self.orig_module is None:
-            print("Warning: Cannot apply weights without the original root module.")
+            logFun("Cannot apply weights without the original root module.", lvl="error")
             return
         apply_count = 0
         for name, module in self.lora_modules.items():
@@ -1416,13 +1345,9 @@ class LoRAModuleWrapper:
                     module.apply_to_module()  # Implementation is in PeftBase subclasses (TODO)
                     apply_count += 1
                 except NotImplementedError:
-                    print(
-                        f"Warning: apply_to_module not implemented for {type(module).__name__} ({name})."
-                    )
+                    logFun(f"apply_to_module not implemented for {type(module).__name__} ({name}).", lvl="warning")
                 except Exception as e:
-                    print(
-                        f"Error applying weights for PEFT module {name} (prefix {module.prefix}): {e}"
-                    )
+                    logFun(f"Error applying weights for PEFT module {name} (prefix {module.prefix}): {e}", lvl="error")
 
     def extract_from_module(self, base_module: nn.Module):
         """
@@ -1430,9 +1355,7 @@ class LoRAModuleWrapper:
         (Requires implementation in LoRAModule, DoRAModule, etc.)
         """
         if self.orig_module is None:
-            print(
-                "Warning: Cannot extract weights without the current original root module."
-            )
+            logFun("Cannot extract weights without the current original root module.", lvl="warning")
             return
         extract_count = 0
         for name, module in self.lora_modules.items():
@@ -1447,17 +1370,11 @@ class LoRAModuleWrapper:
                     )  # Implementation in PeftBase subclasses (TODO)
                     extract_count += 1
                 except AttributeError:
-                    print(
-                        f"Warning: Could not find base submodule '{name}' during extraction."
-                    )
+                    logFun(f"Could not find base submodule '{name}' during extraction.", lvl="warning")
                 except NotImplementedError:
-                    print(
-                        f"Warning: extract_from_module not implemented for {type(module).__name__} ({name})."
-                    )
+                    logFun(f"extract_from_module not implemented for {type(module).__name__} ({name}).", lvl="warning")
                 except Exception as e:
-                    print(
-                        f"Error extracting weights for PEFT module {name} (prefix {module.prefix}): {e}"
-                    )
+                    logFun(f"Error extracting weights for PEFT module {name} (prefix {module.prefix}): {e}", lvl="error")
 
     def prune(self):
         """Removes all dummy modules from management."""
@@ -1501,13 +1418,13 @@ class LoRAModuleWrapper:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_filename = f"unetKeysByBlock_{timestamp}.txt"
 
-        print(f"[LoRA DEBUG] Vai gerar key file com {len(self.lora_modules)} módulos:")
+        logFun(f"[LoRA] Vai gerar key file com {len(self.lora_modules)} módulos:", lvl="debug")
 
         if not self.lora_modules:
-            print("Warning: No LoRA/DoRA/LoHa modules found. Key file not generated.")
+            logFun("No LoRA/DoRA/LoHa modules found. Key file not generated.", lvl="warning")
             return
 
-        print(f"Generating key file by block: {output_filename}")
+        logFun(f"Generating key file by block: {output_filename}", lvl="info")
         from collections import defaultdict
 
         blocks_data: dict[str, list[str]] = defaultdict(list)
@@ -1523,9 +1440,7 @@ class LoRAModuleWrapper:
                 for key in module_state_dict.keys():
                     blocks_data[block_id].append(key)
             except Exception as e:
-                print(
-                    f"Error getting state_dict for module with prefix {module_prefix_with_dot}: {e}"
-                )
+                logFun(f"Error getting state_dict for module with prefix {module_prefix_with_dot}: {e}", lvl="error")
 
         sorted_block_ids = BLOCK_IDS[
             :
@@ -1549,9 +1464,7 @@ class LoRAModuleWrapper:
             with open(output_filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(output_lines).strip())
             abs_path = os.path.abspath(output_filename)
-            print(
-                f"Successfully generated key file '{output_filename}' at '{abs_path}'"
-            )
+            logFun(f"Successfully generated key file '{output_filename}' at '{abs_path}'", lvl="success")
         except Exception as e:
-            print(f"Error writing key file '{output_filename}': {e}")
+            logFun(f"Error writing key file '{output_filename}': {e}", lvl="error")
             traceback.print_exc()

@@ -1,0 +1,8 @@
+[style]
+# Baseado no estilo oficial do Google
+based_on_style = google
+
+# Evita quebra antes do parêntese de fechamento
+split_before_closing_bracket = false
+
+column_limit = 120

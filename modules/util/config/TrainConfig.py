@@ -430,22 +430,22 @@ class TrainConfig(BaseConfig):
     secrets: SecretsConfig
 
     # delta pattern settings
-    delta_pattern_save_it: bool
-    delta_pattern_use_it: bool
-    delta_pattern_path: str
-    delta_pattern_weight: float
+    train_gps_save_it: bool
+    train_gps_use_it: bool
+    train_gps_path: str
+    train_gps_weight: float
     delta_pattern_save_every: int = 0
     delta_pattern_save_every_unit: TimeUnit = TimeUnit.EPOCH
     
     # dcoef pattern settings
-    dcoef_pattern_path: str
-    dcoef_pattern_use_it: bool
+    adpt_dcoef_path: str
+    adpt_dcoef_use_it: bool
     
     # convctrl settings
     convctrl_use_it: bool
     
 		# dynrecorder settings
-    dynrec_use_it: bool
+    data_recorder: bool
     
 		# which run
     run_number: int = 1
@@ -815,13 +815,13 @@ class TrainConfig(BaseConfig):
         data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
-        data.append(("delta_pattern_save_it", True, bool, False))
-        data.append(("delta_pattern_use_it", False, bool, False))
-        data.append(("delta_pattern_weight", 0.0, float, False))
-        data.append(("delta_pattern_path", "", str, False))
-        data.append(("dcoef_pattern_use_it", False, bool, False))
-        data.append(("dcoef_pattern_path", "", str, False))
-        data.append(("dynrec_use_it", False, bool, False))
+        data.append(("train_gps_save_it", True, bool, False))
+        data.append(("train_gps_use_it", False, bool, False))
+        data.append(("train_gps_weight", 0.0, float, False))
+        data.append(("train_gps_path", "", str, False))
+        data.append(("adpt_dcoef_use_it", False, bool, False))
+        data.append(("adpt_dcoef_path", "", str, False))
+        data.append(("data_recorder", False, bool, False))
         data.append(("convctrl_use_it", False, bool, False))
         data.append(("run_number", 1, int, False))
         data.append(("log_cosh_strength", 0.0, float, False))

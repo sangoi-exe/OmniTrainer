@@ -18,7 +18,7 @@ from torch import Tensor
 from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-from modules.sangoi.DynamicLossStrength import DeltaPatternRegularizer
+from modules.sangoi.TrainGPS import TrainGPS
 
 
 class StableDiffusionXLModelEmbedding:
@@ -73,7 +73,7 @@ class StableDiffusionXLModel(BaseModel):
     text_encoder_2_lora: LoRAModuleWrapper | None
     unet_lora: LoRAModuleWrapper | None
     lora_state_dict: dict | None
-    deltas: DeltaPatternRegularizer | None
+    deltas: TrainGPS | None
 
     sd_config: dict | None
     sd_config_filename: str | None

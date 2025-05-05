@@ -63,6 +63,7 @@ class NamedParameterGroupCollection:
                 'params': list(group.parameters),
                 'lr': lr,
                 'initial_lr': lr,
+                'name': group.unique_name,
             })
 
         return parameters

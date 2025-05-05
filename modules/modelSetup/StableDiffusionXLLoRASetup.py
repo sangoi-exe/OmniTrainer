@@ -4,6 +4,7 @@ from typing import Optional
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.sangoi.logFun import logFun
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.NamedParameterGroup import (
     NamedParameterGroup,
@@ -148,9 +149,9 @@ class StableDiffusionXLLoRASetup(
     ):
 
         model.tensorboard = tensorboard
-        print(
-            f"[TensorBoardManager] Instância TensorBoard {'atribuída' if model.tensorboard else 'NÃO atribuída'} ao modelo."
-        )
+        msg = f"[TensorBoardManager] Instância TensorBoard {'atribuída' if model.tensorboard else 'NÃO atribuída'} ao modelo."
+        lvl = "success" if model.tensorboard else "error"
+        logFun(msg, lvl=lvl)
 
         create_te1 = config.text_encoder.train or state_dict_has_prefix(model.lora_state_dict, "lora_te1")
         create_te2 = config.text_encoder_2.train or state_dict_has_prefix(model.lora_state_dict, "lora_te2")
@@ -202,116 +203,92 @@ class StableDiffusionXLLoRASetup(
         model.parameters = parameter_collection
 
         # testar esse mamute do gemini, cheio de verificações e etc
-        # START: Modificação solicitada - Refined DeltaPatternRegularizer initialization
-        from modules.sangoi.DynamicLossStrength import DeltaPatternRegularizer
+        # START: Modificação solicitada - Refined TrainGPS initialization
+        from modules.sangoi.TrainGPS import TrainGPS
         import torch # Ensure torch is imported
 
         # Garante que deltas é None por padrão
         model.deltas = None
 
-        if config.delta_pattern_use_it or config.delta_pattern_save_it:
-            print("[DeltaPattern] Tentando inicializar DeltaPatternRegularizer...")
+        if config.train_gps_use_it or config.train_gps_save_it:
+            logFun("[TrainGPS] Tentando inicializar TrainGPS...", lvl="info")
             try:
                 # A coleção de parâmetros AGORA existe e foi atribuída
                 param_collection = getattr(model, "parameters", None)
                 if param_collection is None or not isinstance(param_collection, NamedParameterGroupCollection):
-                     raise ValueError("Coleção de parâmetros (model.parameters) inválida ou não encontrada para DeltaPattern.")
+                      raise ValueError("Coleção de parâmetros (model.parameters) inválida ou não encontrada para DeltaPattern.")
                 if not list(param_collection.parameters()):
-                    print("[DeltaPattern] Aviso: Coleção de parâmetros está vazia. DeltaPattern não será inicializado.")
-                else:
-                    # Determina o cache_device (GPU preferencialmente)
-                    # Tenta usar o train_device se disponível, senão o device do primeiro parâmetro
-                    if hasattr(self, 'train_device'):
-                        cache_dev = self.train_device
-                    else:
-                        first_param = next(iter(param_collection.parameters()), None)
-                        if first_param is not None:
-                             cache_dev = first_param.device
-                        else:
-                             # Fallback para CPU se nenhum parâmetro foi encontrado (improvável aqui)
-                             print("[DeltaPattern] Aviso: Não foi possível determinar o device dos parâmetros. Usando CPU para cache.")
-                             cache_dev = torch.device("cpu")
-                    print(f"[DeltaPattern] Usando device '{cache_dev}' para cache interno.")
+                    logFun("[TrainGPS] Aviso: Coleção de parâmetros está vazia. DeltaPattern não será inicializado.", lvl="error")
 
+                if config.train_gps_save_it:
                     # Atribui a instância ao modelo
-                    model.deltas = DeltaPatternRegularizer(
+                    model.deltas = TrainGPS(
                         model=model, # Passa a instância do modelo completa
                         param_collection=param_collection, # Passa a coleção de parâmetros
                         penalty_metric=getattr(config, "delta_pattern_metric", "cosine"), # Usa config ou default
-                        cache_device=cache_dev # Passa o device de cache determinado
                     )
-                    print("[DeltaPattern] DeltaPatternRegularizer instanciado.")
-                    print(f"[Trainer Setup] DeltaPattern cache_device: {model.deltas.cache_device}")
-                    print(f"[Trainer Setup] Trainer train_device: {self.train_device}")
-                    if model.deltas.cache_device != self.train_device:
-                        print("[Trainer Setup] ALERTA! DeltaPattern cache_device é diferente do train_device!")                    
+                
+                    logFun("[TrainGPS] Capturando pesos iniciais para salvar (Run 1)...", lvl="info")
+                    model.deltas.capture_weights() # Usa o cache_device interno
 
-                    if config.delta_pattern_save_it:
-                        print("[DeltaPattern] Capturando pesos iniciais para salvar (Run 1)...")
-                        model.deltas.capture_weights() # Usa o cache_device interno
+                if config.train_gps_use_it:
+                    delta_path = getattr(config, "train_gps_path", None)
+                    if delta_path and os.path.exists(delta_path):
+                        logFun(f"[TrainGPS] Carregando padrão de referência de: {delta_path}", lvl="info")
+                        # Determina device/dtype de treino para carregar o padrão corretamente
+                        train_dtype_torch = config.train_dtype.torch_dtype() # Pega do config
+                        train_dev = self.train_device # Usa o train_device da classe setup
 
-                    if config.delta_pattern_use_it:
-                        delta_path = getattr(config, "delta_pattern_path", None)
-                        if delta_path and os.path.exists(delta_path):
-                            print(f"[DeltaPattern] Carregando padrão de referência de: {delta_path}")
-                            # Determina device/dtype de treino para carregar o padrão corretamente
-                            train_dtype_torch = config.train_dtype.torch_dtype() # Pega do config
-                            train_dev = self.train_device # Usa o train_device da classe setup
-
-                            model.deltas.load_reference_pattern(
-                                delta_path,
-                                train_device=train_dev,    # Device de treino explícito
-                                train_dtype=train_dtype_torch # Dtype de treino explícito
-                            )
-                            if model.deltas.reference_deltas:  # Checa se carregou
-                                print("[DeltaPattern] Capturando pesos iniciais para cálculo de penalidade (Run 2)...")
-                                model.deltas.capture_initial_weights_run2() # Usa o cache_device interno
-                            else:
-                                print(f"[DeltaPattern] Aviso: Falha ao carregar padrão de delta de '{delta_path}'. Penalidade desativada.")
-                                config.delta_pattern_use_it = False  # Desativa
+                        model.deltas.load_reference_pattern(delta_path)
+                        if model.deltas.reference_deltas:  # Checa se carregou
+                            logFun("[TrainGPS] Capturando pesos iniciais para cálculo de penalidade (Run 2)...", lvl="info")
+                            model.deltas.capture_initial_weights_run2() # Usa o cache_device interno
                         else:
-                            print(f"[DeltaPattern] Aviso: 'delta_pattern_use_it' True, mas caminho '{delta_path}' inválido ou não especificado. Penalidade desativada.")
-                            config.delta_pattern_use_it = False  # Desativa
+                            logFun(f"[TrainGPS] Aviso: Falha ao carregar padrão de delta de '{delta_path}'. Penalidade desativada.", lvl="error")
+                            config.train_gps_use_it = False  # Desativa
+                    else:
+                        logFun(f"[TrainGPS] Aviso: 'train_gps_use_it' True, mas caminho '{delta_path}' inválido ou não especificado. Penalidade desativada.", lvl="warning")
+                        config.train_gps_use_it = False  # Desativa
 
-                    print("[DeltaPattern] Configuração do DeltaPatternRegularizer concluída.")
+                logFun("[TrainGPS] Configuração do TrainGPS concluída.", lvl="info")
 
             except Exception as e:
-                print(f"[DeltaPattern] Falha CRÍTICA ao inicializar DeltaPatternRegularizer: {e}")
+                logFun(f"[TrainGPS] Falha CRÍTICA ao inicializar TrainGPS: {e}", lvl="error")
                 traceback.print_exc()
                 model.deltas = None  # Garante None se falhar
-                config.delta_pattern_use_it = False # Desativa a funcionalidade se a inicialização falhar
+                config.train_gps_use_it = False # Desativa a funcionalidade se a inicialização falhar
         else:
-            print("[DeltaPattern] DeltaPatternRegularizer não será usado (configurações desativadas).")
+            logFun("[TrainGPS] TrainGPS não será usado (configurações desativadas).", lvl="warning")
             model.deltas = None # Garante None se não for usado
-        # END: Modificação solicitada - Refined DeltaPatternRegularizer initialization
+        # END: Modificação solicitada - Refined TrainGPS initialization
 
         # # Código original comentado para referência
-        # model.deltas = DeltaPatternRegularizer(model, model.parameters)
+        # model.deltas = TrainGPS(model, model.parameters)
         # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
 
-        # model.deltas = DeltaPatternRegularizer(model, model.parameters)
+        # model.deltas = TrainGPS(model, model.parameters)
         # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
-        # if config.delta_pattern_save_it:
-        #     print("[DeltaPattern] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
+        # if config.train_gps_save_it:
+        #     print("[TrainGPS] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
         #     model.deltas.capture_weights()
 
-        # if config.delta_pattern_use_it:
-        #     if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
-        #         print(f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}")
-        #         model.deltas.load_reference_pattern(config.delta_pattern_path)
+        # if config.train_gps_use_it:
+        #     if config.train_gps_path and os.path.exists(config.train_gps_path):
+        #         print(f"[TrainGPS] Carregando padrão de delta de referência de: {config.train_gps_path}")
+        #         model.deltas.load_reference_pattern(config.train_gps_path)
         #         if model.deltas.reference_deltas:  # Verifica se carregou com sucesso
-        #             print("[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
+        #             print("[TrainGPS] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
         #             model.deltas.capture_initial_weights_run2()
         #         else:
         #             print(
-        #                 f"[DeltaPattern] Aviso: Falha ao carregar o padrão de delta de '{config.delta_pattern_path}'. A penalidade será desativada."
+        #                 f"[TrainGPS] Aviso: Falha ao carregar o padrão de delta de '{config.train_gps_path}'. A penalidade será desativada."
         #             )
-        #             config.delta_pattern_use_it = False  # Desativa se não conseguiu carregar
+        #             config.train_gps_use_it = False  # Desativa se não conseguiu carregar
         #     else:
         #         print(
-        #             f"[DeltaPattern] Aviso: 'delta_pattern_use_it' é True, mas o caminho '{config.delta_pattern_path}' não foi encontrado ou não especificado. A penalidade será desativada."
+        #             f"[TrainGPS] Aviso: 'train_gps_use_it' é True, mas o caminho '{config.train_gps_path}' não foi encontrado ou não especificado. A penalidade será desativada."
         #         )
-        #         config.delta_pattern_use_it = False  # Desativa se o caminho não existe
+        #         config.train_gps_use_it = False  # Desativa se o caminho não existe
 
     def setup_train_device(
         self,
