@@ -1227,18 +1227,18 @@ class GenericTrainer(BaseTrainer):
                     self.grad_hook_handles.clear()
                     return # Sai do método train
 
-                # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
-                # 🔸 Snapshot dos pesos CORRETOS dos wrappers LoRA
-                weights_dict: Dict[str, torch.Tensor] = {}
-                logFun(dir(self.model), lvl="error")
-                
-                for name, peft_mod in self.model.unet_lora.lora_modules.items():
-                    snap = peft_mod.flat_params()                # concatena A, B, alpha…
-                    if snap.numel() == 0:
-                        continue
-                    weights_dict[name] = snap
-                    logFun(f"[Trainer] snapshot '{name}' ‖w‖={snap.norm():.3e}", lvl="debug")
-                self.converge_control.snapshot_epoch_weights(weights_dict)
+            # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
+            # 🔸 Snapshot dos pesos CORRETOS dos wrappers LoRA
+            weights_dict: Dict[str, torch.Tensor] = {}
+            logFun(dir(self.model), lvl="error")
+            
+            for name, peft_mod in self.model.unet_lora.lora_modules.items():
+                snap = peft_mod.flat_params()                # concatena A, B, alpha…
+                if snap.numel() == 0:
+                    continue
+                weights_dict[name] = snap
+                logFun(f"[Trainer] snapshot '{name}' ‖w‖={snap.norm():.3e}", lvl="debug")
+            self.converge_control.snapshot_epoch_weights(weights_dict)
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(
