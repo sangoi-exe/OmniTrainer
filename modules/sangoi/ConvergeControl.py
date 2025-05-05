@@ -22,26 +22,24 @@ class ConvergeControl:
         *,
         k_confirm: int = 5,  # Número de checks para congelar
         delta_buffer_size: int | None = None,  # Novo parâmetro para buffer de delta
-        
-        debug: bool = True,        
+        debug: bool = True,
         verbose: bool = True,
         total_epochs: int = 100,
-        
         # Parâmetros para DECISÃO
-        cv_thresh: float = 0.5,           # ← ➋ coef. de variação limite
+        cv_thresh: float = 0.5,  # ← ➋ coef. de variação limite
         slope_thresh: float = 1e-4,
         delta_abs_thresh: float = 2e-3,
         min_buffer_epochs: float = 0,  # Warmup em épocas (mantido)
         enable_freeze_action: bool = True,
-        ):
+    ):
 
-        self.k_confirm   = max(2, k_confirm)      # segurança (≥2)
-        self.win_size    = 50     # ← regra única
-        
-        self.cv_thresh    = cv_thresh
+        self.k_confirm = max(2, k_confirm)  # segurança (≥2)
+        self.win_size = 50  # ← regra única
+
+        self.cv_thresh = cv_thresh
         self.abs_thresh = delta_abs_thresh
         self.slope_thresh = slope_thresh
-        
+
         self._last_epoch_incr: Dict[str, int] = {}
         self.freeze_step_run2: Dict[str, int] = {}  # Mantido para Run >= 2
         self.min_buffer_epochs = min_buffer_epochs
@@ -62,24 +60,30 @@ class ConvergeControl:
         self.verbose = verbose
         self.run_number = run_number
         self.total_epochs = total_epochs
-        self.enable_freeze_action = enable_freeze_action if run_number >= 2 else False  # Congelamento só na Run 2+ por padrão
+        self.enable_freeze_action = (
+            enable_freeze_action if run_number >= 2 else False
+        )  # Congelamento só na Run 2+ por padrão
 
-        self.warm_steps          = 200            # coleta só estatísticas
-        self.alpha_rur           = 2.0            # k × IQR  →  thr_rur
-        self.beta_grad           = 2.0            # k × IQR  →  thr_grad
-        self.win_snr             = 20             # janela SNR (steps)
-        self.grad_eps            = 1e-9
+        self.warm_steps = 200  # coleta só estatísticas
+        self.alpha_rur = 2.0  # k × IQR  →  thr_rur
+        self.beta_grad = 2.0  # k × IQR  →  thr_grad
+        self.win_snr = 20  # janela SNR (steps)
+        self.grad_eps = 1e-9
+        self.thr_rur: Dict[str, float] = {}
+        self.thr_grad: Dict[str, float] = {}
 
         # ▼ buffers por módulo
-        self.rur_hist   = collections.defaultdict(  # deque de floats (steps)
-            lambda: collections.deque(maxlen=self.warm_steps))
-        self.g_hist     = collections.defaultdict(  # deque de tensores (steps)
-            lambda: collections.deque(maxlen=self.win_snr))
-        self.prev_W     = {}                        # peso salvo fim de época
+        self.rur_hist = collections.defaultdict(  # deque de floats (steps)
+            lambda: collections.deque(maxlen=self.warm_steps)
+        )
+        self.g_hist = collections.defaultdict(  # deque de tensores (steps)
+            lambda: collections.deque(maxlen=self.win_snr)
+        )
+        self.prev_W = {}  # peso salvo fim de época
 
         # ▼ baselines mediana+IQR aprendidos no warm-up
-        self.base_rur   = {}
-        self.base_grad  = {}
+        self.base_rur = {}
+        self.base_grad = {}
 
         if self.debug:
             logFun(
@@ -101,10 +105,10 @@ class ConvergeControl:
           • Relative-Update-Ratio contra peso salvo da época anterior
         """
         if weight_t.grad is None:
-            return                                          # não há grad
+            return  # não há grad
 
         g = weight_t.grad.detach()
-        self.g_hist[name].append(g.clone())                 # para SNR
+        self.g_hist[name].append(g.clone())  # para SNR
 
         # Relative-Update-Ratio
         prev_w = self.prev_W.get(name, weight_t.detach())
@@ -152,7 +156,6 @@ class ConvergeControl:
 
         stable = (rur_ok + grad_ok + snr_ok) >= 2
         return stable                        
-
 
     @staticmethod
     def stats_window(arr: List[float]) -> Tuple[float, float, float]:
@@ -349,4 +352,3 @@ class ConvergeControl:
             traceback.print_exc()
 
         return stable
-        

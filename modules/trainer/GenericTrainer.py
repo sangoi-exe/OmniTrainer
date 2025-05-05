@@ -1118,16 +1118,6 @@ class GenericTrainer(BaseTrainer):
                                                         # logFun(f"[ConvergeControl] ATUALIZOU O '{name}'", lvl="debug")
                                                     # else:
                                                     #     logFun(f"[ConvergeControl] NÃO ATUALIZOU O '{name}'", lvl="debug")
-                                    # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
-                                    weights_dict: Dict[str, torch.Tensor] = {}
-                                    for s in mapped_stats_list:
-                                        n = s["name"]
-                                        pg = self.model.parameters.by_unique_name(n)
-                                        if pg and pg.parameters:
-                                            # pega o primeiro parâmetro do grupo (ou outro critério seu)
-                                            w = pg.parameters[0].detach().clone()
-                                            weights_dict[n] = w
-                                    self.converge_control.snapshot_epoch_weights(weights_dict)
                                     # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
                                     if self.recorder:
                                         # Pass necessary stats to recorder's log_step
@@ -1245,6 +1235,18 @@ class GenericTrainer(BaseTrainer):
                         handle.remove()
                     self.grad_hook_handles.clear()
                     return # Sai do método train
+
+                # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
+                weights_dict: Dict[str, torch.Tensor] = {}
+                for s in mapped_stats_list:
+                    n = s["name"]
+                    pg = self.model.parameters.by_unique_name(n)
+                    if pg and pg.parameters:
+                        # pega o primeiro parâmetro do grupo (ou outro critério seu)
+                        w = pg.parameters[0].detach().clone()
+                        weights_dict[n] = w
+                        logFun(f"[Trainer] adding param do weight_dick {w}.", lvl="info")
+                self.converge_control.snapshot_epoch_weights(weights_dict)
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(
