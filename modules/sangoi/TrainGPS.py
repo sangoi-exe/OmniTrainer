@@ -44,8 +44,9 @@ class TrainGPS:
 
     def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor, torch.device]]:
         """Iterates through tensors within the state_dicts of relevant LoRA wrappers."""
+        # agora consideramos o wrapper que carrega os módulos LoRA
         wrappers_to_check = [
-            getattr(self.model, "unet_lora", None),
+            getattr(self.model, "unet_lora", None),  # se você renomear assim
         ]
         processed_keys = (
             set()
@@ -90,13 +91,16 @@ class TrainGPS:
 
     def capture_initial_weights_run2(self):
         """Captura os pesos iniciais da Run 2 (usado para cálculo da penalidade) e armazena em CPU."""
-        self.initial_weights_run2 = {}  # Limpa antes de capturar
+        # Armazena já no device do modelo (GPU) e em float16 para economizar memória/banda
+        target_device = next(self._iterate_params())[2]
+        self.initial_weights_run2 = {}
         count = 0
         try:
             for key, param, _ in self._iterate_params():
+                # detach, mover para GPU e converter em half
                 self.initial_weights_run2[key] = (
-                    param.detach().clone().cpu()
-                )  # Armazena em CPU
+                    param.detach().clone() .to(device=target_device, dtype=torch.bfloat16, non_blocking=True)
+                )
                 count += 1
         except Exception as e:
             logFun(f"[TrainGPS] Erro durante capture_initial_weights_run2: {e}", lvl="error")
@@ -123,14 +127,15 @@ class TrainGPS:
         try:
             with open(pattern_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
-
+            target_device = next(self._iterate_params())[2]
             flat_dict = {}
             for epoch_key, metrics in json_data.items():
                 for param_name, value in metrics.items():
                     full_key = f"{epoch_key}/{param_name}"
-                    flat_dict[full_key] = torch.tensor(
-                        value, dtype=torch.float32, device="cpu"
-                    )
+                # cria no device do modelo e em float16
+                flat_dict[full_key] = (
+                    torch.tensor(value, dtype=torch.float32).to(device=target_device, dtype=torch.bfloat16, non_blocking=True)
+                )
 
             if flat_dict:
                 self.reference_deltas = flat_dict
@@ -158,63 +163,57 @@ class TrainGPS:
         Calcula penalidade entre delta atual (por módulo) e delta de referência.
         Métrica definida em `self.penalty_metric` ("mse" ou "cosine").
         """
+        with torch.no_grad():
+            # ── descobrir device/dtype ───────────────────────────────────────────
+            try:
+                first_param = next(iter(self.param_collection.parameters()))
+                target_device, target_dtype = first_param.device, first_param.dtype
+            except StopIteration:
+                target_device, target_dtype = torch.device("cpu"), torch.float32
+                logFun("[TrainGPS] Parâmetros vazios; usando CPU/float32.", lvl="warning")
 
-        # ── descobrir device/dtype ───────────────────────────────────────────
-        try:
-            first_param = next(iter(self.param_collection.parameters()))
-            target_device, target_dtype = first_param.device, first_param.dtype
-        except StopIteration:
-            target_device, target_dtype = torch.device("cpu"), torch.float32
-            logFun("[TrainGPS] Parâmetros vazios; usando CPU/float32.", lvl="warning")
+            # ── early‑exit se epoch > padrão carregado ───────────────────────────
+            if hasattr(self, "max_epoch_loaded") and hasattr(self.model, "train_progress"):
+                if self.max_epoch_loaded is not None and self.model.train_progress.epoch > self.max_epoch_loaded:
+                    return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
-        # ── early‑exit se epoch > padrão carregado ───────────────────────────
-        if hasattr(self, "max_epoch_loaded") and hasattr(self.model, "train_progress"):
-            if self.max_epoch_loaded is not None and self.model.train_progress.epoch > self.max_epoch_loaded:
+            # ── pré‑condições ────────────────────────────────────────────────────
+            if not self.reference_deltas or not self.initial_weights_run2:
+                self.current_total_delta_norm = None
                 return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
-        # ── pré‑condições ────────────────────────────────────────────────────
-        if not self.reference_deltas or not self.initial_weights_run2:
-            self.current_total_delta_norm = None
-            return torch.tensor(0.0, device=target_device, dtype=target_dtype)
+            try:
+                # 1) Obtém deltas atuais por módulo
+                cur_mod = self._get_current_module_deltas(target_device, target_dtype)
+                # 2) Determina quais módulos têm referência e atual
+                # (aqui criamos ref_mod para mapear “epoch_X/<module>” → tensor)
+                ref_mod = {
+                    full_key.split("/", 1)[1]: val.to(device=target_device, dtype=target_dtype, non_blocking=True)
+                    for full_key, val in self.reference_deltas.items()
+                }
+                common_keys = [k for k in ref_mod if k in cur_mod]
+                # Se não há nada em comum, já retorna zero
+                if not common_keys:
+                    self.current_total_delta_norm = 0.0
+                    return torch.tensor(0.0, device=target_device, dtype=target_dtype)
+                # 3) Empilha vetores em batch único (vetorização)
+                ref_vec = torch.stack([ref_mod[k].float() for k in common_keys], dim=0)
+                cur_vec = torch.stack([cur_mod[k].float() for k in common_keys], dim=0)
 
-        try:
-            # ── preparar dict referência → módulo ────────────────────────────
-            ref_mod: Dict[str, torch.Tensor] = {}
-            for full_key, val in self.reference_deltas.items():
-                module_key = full_key.split("/", 1)[-1]  # remove "epoch_x/" se houver
-                ref_mod[module_key] = val.to(
-                    device=target_device, dtype=target_dtype, non_blocking=True
-                )
+                if self.penalty_metric == "cosine":
+                    cos_sim = torch.nn.functional.cosine_similarity(cur_vec, ref_vec, dim=0, eps=1e-8)
+                    penalty = 1.0 - cos_sim  # distância angular
+                else:  # "mse"
+                    penalty = torch.nn.functional.mse_loss(cur_vec, ref_vec)
 
-            # ── deltas atuais por módulo ─────────────────────────────────────
-            cur_mod = self._get_current_module_deltas(target_device, target_dtype)
+                self.current_total_delta_norm = float(torch.norm(cur_vec, p=2))
+                return (lambda_weight * penalty).to(dtype=target_dtype)
 
-            common_keys = [k for k in ref_mod if k in cur_mod]
-            if not common_keys:
-                self.current_total_delta_norm = 0.0
+            except Exception as e:
+                logFun(f"[TrainGPS] Erro compute_penalty: {e}", lvl="error")
+                traceback.print_exc()
+                self.current_total_delta_norm = None
                 return torch.tensor(0.0, device=target_device, dtype=target_dtype)
-
-            ref_vec = torch.stack([ref_mod[k].float() for k in common_keys])
-            cur_vec = torch.stack([cur_mod[k].float() for k in common_keys])
-
-            # ─────────── INÍCIO ALTERAÇÃO CHATGPT ───────────
-            if self.penalty_metric == "cosine":
-                cos_sim = torch.nn.functional.cosine_similarity(cur_vec, ref_vec, dim=0, eps=1e-8)
-                penalty = 1.0 - cos_sim  # distância angular
-            else:  # "mse"
-                penalty = torch.nn.functional.mse_loss(cur_vec, ref_vec)
-            # ──────────── FIM ALTERAÇÃO CHATGPT ────────────
-
-            self.current_total_delta_norm = torch.norm(cur_vec, p=2).item()
-            return (lambda_weight * penalty).to(dtype=target_dtype)
-
-        except Exception as e:
-            logFun(f"[TrainGPS] Erro compute_penalty: {e}", lvl="error")
-            traceback.print_exc()
-            self.current_total_delta_norm = None
-            return torch.tensor(0.0, device=target_device, dtype=target_dtype)
-
-
 
     def _calculate_total_norm(
         self, weight_dict: Dict[str, Tensor], device: torch.device = torch.device("cpu")

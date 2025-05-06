@@ -437,6 +437,18 @@ class PeftBase(nn.Module):
 
         return Dummy
 
+    def full_weight(self) -> torch.Tensor:
+        W0 = self.orig_module.weight.detach()
+        ΔW = self.make_weight(self.lora_down.weight, self.lora_up.weight) * (self.alpha / self.rank)
+        return (W0 + ΔW).flatten().clone()
+
+    def flat_params(self) -> torch.Tensor:
+        """Concatena TODOS os tensores com requires_grad=True num vetor 1-D."""
+        parts = [p.detach().flatten() for p in self.parameters() if p.requires_grad]
+        if not parts:                               # pode acontecer em bias congelado
+            return torch.empty(0, device=self.orig_module.weight.device)
+        return torch.cat(parts).clone()             # snapshot imutável
+
 
 class LoHaModule(PeftBase):
     """Implementation of LoHa from Lycoris."""
@@ -768,7 +780,6 @@ class LoRAModuleWrapper:
                 # This warning might now catch cases where literal_eval resulted in non-dict or parsing failed implicitly
                 logFun(f"[LoRA] Skipping invalid rank rule entry: {rule_dict} (expected a dictionary after processing)", lvl="warning")
                 continue
-            # END CHANGE
 
             for pattern, rank in rule_dict.items():
                 if not isinstance(rank, int):
@@ -973,7 +984,6 @@ class LoRAModuleWrapper:
             if should_include:
                 peft_module_prefix_for_constructor = potential_peft_prefix_argument
 
-                # START CHANGE - Refine rule matching and application logic
                 rank_to_use = self.default_rank
                 alpha_to_use = self.default_alpha
                 rule_applied = "Global Default"
@@ -1008,7 +1018,6 @@ class LoRAModuleWrapper:
                         "alpha", self.default_alpha
                     )  # Already float
                     rule_applied = f"Rule ('{matched_rule_pattern}')"
-                # END CHANGE
 
                 # Prepara args/kwargs para o construtor do PEFT
                 args_for_this_module = [
@@ -1026,8 +1035,8 @@ class LoRAModuleWrapper:
                     #     f"[LoRA CREATE] {self.klass.__name__} for: '{original_layer_name}' "  # Loga o nome original
                     #     f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use}) "
                     #     f"| PEFT Prefix: {peft_module_prefix_for_constructor}",
-										# 		lvl="info" # Loga o prefixo PEFT final
-										# 		)
+                    # 		lvl="info" # Loga o prefixo PEFT final
+                    # 		)
                     # logFun(log_msg)  # Mantém o log para feedback
 
                     lora_modules[original_layer_name] = self.klass(
@@ -1040,7 +1049,7 @@ class LoRAModuleWrapper:
                         f"[LoRA] Failed to create PEFT module for layer '{name}' (prefix {peft_module_prefix_for_constructor}) "
                         f"using Rank={rank_to_use}, Alpha={alpha_to_use}: {e}",
                         lvl="error"
-												)
+                        )
 
             else:
                 # Conta como skip de filtro SOMENTE se for Linear/Conv2d mas foi filtrado
@@ -1192,7 +1201,7 @@ class LoRAModuleWrapper:
                     f"(Inferred orig: {original_layer_name}) "
                     f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use})",
                     lvl="info" # Log atualizado
-										)
+                    )
                 dummy_module = self.dummy_klass(*dummy_args, **dummy_kwargs)
 
                 # Passa o remaining_state_dict para que PeftBase.load_state_dict possa remover chaves

@@ -10,7 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from collections.abc import Callable
 from typing import Dict
-
+from torch.profiler import profile, ProfilerActivity, schedule
 from numpy import dtype, inf
 
 from modules.trainer.BaseTrainer import BaseTrainer
@@ -979,6 +979,19 @@ class GenericTrainer(BaseTrainer):
                     if transferred_to_temp_device:
                         self.model_setup.setup_train_device(self.model, self.config)
 
+                def _end_epoch_cleanup(self):
+                    """
+                    Limpa tudo que não precisa atravessar épocas:
+                    - snapshots de ConvergeControl
+                    - históricos temporários
+                    - libera cache da GPU
+                    """
+                    # 1) Se estiver usando ConvergeControl
+                    if hasattr(self, "converge_control"):
+                        logFun("[ConvergeControl]: Limpando essa merda..")
+                        self.converge_control.prev_W.clear()
+                        self.converge_control.g_hist.clear()
+                        self.converge_control.rur_hist.clear()
                 # with TorchMemoryRecorder(enabled=False):
                 #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
@@ -990,6 +1003,11 @@ class GenericTrainer(BaseTrainer):
                 teoricamente isso impede que pesos fora da mask sejam atualizados
                 então a rede pode aloprar o quanto quiser ali, não vai mudar nada
                 """
+                # with torch.profiler.profile(
+                #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+                #     record_shapes=True, profile_memory=True, with_stack=True
+                # ) as prof:         
                 with TorchMemoryRecorder(enabled=False):
                     # Previsão original
                     model_output_data = self.model_setup.predict(
@@ -1084,7 +1102,6 @@ class GenericTrainer(BaseTrainer):
                                             logFun(f"[Trainer] Error getting current deltas from TrainGPS: {e_delta}", lvl="error")
                                             traceback.print_exc()
                                             # Continue without deltas if error occurs
-
                                     # Add delta_L2 to each stat dictionary
                                     for s in mapped_stats_list:
                                         module_name = s.get("name")
@@ -1104,11 +1121,9 @@ class GenericTrainer(BaseTrainer):
                                         current_epoch = self.model.train_progress.epoch                                        
                                         self.converge_control.set_current_time(current_epoch, global_step)
                                         self.converge_control.ingest_and_process(mapped_stats_list)
-
-                                    # 🔸 Substitui mapeamento por parameter-groups por atualização direta dos wrappers LoRA
-                                    for name, peft_mod in self.model.unet_lora.lora_modules.items():
-                                        # peft_mod é instância de PeftBase (nn.Module), que encapsula A, B, alpha…
-                                        self.converge_control.update_step_metrics(name, peft_mod)
+                                        # 4.c) Atualiza métricas por step diretamente nos módulos LoRA
+                                        for name, peft_mod in self.model.unet_lora.lora_modules.items():
+                                            self.converge_control.update_step_metrics(name, peft_mod)
                                     # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
                                     if self.recorder:
                                         # Pass necessary stats to recorder's log_step
@@ -1132,6 +1147,8 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step() # Often done after optimizer step
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
+
+                        #prof.step()
 
                         # Report learning rate after potential scheduler step
                         self.model_setup.report_to_tensorboard(
@@ -1172,7 +1189,7 @@ class GenericTrainer(BaseTrainer):
                                 train_progress.global_step,
                             )
                             self.model.ema.step(self.parameters, update_step)
-
+                        #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)) 
                         self.one_step_trained = True
 
                 if self.config.validation:
@@ -1182,7 +1199,7 @@ class GenericTrainer(BaseTrainer):
                 self.callbacks.on_update_train_progress(
                     train_progress, current_epoch_length, self.config.epochs
                 )
-                
+
             # Ajusta d_coef POR ÉPOCA usando Δ-L2 actual
             if self.run_number == 2 and self.adaptive_dcoef and gps_instance:
                 try:
@@ -1201,7 +1218,6 @@ class GenericTrainer(BaseTrainer):
                         )
                         updated_count = 0
                         for g in self.model.optimizer.param_groups:
-                            # logFun((dir(self.model.optimizer)), lvl="error")
                             # AQUI NÃO TÁ MAIS DANDO MERDA, COLOQUEI UNIQUE NAME NA CRIAÇÃO DO PARAM_GROUPS PRA PODER ACESSAR DAQUI
                             name = g.get("name")
                             if name in scales:
@@ -1227,18 +1243,7 @@ class GenericTrainer(BaseTrainer):
                     self.grad_hook_handles.clear()
                     return # Sai do método train
 
-            # ➋ snapshot de pesos no fim da época (com base em mapped_stats_list)
-            # 🔸 Snapshot dos pesos CORRETOS dos wrappers LoRA
-            weights_dict: Dict[str, torch.Tensor] = {}
-            logFun(dir(self.model), lvl="error")
-            
-            for name, peft_mod in self.model.unet_lora.lora_modules.items():
-                snap = peft_mod.flat_params()                # concatena A, B, alpha…
-                if snap.numel() == 0:
-                    continue
-                weights_dict[name] = snap
-                logFun(f"[Trainer] snapshot '{name}' ‖w‖={snap.norm():.3e}", lvl="debug")
-            self.converge_control.snapshot_epoch_weights(weights_dict)
+            _end_epoch_cleanup(self)
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(
@@ -1273,11 +1278,17 @@ class GenericTrainer(BaseTrainer):
                 if self.config.train_gps_save_it:
                     try:
                         # Loga para a época que acabou de terminar
-                        gps_instance.log_group_deltas(train_progress.epoch - 1)
+                        epoch_idx = train_progress.epoch - 1
+                        gps_instance.log_group_deltas(epoch_idx)
+                        # Extrai os deltas calculados para esta época
+                        # ➋ snapshot de pesos no fim da época (com base nos deltas do TrainGPS)
+                        stats = gps_instance.delta_log_by_module.get(f"epoch_{epoch_idx}", {})
+                        if stats:
+                            # Passa o dict de deltas para o ConvergeControl
+                            self.converge_control.snapshot_epoch_weights(stats)                        
                     except Exception as e:
                         logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
                         traceback.print_exc()
-
                 # Logar normas totais para o TensorBoard
                 try:
                     current_norm, reference_norm = gps_instance.get_delta_norms()

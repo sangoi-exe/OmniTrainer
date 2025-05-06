@@ -26,9 +26,12 @@ class ConvergeControl:
         verbose: bool = True,
         total_epochs: int = 100,
         # Parâmetros para DECISÃO
-        cv_thresh: float = 0.5,  # ← ➋ coef. de variação limite
-        slope_thresh: float = 1e-4,
-        delta_abs_thresh: float = 2e-3,
+        cv_thresh: float = 0.5,        # ← coef. de variação limite (fallback)
+        slope_thresh: float = 1e-4,    # ← limiar de inclinação (fallback)
+        delta_abs_thresh: float = 2e-3,# ← limiar de Δ-L2 (fallback)
+        dynamic_k: float = 1.5,        # ← multiplica IQR para threshold dinâmico
+        hist_size: int = 10,  
+        
         min_buffer_epochs: float = 0,  # Warmup em épocas (mantido)
         enable_freeze_action: bool = True,
     ):
@@ -39,14 +42,30 @@ class ConvergeControl:
         self.cv_thresh = cv_thresh
         self.abs_thresh = delta_abs_thresh
         self.slope_thresh = slope_thresh
+        
+        # parâmetros para limiares dinâmicos
+        self.dynamic_k = dynamic_k
+        self.hist_size = hist_size
+
+        # histórico de métricas para thresholds dinâmicos
+        # cada módulo terá deques de 'mean', 'cv' e 'slope'
+        self.metric_hist: Dict[str, Dict[str, Deque[float]]] = collections.defaultdict(
+            lambda: {
+                'mean':  collections.deque(maxlen=self.hist_size),
+                'cv':    collections.deque(maxlen=self.hist_size),
+                'slope': collections.deque(maxlen=self.hist_size),
+            }
+        )
+        # thresholds dinâmicos calculados
+        self.dyn_thresh: Dict[str, Dict[str, float]] = {}				
 
         self._last_epoch_incr: Dict[str, int] = {}
         self.freeze_step_run2: Dict[str, int] = {}  # Mantido para Run >= 2
         self.min_buffer_epochs = min_buffer_epochs
+        self._prev_epoch_state: Dict[str, torch.Tensor] = {}
 
         hint = delta_buffer_size or 0
         self._buffer_maxlen = max(hint, self.win_size)
-
         self.delta_buffers = collections.defaultdict(lambda: collections.deque(maxlen=self._buffer_maxlen))
 
         # Buffer de Δ-L2 por módulo (mantido)
@@ -64,7 +83,7 @@ class ConvergeControl:
             enable_freeze_action if run_number >= 2 else False
         )  # Congelamento só na Run 2+ por padrão
 
-        self.warm_steps = 200  # coleta só estatísticas
+        self.warm_steps = 420  # coleta só estatísticas
         self.alpha_rur = 2.0  # k × IQR  →  thr_rur
         self.beta_grad = 2.0  # k × IQR  →  thr_grad
         self.win_snr = 20  # janela SNR (steps)
@@ -98,28 +117,96 @@ class ConvergeControl:
                 # Mensagem sobre dados históricos removida
                 lvl="debug")
 
-    def update_step_metrics(self, name: str, weight_t):
+    def update_step_metrics(self, name: str, module: torch.nn.Module):
         """
-        Captura métricas por step usando APENAS o tensor de peso recebido:
-          • grad_norm para SNR / saturação
-          • Relative-Update-Ratio contra peso salvo da época anterior
+        Captura métricas por step a partir de um módulo:
+          • grad_norm (concat de todos os grads) → SNR
+          • RUR vs snapshot anterior → Relative-Update-Ratio
         """
-        if weight_t.grad is None:
-            return  # não há grad
+        # AQUI TÁ SUAVE
+        try:
+            # 1) Grad norm para SNR
+            grads = [
+                p.grad.detach().flatten()
+                for p in module.parameters()
+                if p.grad is not None
+            ]
+            if grads:
+                grad_vec = torch.cat(grads)
+                self.g_hist[name].append(grad_vec.clone())
 
-        g = weight_t.grad.detach()
-        self.g_hist[name].append(g.clone())  # para SNR
+            # 2) Captura o vetor de peso corrente
+            if hasattr(module, "flat_params"):
+                curr_w = module.flat_params().detach()
+            else:
+                params = [p.detach().flatten() for p in module.parameters()]
+                curr_w = torch.cat(params) if params else None
+            if curr_w is None:
+                return
 
-        # Relative-Update-Ratio
-        prev_w = self.prev_W.get(name, weight_t.detach())
-        rur = (weight_t.detach() - prev_w).norm() / (prev_w.norm() + self.grad_eps)
-        self.rur_hist[name].append(rur.item())
+            # 3) RUR em relação ao snapshot anterior
+            prev_w = self.prev_W.get(name, curr_w)
+            rur = (curr_w - prev_w).norm() / (prev_w.norm() + self.grad_eps)
+            self.rur_hist[name].append(rur.item())
 
-    def snapshot_epoch_weights(self, weights_dict: Dict[str, "torch.Tensor"]):
-        """Salva pesos (1×/época) para calcular RUR na próxima época."""
-        for n, w in weights_dict.items():
-            self.prev_W[n] = w.detach().clone()
+            # 4) Atualiza snapshot para o próximo step
+            self.prev_W[name] = curr_w.clone()
 
+            # Debug opcional
+            #logFun(f"[ConvergeControl] Step RUR '{name}': {rur.item():.4e}", lvl="debug")
+        except Exception as e:
+            logFun(f"[ConvergeControl] Exception during update_step_metrics processing: {e}", lvl="error")
+            traceback.print_exc()                        
+
+    def snapshot_epoch_weights(self, deltas_by_module: Dict[str, float]):
+        """
+        Atualiza os buffers de Δ-L2 por módulo usando os deltas pré-calculados.
+        """
+        for module, delta in deltas_by_module.items():
+            self.delta_buffers[module].append(delta)
+        # Para imprimir tudo formatado
+        # Imprime porcentagem de estabilidade de cada módulo ao fim da época
+        # Imprime porcentagem de estabilidade e métricas absolutas de cada módulo
+        for module in self.delta_buffers.keys():
+            # re-calcula estatísticas para exibir
+            buf = self.delta_buffers[module]
+            window = list(buf)[-self.win_size:]
+            mean, std, slope = self.stats_window(window)
+            cv = std / (mean + 1e-12)
+            # ❶ Atualiza histórico de métricas
+            mh = self.metric_hist[module]
+            mh['mean'].append(mean)
+            mh['cv'].append(cv)
+            mh['slope'].append(abs(slope))
+
+            # ❷ Se houver hist_size pontos, calcula thresholds dinâmicos
+            if len(mh['mean']) == self.hist_size:
+                import numpy as np
+                # para cada métrica, usa median + k * IQR
+                for met in ('mean','cv','slope'):
+                    arr = np.array(mh[met])
+                    q1, q3 = np.percentile(arr, [25, 75])
+                    med = np.median(arr)
+                    self.dyn_thresh.setdefault(module, {})[met] = med + self.dynamic_k * (q3 - q1)
+
+            # logs dos thresholds dinâmicos/fixos e da estabilidade
+            thr = self.dyn_thresh.get(module, {})
+            logFun(
+                f"[THR] '{module}': abs<{thr.get('mean', self.abs_thresh):.3e}, "
+                f"cv<{thr.get('cv', self.cv_thresh):.3f}, "
+                f"slope<{thr.get('slope', self.slope_thresh):.3e}",
+                lvl="debug"
+            )
+
+            # ❸ Exibe estabilidade com métricas absolutas
+            score = self.stability_score(module)
+            logFun(
+                f"[DEBUG] Época {self._current_epoch:03d} — '{module}': "
+                f"estab={score*100:5.1f}% │ "
+                f"mean={mean:.3e}, cv={cv:.3e}, slope={slope:.3e}",
+                lvl="warning"
+            )
+            
     def _ready_to_freeze(self, name: str) -> bool:
         """Usa RUR e grad_norm com limiares aprendidos no warm-up."""
         # warm-up: ainda aprendendo baselines
@@ -162,7 +249,7 @@ class ConvergeControl:
         """Retorna média, desvio padrão e inclinação (OLS) de uma sequência."""
         y = np.asarray(arr, dtype=np.float32)
         mean = float(y.mean())
-        std = float(y.std(ddof=0))
+        std = float(y.std(ddof=1))
         x = np.arange(len(y), dtype=np.float32)
         slope, *_ = linregress(x, y)  # small slope → ~estável
         return mean, std, float(slope)
@@ -329,26 +416,56 @@ class ConvergeControl:
         slope_ok = abs(slope) < self.slope_thresh
 
         stable = (mean_ok and cv_ok) or (cv_ok and slope_ok)
-        try:
-            if self.debug:
-                # Último delta-L2 observado
-                last_delta_val = f"{window[-1]:.3e}" if window else "N/A"
-                logFun(
-                    f"[Δ-STABLE CHECK] {name}@{self._current_step} (win={len(window)}): "
-                    f"Δ_last={last_delta_val} | "
-                    f"mean={mean:.3e}  ({'OK' if mean_ok  else 'NO'})< {self.abs_thresh:.1e} | "
-                    f"CV={cv:.3e}     ({'OK' if cv_ok    else 'NO'})< {self.cv_thresh:.2f} | "
-                    f"slope={slope:.3e} ({'OK' if slope_ok else 'NO'})< {self.slope_thresh:.1e} || "
-                    f"STABLE={stable}",
-                    lvl="debug")
-        except KeyError as e:
-            logFun(f"[Trainer] KeyError ao acessar stat['group_idx'] ou mapeamento. Chave ausente? Erro: {e}", lvl="error")
-            traceback.print_exc()
-        except IndexError as e:
-            logFun(f"[Trainer] IndexError ao acessar self.model.param_group_mapping. group_idx fora do range? Erro: {e}", lvl="error")
-            traceback.print_exc()
-        except Exception as e:
-            logFun(f"[Trainer@{self._current_step}] Exception during post-optimizer step processing (ConvergeControl/Recorder): {e}", lvl="error")
-            traceback.print_exc()
+        # try:
+        #     if self.debug:
+        #         # Último delta-L2 observado
+        #         last_delta_val = f"{window[-1]:.3e}" if window else "N/A"
+        #         logFun(
+        #             f"[Δ-STABLE CHECK] {name}@{self._current_step} (win={len(window)}): "
+        #             f"Δ_last={last_delta_val} | "
+        #             f"mean={mean:.3e}  ({'OK' if mean_ok  else 'NO'})< {self.abs_thresh:.1e} | "
+        #             f"CV={cv:.3e}     ({'OK' if cv_ok    else 'NO'})< {self.cv_thresh:.2f} | "
+        #             f"slope={slope:.3e} ({'OK' if slope_ok else 'NO'})< {self.slope_thresh:.1e} || "
+        #             f"STABLE={stable}",
+        #             lvl="debug")
+        # except KeyError as e:
+        #     logFun(f"[Trainer] KeyError ao acessar stat['group_idx'] ou mapeamento. Chave ausente? Erro: {e}", lvl="error")
+        #     traceback.print_exc()
+        # except IndexError as e:
+        #     logFun(f"[Trainer] IndexError ao acessar self.model.param_group_mapping. group_idx fora do range? Erro: {e}", lvl="error")
+        #     traceback.print_exc()
+        # except Exception as e:
+        #     logFun(f"[Trainer@{self._current_step}] Exception during post-optimizer step processing (ConvergeControl/Recorder): {e}", lvl="error")
+        #     traceback.print_exc()
 
         return stable
+
+    def stability_score(self, name: str) -> float:
+        """
+        Retorna um score [0.0, 1.0] baseado em:
+          • mean < abs_thresh
+          • cv   < cv_thresh
+          • |slope| < slope_thresh
+        Média simples das 3 componentes.
+        """
+        buf = self.delta_buffers.get(name, None)
+        if buf is None or len(buf) < self.win_size:
+            return 0.0  # ainda sem histórico suficiente
+
+        # calcula estatísticas dos últimos win_size deltas
+        window = list(buf)[-self.win_size:]
+        mean, std, slope = self.stats_window(window)
+        cv = std / (mean + 1e-12)
+        
+        # escolhe thresholds: dinâmico se calculado, senão o fixo
+        thr_mean   = self.dyn_thresh.get(name, {}).get('mean',   self.abs_thresh)
+        thr_cv     = self.dyn_thresh.get(name, {}).get('cv',     self.cv_thresh)
+        thr_slope  = self.dyn_thresh.get(name, {}).get('slope',  self.slope_thresh)
+
+        # pontua cada critério (0 = falhou, 1 = perfeição)
+        mean_score  = max(0.0, min(1.0, (thr_mean   - mean)  / thr_mean))
+        cv_score    = max(0.0, min(1.0, (thr_cv     - cv)    / thr_cv))
+        slope_score = max(0.0, min(1.0, (thr_slope  - abs(slope)) / thr_slope))
+
+        # média simples como score final
+        return (mean_score + cv_score + slope_score) / 3.0
