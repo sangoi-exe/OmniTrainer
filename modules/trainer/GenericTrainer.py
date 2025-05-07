@@ -979,19 +979,19 @@ class GenericTrainer(BaseTrainer):
                     if transferred_to_temp_device:
                         self.model_setup.setup_train_device(self.model, self.config)
 
-                def _end_epoch_cleanup(self):
-                    """
-                    Limpa tudo que não precisa atravessar épocas:
-                    - snapshots de ConvergeControl
-                    - históricos temporários
-                    - libera cache da GPU
-                    """
-                    # 1) Se estiver usando ConvergeControl
-                    if hasattr(self, "converge_control"):
-                        logFun("[ConvergeControl]: Limpando essa merda..")
-                        self.converge_control.prev_W.clear()
-                        self.converge_control.g_hist.clear()
-                        self.converge_control.rur_hist.clear()
+                # def _end_epoch_cleanup(self):
+                #     """
+                #     Limpa tudo que não precisa atravessar épocas:
+                #     - snapshots de ConvergeControl
+                #     - históricos temporários
+                #     - libera cache da GPU
+                #     """
+                #     # 1) Se estiver usando ConvergeControl
+                #     if hasattr(self, "converge_control"):
+                #         logFun("[ConvergeControl]: Limpando essa merda..")
+                #         self.converge_control.prev_W.clear()
+                #         self.converge_control.g_hist.clear()
+                #         self.converge_control.rur_hist.clear()
                 # with TorchMemoryRecorder(enabled=False):
                 #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
@@ -1243,7 +1243,8 @@ class GenericTrainer(BaseTrainer):
                     self.grad_hook_handles.clear()
                     return # Sai do método train
 
-            _end_epoch_cleanup(self)
+           # if hasattr(self, "converge_control"):
+               # self.converge_control._end_epoch_cleanup()
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(
@@ -1283,8 +1284,10 @@ class GenericTrainer(BaseTrainer):
                         # Extrai os deltas calculados para esta época
                         # ➋ snapshot de pesos no fim da época (com base nos deltas do TrainGPS)
                         stats = gps_instance.delta_log_by_module.get(f"epoch_{epoch_idx}", {})
+                        # AQUI TÁ SUAVE NEW
                         if stats:
                             # Passa o dict de deltas para o ConvergeControl
+                            
                             self.converge_control.snapshot_epoch_weights(stats)                        
                     except Exception as e:
                         logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
@@ -1323,7 +1326,7 @@ class GenericTrainer(BaseTrainer):
                     # AQUI TÁ SUAVE
                     param_group_obj = self.model.parameters.by_unique_name(name)
                     if not param_group_obj:
-                        logFun(f"[Trainer] passou por if not param_group_obj:", lvl="warning")
+                        #logFun(f"[Trainer] passou por if not param_group_obj:", lvl="warning")
                         continue  # nome inválido ou não existe
 
                     # Decide se deve estar habilitado (não congelado)
