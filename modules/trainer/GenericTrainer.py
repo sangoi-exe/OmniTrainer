@@ -1074,6 +1074,17 @@ class GenericTrainer(BaseTrainer):
                             if current_stats_list: # Only proceed if stats were generated
                                 mapped_stats_list = []
                                 for stat in current_stats_list:
+                                    # group_idx = stat["group_idx"]
+                                    # # DEBUG: mostra qual group_idx e nome está sendo mapeado
+                                    # try:
+                                    #     name = self.model.param_group_mapping[group_idx]
+                                    # except Exception:
+                                    #     name = None
+                                    # logFun(
+                                    #     f"[DEBUG Trainer] pop_stats → group_idx={group_idx}, "
+                                    #     f"name_mapped={name!r}",
+                                    #     lvl="debug"
+                                    # )
                                     group_idx = stat["group_idx"] # Acesso direto, pode dar KeyError se não existir
                                     if 0 <= group_idx < len(self.model.param_group_mapping):
                                         name = self.model.param_group_mapping[group_idx]
@@ -1122,8 +1133,14 @@ class GenericTrainer(BaseTrainer):
                                         self.converge_control.set_current_time(current_epoch, global_step)
                                         self.converge_control.ingest_and_process(mapped_stats_list)
                                         # 4.c) Atualiza métricas por step diretamente nos módulos LoRA
-                                        for name, peft_mod in self.model.unet_lora.lora_modules.items():
-                                            self.converge_control.update_step_metrics(name, peft_mod)
+                                        for stat in mapped_stats_list:
+                                            stats_name = stat["name"]  # ex: 'lora_unet_mid_block_resnets_1_conv2'
+                                            peft_mod = self.model.unet_lora.get_module_for_stats(stats_name)
+                                            if peft_mod is None:
+                                                logFun(f"[Trainer DEBUG] PEFT module não encontrado para stats_name: {stats_name}", lvl="debug")
+                                                continue
+                                            # usa stats_name como chave para ConvergeControl, e o módulo correto
+                                            self.converge_control.update_step_metrics(stats_name, peft_mod)
                                     # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
                                     if self.recorder:
                                         # Pass necessary stats to recorder's log_step
@@ -1281,14 +1298,7 @@ class GenericTrainer(BaseTrainer):
                         # Loga para a época que acabou de terminar
                         epoch_idx = train_progress.epoch - 1
                         gps_instance.log_group_deltas(epoch_idx)
-                        # Extrai os deltas calculados para esta época
-                        # ➋ snapshot de pesos no fim da época (com base nos deltas do TrainGPS)
-                        stats = gps_instance.delta_log_by_module.get(f"epoch_{epoch_idx}", {})
-                        # AQUI TÁ SUAVE NEW
-                        if stats:
-                            # Passa o dict de deltas para o ConvergeControl
-                            
-                            self.converge_control.snapshot_epoch_weights(stats)                        
+                        self.converge_control.snapshot_epoch_weights()
                     except Exception as e:
                         logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
                         traceback.print_exc()

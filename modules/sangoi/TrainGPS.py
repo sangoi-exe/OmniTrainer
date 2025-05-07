@@ -65,6 +65,10 @@ class TrainGPS:
                         # Retorna tensor destacado (detach) para evitar problemas de grafo
                         yield key, tensor.detach(), tensor.device
                         processed_keys.add(key)
+                        # DEBUG: mostra toda chave que o GPS está iterando
+                        # logFun(f"[DEBUG TrainGPS] Found state_dict key: {key}", lvl="debug")
+                        # yield key, tensor.detach(), tensor.device
+                        # processed_keys.add(key)
             except Exception as e:
                 logFun(f"[TrainGPS] Erro ao iterar state_dict para wrapper {getattr(wrapper, 'prefix', 'Unknown')}: {e}")
 

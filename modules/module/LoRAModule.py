@@ -442,13 +442,6 @@ class PeftBase(nn.Module):
         ΔW = self.make_weight(self.lora_down.weight, self.lora_up.weight) * (self.alpha / self.rank)
         return (W0 + ΔW).flatten().clone()
 
-    def flat_params(self) -> torch.Tensor:
-        """Concatena TODOS os tensores com requires_grad=True num vetor 1-D."""
-        parts = [p.detach().flatten() for p in self.parameters() if p.requires_grad]
-        if not parts:                               # pode acontecer em bias congelado
-            return torch.empty(0, device=self.orig_module.weight.device)
-        return torch.cat(parts).clone()             # snapshot imutável
-
 
 class LoHaModule(PeftBase):
     """Implementation of LoHa from Lycoris."""
@@ -1477,3 +1470,17 @@ class LoRAModuleWrapper:
         except Exception as e:
             logFun(f"Error writing key file '{output_filename}': {e}", lvl="error")
             traceback.print_exc()
+
+    def get_module_for_stats(self, stats_name: str) -> nn.Module | None:
+        """
+        Dado um stats_name (ex: 'lora_unet_mid_block_resnets_1_conv2'),
+        retorna o objeto PEFT correto em self.lora_modules,
+        ou None se não encontrar.
+        """
+        # prefixo usado na criação dos módulos
+        prefix = self.prefix  # ex: 'lora_unet'
+        for orig_name, peft_mod in self.lora_modules.items():
+            candidate = f"{prefix}_{orig_name.replace('.', '_')}"
+            if candidate == stats_name:
+                return peft_mod
+        return None

@@ -36,7 +36,7 @@ class ConvergeControl:
         warm_steps_dhat_snr: int = 200,
         # Renomeado para base_gamma_d_hat no construtor para clareza
         # O valor passado aqui será o ponto de partida para o gamma dinâmico.
-        base_gamma_d_hat: float = 1.0,  # <<< VALOR SUGERIDO: 1.0 (em vez de 2.0)
+        base_gamma_d_hat: float = 1.0,
         delta_snr: float = 1.0,
         min_stable_metrics_freeze: int = 2,
         min_buffer_epochs: float = 0,
@@ -75,6 +75,7 @@ class ConvergeControl:
         hint = delta_buffer_size or 0
         self._buffer_maxlen_delta_l2 = max(hint, self.win_size_delta_l2)
         self.delta_buffers = collections.defaultdict(lambda: collections.deque(maxlen=self._buffer_maxlen_delta_l2))
+        self._rolling_stats = collections.defaultdict(lambda: RollingStats(self.win_size_delta_l2))
 
         self.perma_frozen: Set[str] = set()
         self.suspect_counter: Dict[str, int] = collections.defaultdict(int)
@@ -92,11 +93,16 @@ class ConvergeControl:
         # Armazena o gamma_d_hat base fornecido no init
         self.base_gamma_d_hat_config = base_gamma_d_hat
         self.delta_snr = delta_snr
-        self.min_stable_metrics_freeze = max(1, min(2, min_stable_metrics_freeze))
+        # agora exigimos D-hat, slope e SNR estáveis
+        self.min_stable_metrics_freeze = 3
 
         self.grad_eps = 1e-9
 
+        # thresholds dinâmicos para D-hat e seu slope
         self.thr_d_hat: Dict[str, float] = {}
+        self.thr_slope_d_hat: Dict[str, float] = {}
+        # último slope calculado de D-hat, para comparação na decisão
+        self.last_slope_d_hat: Dict[str, float] = {}
         self.thr_snr: Dict[str, float] = {}
 
         self.win_snr_calc = 2
@@ -135,39 +141,12 @@ class ConvergeControl:
                 print(f"[ConvergeControl __init__] Error in logFun: {e}")
                 traceback.print_exc()
 
-    def _robust_stats(self, arr_like: Deque[float] | List[float] | np.ndarray) -> Tuple[float, float]: # Adicionado np.ndarray à anotação de tipo
-        try:
-            # Se já for um array NumPy, não precisa converter de novo.
-            # Se for uma lista ou deque, converter para NumPy.
-            if isinstance(arr_like, np.ndarray):
-                arr = arr_like.astype(np.float32) # Garante o dtype
-            elif hasattr(arr_like, '__len__') and len(arr_like) == 0: # Verifica se é um iterável com len e está vazio
-                return 0.0, 0.0
-            elif not arr_like and not hasattr(arr_like, '__len__'): # Para outros tipos de "falsy" que não têm len (embora menos provável aqui)
-                return 0.0, 0.0
-            else:
-                arr = np.array(list(arr_like), dtype=np.float32)
-
-            # Agora 'arr' é definitivamente um array NumPy.
-            # Verifique o tamanho do array NumPy.
-            if arr.size == 0: # Use .size para arrays NumPy
-                return 0.0, 0.0
-            
-            # O resto da sua lógica parece OK:
-            if arr.size < 2: # Use .size aqui também
-                # np.median funciona com arrays de 1 elemento.
-                # np.percentile precisa de pelo menos 1 elemento.
-                return float(np.median(arr)), 0.0
-            
-            q1, med, q3 = np.percentile(arr, [25, 50, 75])
-            return float(med), float(q3 - q1)
-        except (ValueError, TypeError, IndexError) as e:
-            # Assuming self.debug and logFun are available and functional
-            if hasattr(self, 'debug') and self.debug:
-                logFun(
-                    f"[ConvergeControl._robust_stats] Error: {e}. Input type: {type(arr_like)}, content (first 5): {str(list(arr_like)[:5])}", lvl="error")
-                traceback.print_exc()
-            return 0.0, 0.0
+    def _robust_stats(self, seq):
+        arr = np.asarray(seq, dtype=np.float32)
+        if arr.size < 2:
+            return float(np.median(arr)) if arr.size == 1 else 0.0, 0.0
+        q1, med, q3 = np.percentile(arr, [25,50,75])
+        return float(med), float(q3 - q1)
 
     def _calculate_snr(self, g_vector_deque: Deque[torch.Tensor]) -> Optional[float]:
         if len(g_vector_deque) < 2:
@@ -234,103 +213,114 @@ class ConvergeControl:
                 print(f"Logging error in update_step_metrics during exception handling: {log_e}")
                 print(f"Original error for '{name}': {e}")
                 traceback.print_exc()
+        # finally:
+        #     logFun(f"[DEBUG] update_step_metrics chamado para '{name}': "
+        #           f"g_vec_len={len(self.g_vector_hist_for_snr_calc[name])}, "
+        #           f"g_hist_len={len(self.g_hist_for_snr_baseline[name])}",
+        #           lvl="debug")                    
 
-    def snapshot_epoch_weights(self, deltas_by_module: Dict[str, float]):
-        for module, delta in deltas_by_module.items():
+    def snapshot_epoch_weights(self): # << NÃO RECEBE MAIS "deltas_by_module"
+        """
+        Chamado no final de cada época.
+        Calcula estatísticas de Delta-L2 (mean, cv, slope) para cada módulo
+        usando os dados acumulados em self.delta_buffers e self._rolling_stats
+        (que foram populados por ingest_and_process com deltas da Run 2).
+        Atualiza os limiares dinâmicos para o stability_score e logs.
+        """
+        for module_name in list(self.delta_buffers.keys()): # Itera sobre os módulos que têm dados
             try:
-                self.delta_buffers[module].append(delta)
-            except Exception as e:
-                try:
-                    logFun(
-                        f"[ConvergeControl.snapshot_epoch_weights] Error appending delta for module '{module}': {delta}. Error: {e}", lvl="error")
-                    traceback.print_exc()
-                except Exception as log_e:
-                    print(f"Logging error in snapshot_epoch_weights (append loop): {log_e}")
-                    print(f"Original error for module '{module}': {e}")
-                    traceback.print_exc()
-
-        for module in list(self.delta_buffers.keys()):
-            try:
-                buf_delta_l2 = self.delta_buffers[module]
-                if len(buf_delta_l2) < self.win_size_delta_l2:                    
+                buf_delta_l2 = self.delta_buffers[module_name]
+                if len(buf_delta_l2) < self.win_size_delta_l2:
                     if self.debug and self._current_step % 10 == 0:
                         logFun(
-                            f"[ConvergeControl] Mod '{module}' ({len(buf_delta_l2)}/{self.win_size_delta_l2}) Δ-L2 buf too short for stats.",
+                            f"[ConvergeControl.snapshot_epoch_weights] Mod '{module_name}' ({len(buf_delta_l2)}/{self.win_size_delta_l2}) Δ-L2 buf too short for stats.",
                             lvl="debug")
                     continue
 
-                window_delta_l2 = list(buf_delta_l2)[-self.win_size_delta_l2:]
-                mean_dl2, std_dl2, slope_dl2 = self.stats_window(window_delta_l2)
-                cv_dl2 = std_dl2 / (mean_dl2 + 1e-12)
-                score_dl2 = self.stability_score(module)
+                # Obtém média e desvio padrão direto do RollingStats
+                # _rolling_stats foi populado por ingest_and_process ao longo da época
+                rs = self._rolling_stats[module_name]
+                mean_dl2 = rs.mean
+                std_dl2  = rs.std
+                
+                # Slope é calculado sobre a janela mais recente do buffer completo
+                # (RollingStats não mantém a sequência para cálculo de slope)
+                slope_dl2 = self.stats_window(list(buf_delta_l2)[-self.win_size_delta_l2:])[2]
+                cv_dl2 = std_dl2 / (mean_dl2 + 1e-12) if mean_dl2 > 1e-12 else 0.0 # Evitar divisão por zero se média for muito pequena
+                
+                score_dl2 = self.stability_score(module_name) # stability_score usará os mesmos buffers
 
                 # Atualiza histórico e limiares dinâmicos para Delta-L2
-                mh_dl2 = self.metric_hist_delta_l2[module]
+                mh_dl2 = self.metric_hist_delta_l2[module_name]
                 mh_dl2['mean'].append(mean_dl2)
                 mh_dl2['cv'].append(cv_dl2)
-                mh_dl2['slope'].append(abs(slope_dl2))
+                mh_dl2['slope'].append(abs(slope_dl2)) # Armazena valor absoluto do slope
 
-                # CONDIÇÃO MODIFICADA: Recalcular se o histórico estiver cheio (ou tiver um tamanho mínimo)
-                # Considerando que hist_size_delta_l2 é o tamanho desejado para o cálculo do limiar.
-                if len(mh_dl2['mean']) == self.hist_size_delta_l2: # Mantém a lógica de que o deque está 'cheio' para ser representativo
+                if len(mh_dl2['mean']) == self.hist_size_delta_l2:
                     for met_key in ('mean', 'cv', 'slope'):
-                        # O deque mh_dl2[met_key] já é uma janela deslizante devido ao maxlen.
-                        # Então, 'arr' sempre terá os últimos 'hist_size_delta_l2' valores.
-                        arr = np.array(list(mh_dl2[met_key]), dtype=np.float32)
-                        # A verificação 'if len(arr) > 0:' é redundante se a condição externa for len == hist_size_delta_l2 (e hist_size > 0)
-                        # mas não faz mal.
-                        med, iqr_val = self._robust_stats(arr)
-                        calculated_thresh = med + self.dynamic_k_delta_l2 * iqr_val
-                        self.dyn_thresh_delta_l2.setdefault(module, {})[met_key] = calculated_thresh
-                        if self.debug: # Adicionar log para ver a atualização
-                            logFun(f"[ConvergeControl] Mod '{module}' DynThresh Δ-L2 for '{met_key}' updated to: {calculated_thresh:.3e} "
-                                  f"(based on hist_len={len(arr)}, med={med:.3e}, iqr={iqr_val:.3e})", lvl="debug")
+                        metric_values_for_dyn_thresh = list(mh_dl2[met_key])
+                        # Usar média e std do histórico da métrica para o limiar dinâmico
+                        # (Não mais mediana e IQR aqui, para consistência com o que foi discutido para Prodigy)
+                        # Ou manter mediana e IQR se preferir robustez contra outliers no histórico da métrica.
+                        # Vamos manter _robust_stats por enquanto, como estava antes.
+                        med_met, iqr_met = self._robust_stats(metric_values_for_dyn_thresh)
+                        base, var = med_met, iqr_met
 
+                        calculated_thresh = base + self.dynamic_k_delta_l2 * var
+                        self.dyn_thresh_delta_l2.setdefault(module_name, {})[met_key] = calculated_thresh
+                        if self.debug:
+                            logFun(f"[ConvergeControl.snapshot_epoch_weights] Mod '{module_name}' DynThresh Δ-L2 for '{met_key}' updated to: {calculated_thresh:.3e} "
+                                  f"(based on hist_len={len(metric_values_for_dyn_thresh)}, med={med_met:.3e}, iqr={iqr_met:.3e})", lvl="debug")
+
+                # --- Logging Detalhado (como estava antes, adaptado para module_name) ---
                 curr_d_hat_val_str = "N/A"
                 thr_d_hat_str = "N/A (no base)"
                 d_hat_ok_str = "-"
-                if module in self.d_hat_hist and self.d_hat_hist[module]:
-                    curr_d_hat_val = self.d_hat_hist[module][-1]
+                if module_name in self.d_hat_hist and self.d_hat_hist[module_name]:
+                    curr_d_hat_val = self.d_hat_hist[module_name][-1]
                     curr_d_hat_val_str = f"{curr_d_hat_val:.2e}"
-                    if module in self.thr_d_hat:
-                        thr_d_hat_str = f"<{self.thr_d_hat[module]:.2e}"
-                        d_hat_ok_str = "OK" if curr_d_hat_val < self.thr_d_hat[module] else "NO"
+                    if module_name in self.thr_d_hat:
+                        thr_d_hat_str = f"<{self.thr_d_hat[module_name]:.2e}"
+                        d_hat_ok_str = "OK" if curr_d_hat_val < self.thr_d_hat[module_name] else "NO"
                     else:
-                        thr_d_hat_str = f"<{self.base_d_hat.get(module, float('inf')):.2e} (warmup)"
+                        base_d_hat_val = self.base_d_hat.get(module_name, float('inf'))
+                        thr_d_hat_str = f"<{base_d_hat_val:.2e} (warmup)"
+
 
                 curr_snr_val_str = "N/A"
                 thr_snr_str = "N/A (no base)"
                 snr_ok_str = "-"
                 last_snr_from_baseline_hist = None
-                if module in self.g_hist_for_snr_baseline and self.g_hist_for_snr_baseline[module]:
-                    last_snr_from_baseline_hist = self.g_hist_for_snr_baseline[module][-1]
+                if module_name in self.g_hist_for_snr_baseline and self.g_hist_for_snr_baseline[module_name]:
+                    last_snr_from_baseline_hist = self.g_hist_for_snr_baseline[module_name][-1]
 
                 if last_snr_from_baseline_hist is not None:
                     curr_snr_val_str = f"{last_snr_from_baseline_hist:.2f}"
 
-                # Verificar se o threshold e o baseline de SNR existem (calculados em _ready_to_freeze)
-                if module in self.thr_snr:
-                    thr_snr_str = f"<{self.thr_snr[module]:.2f}"
-                    if last_snr_from_baseline_hist is not None: # Só podemos dizer OK/NO se tivermos um valor para comparar
-                        snr_ok_str = "OK" if last_snr_from_baseline_hist < self.thr_snr[module] else "NO"
+                if module_name in self.thr_snr:
+                    thr_snr_str = f"<{self.thr_snr[module_name]:.2f}"
+                    if last_snr_from_baseline_hist is not None:
+                        snr_ok_str = "OK" if last_snr_from_baseline_hist < self.thr_snr[module_name] else "NO"
                     else:
-                        snr_ok_str = "?" # Não sabemos o valor atual para comparar com o threshold no log
-                elif module in self.base_snr: # Se thr não existe, mas base existe
-                    thr_snr_str = f"(base={self.base_snr[module]:.2f} no_thr_yet)"
-                else: # Nem base nem threshold
+                        snr_ok_str = "?"
+                elif module_name in self.base_snr:
+                    thr_snr_str = f"(base={self.base_snr[module_name]:.2f} no_thr_yet)"
+                else:
                     thr_snr_str = "N/A (no base)"                    
 
                 log_line1 = (
-                    f"[CONV_STAT] Época {self._current_epoch:03d} — '{module}':\n"
+                    f"[CONV_STAT] Época {self._current_epoch:03d} — '{module_name}':\n"
                     f"  Δ-L2 Score: {score_dl2 * 100:5.1f}% (Mean={mean_dl2:.2e}, CV={cv_dl2:.2e}, Slope={slope_dl2:.2e})"
                 )
-                thr_dl2_mean = self.dyn_thresh_delta_l2.get(module, {}).get('mean', self.abs_thresh_fallback)
-                thr_dl2_cv = self.dyn_thresh_delta_l2.get(module, {}).get('cv', self.cv_thresh_fallback)
-                thr_dl2_slope = self.dyn_thresh_delta_l2.get(module, {}).get('slope', self.slope_thresh_fallback)
-                log_line2 = (f"  Δ-L2 Thresh: DynUsed=({module in self.dyn_thresh_delta_l2}), "f"Mean<{thr_dl2_mean:.2e}, CV<{thr_dl2_cv:.2f}, Slope<{thr_dl2_slope:.2e}")
-                log_line3 = (f"  D-hat: Val={curr_d_hat_val_str} ({d_hat_ok_str} {thr_d_hat_str}) | "f"SNR: Val={curr_snr_val_str} ({snr_ok_str} {thr_snr_str})")
-                suspect_count = self.suspect_counter.get(module, 0)
-                is_permafrozen = module in self.perma_frozen
+                thr_dl2_mean = self.dyn_thresh_delta_l2.get(module_name, {}).get('mean', self.abs_thresh_fallback)
+                thr_dl2_cv = self.dyn_thresh_delta_l2.get(module_name, {}).get('cv', self.cv_thresh_fallback)
+                thr_dl2_slope = self.dyn_thresh_delta_l2.get(module_name, {}).get('slope', self.slope_thresh_fallback)
+                log_line2 = (f"  Δ-L2 Thresh: DynUsed=({module_name in self.dyn_thresh_delta_l2}), "
+                             f"Mean<{thr_dl2_mean:.2e}, CV<{thr_dl2_cv:.2f}, Slope<{thr_dl2_slope:.2e}")
+                log_line3 = (f"  D-hat: Val={curr_d_hat_val_str} ({d_hat_ok_str} {thr_d_hat_str}) | "
+                             f"SNR: Val={curr_snr_val_str} ({snr_ok_str} {thr_snr_str})")
+                suspect_count = self.suspect_counter.get(module_name, 0)
+                is_permafrozen = module_name in self.perma_frozen
                 freeze_status_str = "PERMA" if is_permafrozen else f"{suspect_count}/{self.k_confirm}"
                 log_line4 = (f"  Freeze Status: {freeze_status_str}")
                 full_log_message = f"{log_line1}\n{log_line2}\n{log_line3}\n{log_line4}"
@@ -339,12 +329,12 @@ class ConvergeControl:
             except Exception as e:
                 try:
                     logFun(
-                        f"[ConvergeControl.snapshot_epoch_weights] Error processing/logging for module '{module}': {e}",
+                        f"[ConvergeControl.snapshot_epoch_weights] Error processing/logging for module '{module_name}': {e}",
                         lvl="error")
                     traceback.print_exc()
                 except Exception as log_e:
                     print(f"Logging error in snapshot_epoch_weights (main loop): {log_e}")
-                    print(f"Original error for module '{module}': {e}")
+                    print(f"Original error for module '{module_name}': {e}")
                     traceback.print_exc()
 
     def _ready_to_freeze(self, name: str) -> bool:
@@ -389,82 +379,100 @@ class ConvergeControl:
                 current_gamma_d_hat = max(self.min_overall_gamma_dhat, min(self.max_overall_gamma_dhat, current_gamma_d_hat))
 
                 self.thr_d_hat[name] = max(0.0, med_d_hat - current_gamma_d_hat * iqr_d_hat)
+                # novo: define limiar de slope de D-hat como k×IQR
+                self.thr_slope_d_hat[name] = self.slope_sensitivity_dhat * iqr_d_hat
+                # guarda o slope atual
+                self.last_slope_d_hat[name] = slope_d_hat
                 
                 if self.debug: # Log movido para dentro da condição de cálculo bem-sucedido
                     logFun(
-                        f"[BASELINE D_HAT] '{name}': med={med_d_hat:.3e}, IQR={iqr_d_hat:.3e}, "
-                        f"slope(win={window_for_dhat_slope_len})={slope_d_hat:.3e}, "
-                        f"dyn_gamma={current_gamma_d_hat:.2f} (base={self.base_gamma_d_hat_config:.2f}, adj={adjustment_value:.3f}) -> thr_d_hat={self.thr_d_hat[name]:.3e}",
+                        f"[BASELINE D_HAT] '{name}': med={med_d_hat:.3e}, IQR={iqr_d_hat:.3e}, \n"
+                        f"slope(win={window_for_dhat_slope_len})={slope_d_hat:.3e}, \n"
+                        f"dyn_gamma={current_gamma_d_hat:.2f} (base={self.base_gamma_d_hat_config:.2f}, adj={adjustment_value:.3f}) -> thr_d_hat={self.thr_d_hat[name]:.3e} \n",
                         lvl="debug")
             elif name in self.thr_d_hat: # Histórico insuficiente, remove limiar antigo
                 del self.thr_d_hat[name]
                 if name in self.base_d_hat: del self.base_d_hat[name]
 
-            # SNR: Recalcula baseline e threshold
+            # SNR: Recalcula baseline e threshold (fecha a “avenida”)
             if name in self.g_hist_for_snr_baseline and len(self.g_hist_for_snr_baseline[name]) >= 2:
                 med_snr, iqr_snr = self._robust_stats(self.g_hist_for_snr_baseline[name])
                 self.base_snr[name] = med_snr
-                self.thr_snr[name] = med_snr + self.delta_snr * iqr_snr
-                if self.debug: # Log movido para dentro da condição
-                    logFun(f"[BASELINE SNR] '{name}': med={med_snr:.3e}, IQR={iqr_snr:.3e} -> thr_snr={self.thr_snr[name]:.3e}", lvl="debug")
-            elif name in self.thr_snr: # Histórico insuficiente, remove limiar antigo
+                # Agora só considera SN R bem abaixo da mediana
+                self.thr_snr[name] = max(0.0, med_snr - self.delta_snr * iqr_snr)
+                if self.debug:
+                    logFun(
+                        f"[BASELINE SNR] '{name}': med={med_snr:.3e}, IQR={iqr_snr:.3e} -> "
+                        f"thr_snr={self.thr_snr[name]:.3e} (med - {self.delta_snr}×IQR)",
+                        lvl="debug"
+                    )
+            elif name in self.thr_snr:
+                # histórico insuficiente, remove limiar antigo
                 del self.thr_snr[name]
-                if name in self.base_snr: del self.base_snr[name]
+                if name in self.base_snr:
+                    del self.base_snr[name]
 
             # Verificação se os limiares foram calculados (após a tentativa de recálculo)
             if not (name in self.thr_d_hat and name in self.thr_snr):
                 if self.debug and self._current_step % 10 == 0: # Ajuste na frequência do log
-                    log_msg_wait = (f"[_ready_to_freeze] Mod '{name}' waiting for D/S thresholds. "
-                                    f"DThrExists: {name in self.thr_d_hat}, SThrExists: {name in self.thr_snr}. "
-                                    f"DHist: {len(self.d_hat_hist.get(name,[]))}/{self.warm_steps}, "
+                    log_msg_wait = (f"[_ready_to_freeze] Mod '{name}' waiting for D/S thresholds. \n"
+                                    f"DThrExists: {name in self.thr_d_hat}, SThrExists: {name in self.thr_snr}. \n"
+                                    f"DHist: {len(self.d_hat_hist.get(name,[]))}/{self.warm_steps}, \n"
                                     f"SHist: {len(self.g_hist_for_snr_baseline.get(name,[]))}/{self.warm_steps}")
                     logFun(log_msg_wait, lvl="debug")
                 return False
 
             # --- Avaliação de Estabilidade ---
             stable_metrics_count = 0
-            d_hat_ok, snr_ok = False, False
+            d_hat_ok, slope_ok, snr_ok = False, False, False
 
-            curr_d_hat_val = float('nan') 
+            curr_d_hat_val = float('inf') 
             if name in self.d_hat_hist and self.d_hat_hist[name]: # Verifica se o histórico tem algo
                 curr_d_hat_val = self.d_hat_hist[name][-1]
                 if name in self.thr_d_hat: # Verifica se o limiar foi calculado
                     if curr_d_hat_val < self.thr_d_hat[name]:
                         d_hat_ok = True
-                    stable_metrics_count += 1 if d_hat_ok else 0 
+                        stable_metrics_count += 1
+
+            # verifica slope de D-hat
+            curr_slope_val = self.last_slope_d_hat.get(name, float('nan'))
+            if name in self.thr_slope_d_hat and abs(curr_slope_val) < self.thr_slope_d_hat[name]:
+                slope_ok = True
+                stable_metrics_count += 1                        
             
-            curr_snr_val = float('nan')
+            curr_snr_val = float('inf')
             current_snr_calculated = self._calculate_snr(self.g_vector_hist_for_snr_calc[name])
             if current_snr_calculated is not None:
                 curr_snr_val = current_snr_calculated
-                if name in self.thr_snr: # Verifica se o limiar foi calculado
-                    if curr_snr_val < self.thr_snr[name]:
-                        snr_ok = True
-                    stable_metrics_count += 1 if snr_ok else 0
+                if curr_snr_val < self.thr_snr[name]:
+                    snr_ok = True
+                    stable_metrics_count += 1
 
             # Lógica de decisão de estabilidade geral
+            # agora contamos 3 métricas possíveis
             num_metrics_evaluable = 0
-            if name in self.thr_d_hat and not math.isnan(curr_d_hat_val): num_metrics_evaluable +=1
-            if name in self.thr_snr and not math.isnan(curr_snr_val): num_metrics_evaluable +=1
+            if name in self.thr_d_hat     and not math.isnan(curr_d_hat_val):   num_metrics_evaluable += 1
+            if name in self.thr_slope_d_hat and not math.isnan(curr_slope_val): num_metrics_evaluable += 1
+            if name in self.thr_snr       and not math.isnan(curr_snr_val):     num_metrics_evaluable += 1
             
             is_overall_stable = False
             if num_metrics_evaluable >= self.min_stable_metrics_freeze:
                 # Contar quantas das métricas *avaliáveis* estão OK
+                # exigimos as 3 métricas OK
                 actual_ok_count = 0
-                if name in self.thr_d_hat and not math.isnan(curr_d_hat_val) and d_hat_ok:
-                    actual_ok_count +=1
-                if name in self.thr_snr and not math.isnan(curr_snr_val) and snr_ok:
-                    actual_ok_count +=1
+                if name in self.thr_d_hat       and d_hat_ok:   actual_ok_count += 1
+                if name in self.thr_slope_d_hat and slope_ok:   actual_ok_count += 1
+                if name in self.thr_snr         and snr_ok:     actual_ok_count += 1
                 
                 if actual_ok_count >= self.min_stable_metrics_freeze:
                     is_overall_stable = True
             
             if self.debug and self._current_step % 10 == 0: # Ajuste na frequência do log
                 log_msg = (
-                    f"[_ready_to_freeze] '{name}': "
-                    f"Dhat={curr_d_hat_val:.2e}({d_hat_ok}, thr={self.thr_d_hat.get(name, float('nan')):.2e}), "
-                    f"SNR={curr_snr_val:.2e}({snr_ok}, thr={self.thr_snr.get(name, float('nan')):.2e}) | "
-                    f"Evaluable={num_metrics_evaluable}, ActualOKs={actual_ok_count if 'actual_ok_count' in locals() else 'N/A'}>={self.min_stable_metrics_freeze} -> Stable={is_overall_stable}")
+                    f"[_ready_to_freeze] '{name}': \n"
+                    f"Dhat={curr_d_hat_val:.2e}({d_hat_ok}, thr={self.thr_d_hat.get(name, float('nan')):.2e}), \n"
+                    f"SNR={curr_snr_val:.2e}({snr_ok}, thr={self.thr_snr.get(name, float('nan')):.2e}) | \n"
+                    f"Evaluable={num_metrics_evaluable}, ActualOKs={actual_ok_count if 'actual_ok_count' in locals() else 'N/A'}>={self.min_stable_metrics_freeze} -> Stable={is_overall_stable} \n")
                 logFun(log_msg, lvl="debug")
 
             return is_overall_stable
@@ -546,7 +554,9 @@ class ConvergeControl:
 
             try:
                 if delta_val is not None:
-                    self.delta_buffers[name].append(float(delta_val))
+                    f_delta_val = float(delta_val)
+                    self.delta_buffers[name].append(f_delta_val)
+                    self._rolling_stats[name].add(f_delta_val) # ATUALIZA ROLLING STATS AQUI
                     processed_deltas += 1
 
                 if d_hat_val is not None:
@@ -558,7 +568,6 @@ class ConvergeControl:
                         logFun(
                             f"[ConvergeControl] Error processing stats for '{name}': {e}. ΔL2: {delta_val}, Dhat: {d_hat_val}",
                             lvl="warning")
-                        # Consider adding traceback.print_exc() here if these errors are frequent/problematic
                     except Exception as log_e:
                         print(f"Logging error in ingest_and_process for '{name}': {log_e}")
                         print(f"Original error for '{name}': {e}")
@@ -727,3 +736,44 @@ class ConvergeControl:
                 print(f"Logging error in _end_epoch_cleanup: {log_e}")
                 print(f"Original cleanup error: {e}")
                 traceback.print_exc()
+
+from collections import deque
+
+class RollingStats:
+    """
+    Estatísticas (média, variância) para uma janela móvel de valores.
+    Complexidade de inserção O(1).
+    """
+    def __init__(self, window_size: int):
+        self.window = deque(maxlen=window_size)
+        self.sum_x = 0.0
+        self.sum_x2 = 0.0
+
+    def add(self, x: float):
+        # Se a janela já estiver cheia, remova o mais antigo
+        if len(self.window) == self.window.maxlen:
+            old = self.window[0]
+            self.sum_x  -= old
+            self.sum_x2 -= old * old
+
+        # Insere o novo
+        self.window.append(x)
+        self.sum_x  += x
+        self.sum_x2 += x * x
+
+    @property
+    def mean(self) -> float:
+        n = len(self.window)
+        return self.sum_x / n if n else 0.0
+
+    @property
+    def variance(self) -> float:
+        n = len(self.window)
+        if n < 2:
+            return 0.0
+        # var = (Σx² – Σx²/n) / (n-1)
+        return (self.sum_x2 - (self.sum_x ** 2) / n) / (n - 1)
+
+    @property
+    def std(self) -> float:
+        return math.sqrt(self.variance)
