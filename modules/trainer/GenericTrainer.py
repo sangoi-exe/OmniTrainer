@@ -1146,10 +1146,10 @@ class GenericTrainer(BaseTrainer):
                                         # Pass necessary stats to recorder's log_step
                                         # AQUI TÁ SUAVE
                                         for mapped_stat in mapped_stats_list: # Itera sobre a lista já mapeada
-                                            # DataRecorder's log_step expects name, d_hat
+                                            # DataRecorder's log_step expects name, d_max
                                             self.recorder.log_step(
                                                 name=mapped_stat["name"],
-                                                d_hat=mapped_stat.get("d_hat", 0.0), # Provide default if missing
+                                                d_max=mapped_stat.get("d_max", 0.0), # Provide default if missing
                                             )
                         except KeyError as e:
                             logFun(f"[Trainer] KeyError ao acessar stat['group_idx'] ou mapeamento. Chave ausente? Erro: {e}", lvl="error")
@@ -1448,7 +1448,7 @@ class GenericTrainer(BaseTrainer):
                 logFun(f"[DataRecorder] Salvando perfil (Run {self.run_number}) em: {profile_save_path}", lvl="info")
 
                 # DataRecorder's dump method now only takes the path
-                # It saves d_hat_final and d_coef_base internally collected.
+                # It saves d_max_final and d_coef_base internally collected.
                 self.recorder.dump(profile_save_path)
 
             except Exception as e:

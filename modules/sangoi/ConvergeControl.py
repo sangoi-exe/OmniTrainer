@@ -34,16 +34,16 @@ class ConvergeControl:
         hist_size_delta_l2: int = 10,
 
         warm_steps_dhat_snr: int = 200,
-        # Renomeado para base_gamma_d_hat no construtor para clareza
+        # Renomeado para base_gamma_d_max no construtor para clareza
         # O valor passado aqui será o ponto de partida para o gamma dinâmico.
-        base_gamma_d_hat: float = 1.0,
+        base_gamma_d_max: float = 1.0,
         delta_snr: float = 1.0,
         min_stable_metrics_freeze: int = 2,
         min_buffer_epochs: float = 0,
         enable_freeze_action: bool = True,
 
-        # Novos parâmetros para gamma_d_hat dinâmico com slope
-        # A janela para o slope do D-hat usará self.warm_steps (maxlen de d_hat_hist)
+        # Novos parâmetros para gamma_d_max dinâmico com slope
+        # A janela para o slope do D-hat usará self.warm_steps (maxlen de d_max_hist)
         slope_sensitivity_dhat: float = 0.5,
         dhat_slope_norm_factor: float = 1e-5, # <<< AJUSTAR ISTO EXPERIMENTALMENTE
         min_overall_gamma_dhat: float = 0.1,
@@ -90,8 +90,8 @@ class ConvergeControl:
         self.enable_freeze_action = (enable_freeze_action if run_number >= 2 else False)
 
         self.warm_steps = warm_steps_dhat_snr
-        # Armazena o gamma_d_hat base fornecido no init
-        self.base_gamma_d_hat_config = base_gamma_d_hat
+        # Armazena o gamma_d_max base fornecido no init
+        self.base_gamma_d_max_config = base_gamma_d_max
         self.delta_snr = delta_snr
         # agora exigimos D-hat, slope e SNR estáveis
         self.min_stable_metrics_freeze = 3
@@ -99,10 +99,10 @@ class ConvergeControl:
         self.grad_eps = 1e-9
 
         # thresholds dinâmicos para D-hat e seu slope
-        self.thr_d_hat: Dict[str, float] = {}
-        self.thr_slope_d_hat: Dict[str, float] = {}
+        self.thr_d_max: Dict[str, float] = {}
+        self.thr_slope_d_max: Dict[str, float] = {}
         # último slope calculado de D-hat, para comparação na decisão
-        self.last_slope_d_hat: Dict[str, float] = {}
+        self.last_slope_d_max: Dict[str, float] = {}
         self.thr_snr: Dict[str, float] = {}
 
         self.win_snr_calc = 2
@@ -112,9 +112,9 @@ class ConvergeControl:
         self.g_vector_hist_for_snr_calc = collections.defaultdict(
             lambda: collections.deque(maxlen=self.win_snr_calc)
         )
-        self.d_hat_hist = collections.defaultdict(lambda: collections.deque(maxlen=self.warm_steps))
+        self.d_max_hist = collections.defaultdict(lambda: collections.deque(maxlen=self.warm_steps))
 
-        self.base_d_hat: Dict[str, float] = {} # Mediana de D-hat
+        self.base_d_max: Dict[str, float] = {} # Mediana de D-hat
         self.base_snr: Dict[str, float] = {} # Mediana de SNR
 
         # Atributos para o gamma dinâmico
@@ -123,9 +123,9 @@ class ConvergeControl:
         self.min_overall_gamma_dhat = min_overall_gamma_dhat
         self.max_overall_gamma_dhat = max_overall_gamma_dhat
         
-        # Parâmetro gamma_d_hat original agora é o 'base' para o cálculo dinâmico
-        # Não precisa mais de self.gamma_d_hat como um atributo fixo se ele será sempre dinâmico
-        # dentro de _ready_to_freeze. O valor configurado é self.base_gamma_d_hat_config.
+        # Parâmetro gamma_d_max original agora é o 'base' para o cálculo dinâmico
+        # Não precisa mais de self.gamma_d_max como um atributo fixo se ele será sempre dinâmico
+        # dentro de _ready_to_freeze. O valor configurado é self.base_gamma_d_max_config.
 
         if self.debug:
             try:
@@ -133,7 +133,7 @@ class ConvergeControl:
                     f"[ConvergeControl] Init: Run {self.run_number}, FreezeAction: {self.enable_freeze_action}. "
                     f"Δ-L2 params: dynamic_k={self.dynamic_k_delta_l2}, hist_size={self.hist_size_delta_l2}. "
                     f"Freeze Decision (D-hat, SNR): Warmup={self.warm_steps} steps, "
-                    f"base_gamma_d_hat_config={self.base_gamma_d_hat_config:.2f} " # Log do gamma base
+                    f"base_gamma_d_max_config={self.base_gamma_d_max_config:.2f} " # Log do gamma base
                     f"(dyn_slope_sens={self.slope_sensitivity_dhat:.2f}, dyn_slope_norm={self.dhat_slope_norm_factor:.1e}), "
                     f"delta_snr={self.delta_snr}, MinStableMetrics={self.min_stable_metrics_freeze}",
                     lvl="debug")
@@ -273,18 +273,18 @@ class ConvergeControl:
                                   f"(based on hist_len={len(metric_values_for_dyn_thresh)}, med={med_met:.3e}, iqr={iqr_met:.3e})", lvl="debug")
 
                 # --- Logging Detalhado (como estava antes, adaptado para module_name) ---
-                curr_d_hat_val_str = "N/A"
-                thr_d_hat_str = "N/A (no base)"
-                d_hat_ok_str = "-"
-                if module_name in self.d_hat_hist and self.d_hat_hist[module_name]:
-                    curr_d_hat_val = self.d_hat_hist[module_name][-1]
-                    curr_d_hat_val_str = f"{curr_d_hat_val:.2e}"
-                    if module_name in self.thr_d_hat:
-                        thr_d_hat_str = f"<{self.thr_d_hat[module_name]:.2e}"
-                        d_hat_ok_str = "OK" if curr_d_hat_val < self.thr_d_hat[module_name] else "NO"
+                curr_d_max_val_str = "N/A"
+                thr_d_max_str = "N/A (no base)"
+                d_max_ok_str = "-"
+                if module_name in self.d_max_hist and self.d_max_hist[module_name]:
+                    curr_d_max_val = self.d_max_hist[module_name][-1]
+                    curr_d_max_val_str = f"{curr_d_max_val:.2e}"
+                    if module_name in self.thr_d_max:
+                        thr_d_max_str = f"<{self.thr_d_max[module_name]:.2e}"
+                        d_max_ok_str = "OK" if curr_d_max_val < self.thr_d_max[module_name] else "NO"
                     else:
-                        base_d_hat_val = self.base_d_hat.get(module_name, float('inf'))
-                        thr_d_hat_str = f"<{base_d_hat_val:.2e} (warmup)"
+                        base_d_max_val = self.base_d_max.get(module_name, float('inf'))
+                        thr_d_max_str = f"<{base_d_max_val:.2e} (warmup)"
 
 
                 curr_snr_val_str = "N/A"
@@ -317,7 +317,7 @@ class ConvergeControl:
                 thr_dl2_slope = self.dyn_thresh_delta_l2.get(module_name, {}).get('slope', self.slope_thresh_fallback)
                 log_line2 = (f"  Δ-L2 Thresh: DynUsed=({module_name in self.dyn_thresh_delta_l2}), "
                              f"Mean<{thr_dl2_mean:.2e}, CV<{thr_dl2_cv:.2f}, Slope<{thr_dl2_slope:.2e}")
-                log_line3 = (f"  D-hat: Val={curr_d_hat_val_str} ({d_hat_ok_str} {thr_d_hat_str}) | "
+                log_line3 = (f"  D-hat: Val={curr_d_max_val_str} ({d_max_ok_str} {thr_d_max_str}) | "
                              f"SNR: Val={curr_snr_val_str} ({snr_ok_str} {thr_snr_str})")
                 suspect_count = self.suspect_counter.get(module_name, 0)
                 is_permafrozen = module_name in self.perma_frozen
@@ -351,48 +351,48 @@ class ConvergeControl:
             # D-hat: Recalcula baseline (mediana, iqr) e threshold (com gamma dinâmico)
             # A condição len >= self.warm_steps é implicitamente verdadeira se o deque está cheio (maxlen=warm_steps)
             # mas precisamos de pelo menos 2 pontos para as estatísticas.
-            if name in self.d_hat_hist and len(self.d_hat_hist[name]) >= 2:
-                med_d_hat, iqr_d_hat = self._robust_stats(self.d_hat_hist[name])
-                self.base_d_hat[name] = med_d_hat # Atualiza a mediana base da janela atual
+            if name in self.d_max_hist and len(self.d_max_hist[name]) >= 2:
+                med_d_max, iqr_d_max = self._robust_stats(self.d_max_hist[name])
+                self.base_d_max[name] = med_d_max # Atualiza a mediana base da janela atual
 
-                slope_d_hat = 0.0
-                d_hat_history_list = list(self.d_hat_hist[name])
+                slope_d_max = 0.0
+                d_max_history_list = list(self.d_max_hist[name])
                 
                 # A janela para o slope do D-hat será todo o histórico atual (máx. self.warm_steps)
                 # desde que tenha pelo menos 2 pontos.
                 window_for_dhat_slope_len = 0
-                if len(d_hat_history_list) >= 2:
-                    # Para o slope, usamos uma janela de até self.warm_steps (que é o maxlen de d_hat_hist)
+                if len(d_max_history_list) >= 2:
+                    # Para o slope, usamos uma janela de até self.warm_steps (que é o maxlen de d_max_hist)
                     # Não há um self.win_size_dhat_slope separado, usamos o tamanho do histórico de D-hat.
-                    window_for_dhat_slope_len = len(d_hat_history_list)
-                    _, _, slope_d_hat = self.stats_window(d_hat_history_list) # Usa todo o histórico atual
+                    window_for_dhat_slope_len = len(d_max_history_list)
+                    _, _, slope_d_max = self.stats_window(d_max_history_list) # Usa todo o histórico atual
                 
-                # Lógica para gamma_d_hat dinâmico
-                # Se d_hat está caindo (slope_d_hat < 0), queremos aumentar gamma (ser mais agressivo).
+                # Lógica para gamma_d_max dinâmico
+                # Se d_max está caindo (slope_d_max < 0), queremos aumentar gamma (ser mais agressivo).
                 # O sinal do 'adjustment' deve ser o mesmo do efeito em gamma (aumento/diminuição).
                 # Então, se slope < 0, adjustment > 0.
                 adjustment_value = 0.0
                 if self.dhat_slope_norm_factor != 0: # Evitar divisão por zero
-                    adjustment_value = - (slope_d_hat / self.dhat_slope_norm_factor) * self.slope_sensitivity_dhat
+                    adjustment_value = - (slope_d_max / self.dhat_slope_norm_factor) * self.slope_sensitivity_dhat
                 
-                current_gamma_d_hat = self.base_gamma_d_hat_config * (1 + adjustment_value)
-                current_gamma_d_hat = max(self.min_overall_gamma_dhat, min(self.max_overall_gamma_dhat, current_gamma_d_hat))
+                current_gamma_d_max = self.base_gamma_d_max_config * (1 + adjustment_value)
+                current_gamma_d_max = max(self.min_overall_gamma_dhat, min(self.max_overall_gamma_dhat, current_gamma_d_max))
 
-                self.thr_d_hat[name] = max(0.0, med_d_hat - current_gamma_d_hat * iqr_d_hat)
+                self.thr_d_max[name] = max(0.0, med_d_max - current_gamma_d_max * iqr_d_max)
                 # novo: define limiar de slope de D-hat como k×IQR
-                self.thr_slope_d_hat[name] = self.slope_sensitivity_dhat * iqr_d_hat
+                self.thr_slope_d_max[name] = self.slope_sensitivity_dhat * iqr_d_max
                 # guarda o slope atual
-                self.last_slope_d_hat[name] = slope_d_hat
+                self.last_slope_d_max[name] = slope_d_max
                 
                 if self.debug: # Log movido para dentro da condição de cálculo bem-sucedido
                     logFun(
-                        f"[BASELINE D_HAT] '{name}': med={med_d_hat:.3e}, IQR={iqr_d_hat:.3e}, \n"
-                        f"slope(win={window_for_dhat_slope_len})={slope_d_hat:.3e}, \n"
-                        f"dyn_gamma={current_gamma_d_hat:.2f} (base={self.base_gamma_d_hat_config:.2f}, adj={adjustment_value:.3f}) -> thr_d_hat={self.thr_d_hat[name]:.3e} \n",
+                        f"[BASELINE d_max] '{name}': med={med_d_max:.3e}, IQR={iqr_d_max:.3e}, \n"
+                        f"slope(win={window_for_dhat_slope_len})={slope_d_max:.3e}, \n"
+                        f"dyn_gamma={current_gamma_d_max:.2f} (base={self.base_gamma_d_max_config:.2f}, adj={adjustment_value:.3f}) -> thr_d_max={self.thr_d_max[name]:.3e} \n",
                         lvl="debug")
-            elif name in self.thr_d_hat: # Histórico insuficiente, remove limiar antigo
-                del self.thr_d_hat[name]
-                if name in self.base_d_hat: del self.base_d_hat[name]
+            elif name in self.thr_d_max: # Histórico insuficiente, remove limiar antigo
+                del self.thr_d_max[name]
+                if name in self.base_d_max: del self.base_d_max[name]
 
             # SNR: Recalcula baseline e threshold (fecha a “avenida”)
             if name in self.g_hist_for_snr_baseline and len(self.g_hist_for_snr_baseline[name]) >= 2:
@@ -413,30 +413,30 @@ class ConvergeControl:
                     del self.base_snr[name]
 
             # Verificação se os limiares foram calculados (após a tentativa de recálculo)
-            if not (name in self.thr_d_hat and name in self.thr_snr):
+            if not (name in self.thr_d_max and name in self.thr_snr):
                 if self.debug and self._current_step % 10 == 0: # Ajuste na frequência do log
                     log_msg_wait = (f"[_ready_to_freeze] Mod '{name}' waiting for D/S thresholds. \n"
-                                    f"DThrExists: {name in self.thr_d_hat}, SThrExists: {name in self.thr_snr}. \n"
-                                    f"DHist: {len(self.d_hat_hist.get(name,[]))}/{self.warm_steps}, \n"
+                                    f"DThrExists: {name in self.thr_d_max}, SThrExists: {name in self.thr_snr}. \n"
+                                    f"DHist: {len(self.d_max_hist.get(name,[]))}/{self.warm_steps}, \n"
                                     f"SHist: {len(self.g_hist_for_snr_baseline.get(name,[]))}/{self.warm_steps}")
                     logFun(log_msg_wait, lvl="debug")
                 return False
 
             # --- Avaliação de Estabilidade ---
             stable_metrics_count = 0
-            d_hat_ok, slope_ok, snr_ok = False, False, False
+            d_max_ok, slope_ok, snr_ok = False, False, False
 
-            curr_d_hat_val = float('inf') 
-            if name in self.d_hat_hist and self.d_hat_hist[name]: # Verifica se o histórico tem algo
-                curr_d_hat_val = self.d_hat_hist[name][-1]
-                if name in self.thr_d_hat: # Verifica se o limiar foi calculado
-                    if curr_d_hat_val < self.thr_d_hat[name]:
-                        d_hat_ok = True
+            curr_d_max_val = float('inf') 
+            if name in self.d_max_hist and self.d_max_hist[name]: # Verifica se o histórico tem algo
+                curr_d_max_val = self.d_max_hist[name][-1]
+                if name in self.thr_d_max: # Verifica se o limiar foi calculado
+                    if curr_d_max_val < self.thr_d_max[name]:
+                        d_max_ok = True
                         stable_metrics_count += 1
 
             # verifica slope de D-hat
-            curr_slope_val = self.last_slope_d_hat.get(name, float('nan'))
-            if name in self.thr_slope_d_hat and abs(curr_slope_val) < self.thr_slope_d_hat[name]:
+            curr_slope_val = self.last_slope_d_max.get(name, float('nan'))
+            if name in self.thr_slope_d_max and abs(curr_slope_val) < self.thr_slope_d_max[name]:
                 slope_ok = True
                 stable_metrics_count += 1                        
             
@@ -451,8 +451,8 @@ class ConvergeControl:
             # Lógica de decisão de estabilidade geral
             # agora contamos 3 métricas possíveis
             num_metrics_evaluable = 0
-            if name in self.thr_d_hat     and not math.isnan(curr_d_hat_val):   num_metrics_evaluable += 1
-            if name in self.thr_slope_d_hat and not math.isnan(curr_slope_val): num_metrics_evaluable += 1
+            if name in self.thr_d_max     and not math.isnan(curr_d_max_val):   num_metrics_evaluable += 1
+            if name in self.thr_slope_d_max and not math.isnan(curr_slope_val): num_metrics_evaluable += 1
             if name in self.thr_snr       and not math.isnan(curr_snr_val):     num_metrics_evaluable += 1
             
             is_overall_stable = False
@@ -460,8 +460,8 @@ class ConvergeControl:
                 # Contar quantas das métricas *avaliáveis* estão OK
                 # exigimos as 3 métricas OK
                 actual_ok_count = 0
-                if name in self.thr_d_hat       and d_hat_ok:   actual_ok_count += 1
-                if name in self.thr_slope_d_hat and slope_ok:   actual_ok_count += 1
+                if name in self.thr_d_max       and d_max_ok:   actual_ok_count += 1
+                if name in self.thr_slope_d_max and slope_ok:   actual_ok_count += 1
                 if name in self.thr_snr         and snr_ok:     actual_ok_count += 1
                 
                 if actual_ok_count >= self.min_stable_metrics_freeze:
@@ -470,7 +470,7 @@ class ConvergeControl:
             if self.debug and self._current_step % 10 == 0: # Ajuste na frequência do log
                 log_msg = (
                     f"[_ready_to_freeze] '{name}': \n"
-                    f"Dhat={curr_d_hat_val:.2e}({d_hat_ok}, thr={self.thr_d_hat.get(name, float('nan')):.2e}), \n"
+                    f"Dhat={curr_d_max_val:.2e}({d_max_ok}, thr={self.thr_d_max.get(name, float('nan')):.2e}), \n"
                     f"SNR={curr_snr_val:.2e}({snr_ok}, thr={self.thr_snr.get(name, float('nan')):.2e}) | \n"
                     f"Evaluable={num_metrics_evaluable}, ActualOKs={actual_ok_count if 'actual_ok_count' in locals() else 'N/A'}>={self.min_stable_metrics_freeze} -> Stable={is_overall_stable} \n")
                 logFun(log_msg, lvl="debug")
@@ -543,11 +543,11 @@ class ConvergeControl:
             return
 
         processed_deltas = 0
-        processed_d_hats = 0
+        processed_d_maxs = 0
         for stat in stats_list:
             name = stat.get("name")
             delta_val = stat.get("delta_L2")
-            d_hat_val = stat.get("d_hat")
+            d_max_val = stat.get("d_max")
 
             if name is None:
                 continue
@@ -559,23 +559,23 @@ class ConvergeControl:
                     self._rolling_stats[name].add(f_delta_val) # ATUALIZA ROLLING STATS AQUI
                     processed_deltas += 1
 
-                if d_hat_val is not None:
-                    self.d_hat_hist[name].append(float(d_hat_val))
-                    processed_d_hats += 1
+                if d_max_val is not None:
+                    self.d_max_hist[name].append(float(d_max_val))
+                    processed_d_maxs += 1
             except (ValueError, TypeError) as e:
                 if self.debug:
                     try:
                         logFun(
-                            f"[ConvergeControl] Error processing stats for '{name}': {e}. ΔL2: {delta_val}, Dhat: {d_hat_val}",
+                            f"[ConvergeControl] Error processing stats for '{name}': {e}. ΔL2: {delta_val}, Dhat: {d_max_val}",
                             lvl="warning")
                     except Exception as log_e:
                         print(f"Logging error in ingest_and_process for '{name}': {log_e}")
                         print(f"Original error for '{name}': {e}")
 
-        if self.debug and (processed_deltas == 0 or processed_d_hats == 0) and self._current_step % 10 == 0:
+        if self.debug and (processed_deltas == 0 or processed_d_maxs == 0) and self._current_step % 10 == 0:
             try:
                 logFun(
-                    f"[ConvergeControl] Step {self._current_step}: No ΔL2 ({processed_deltas}) or Dhat ({processed_d_hats}) ingested.",
+                    f"[ConvergeControl] Step {self._current_step}: No ΔL2 ({processed_deltas}) or Dhat ({processed_d_maxs}) ingested.",
                     lvl="debug")
             except Exception as log_e:
                 print(f"Logging error in ingest_and_process (summary log): {log_e}")
@@ -594,7 +594,7 @@ class ConvergeControl:
                 return {}
 
             decisions: Dict[str, bool] = {}
-            module_names_to_decide = list(set(self.g_vector_hist_for_snr_calc.keys()) | set(self.d_hat_hist.keys()))
+            module_names_to_decide = list(set(self.g_vector_hist_for_snr_calc.keys()) | set(self.d_max_hist.keys()))
 
             if self.debug and not module_names_to_decide and self._current_step % 10 == 0:
                 logFun(f"[ConvergeControl] Decide@{self._current_step}: No modules with D-hat/SNR history for eval.", lvl="debug")
@@ -718,7 +718,7 @@ class ConvergeControl:
         try:
             for buf in self.delta_buffers.values():
                 buf.clear()
-            for hist in self.d_hat_hist.values():
+            for hist in self.d_max_hist.values():
                 hist.clear()
             for hist in self.g_hist_for_snr_baseline.values():
                 hist.clear()
