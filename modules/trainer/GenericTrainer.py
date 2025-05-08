@@ -49,7 +49,7 @@ import huggingface_hub
 from tqdm import tqdm
 from requests.exceptions import ConnectionError
 
-from modules.sangoi.ConvergeControl import ConvergeControl
+from modules.sangoi.ConvergeControl import ConvCfg, ConvergeControl
 from modules.sangoi.AdaptiveDCoef import AdaptiveDCoef
 from modules.sangoi.DataRecorder import DataRecorder
 from modules.sangoi.TrainGPS import TrainGPS
@@ -117,18 +117,18 @@ class GenericTrainer(BaseTrainer):
         self.adaptive_dcoef = None
         self.converge_control = None
         self.train_device =  torch.device(getattr(self.config, "train_device"))
-        self.train_dtype: None
+        self.train_dtype = None
 
         self.console = RichConsole() # Instancia do console para este trainer, usado pelo Live e logFun
         self._setup_rich_layout() # Configura o layout Rich
 
         # Component initialization flags (from config, with defaults)
-        dcoef_debug = getattr(self.config, "dcoef_debug", True)
-        dcoef_verbose = getattr(self.config, "dcoef_verbose", True)
-        recorder_debug = getattr(self.config, "recorder_debug", True)
-        recorder_verbose = getattr(self.config, "recorder_verbose", True)
-        converge_debug = getattr(self.config, "converge_debug", True)
-        converge_verbose = getattr(self.config, "converge_verbose", True)
+        self.dcoef_debug = True
+        self.dcoef_verbose = True
+        self.recorder_debug = True
+        self.recorder_verbose = True
+        self.converge_debug = True
+        self.converge_verbose = True
 
         # Determine the current run number
         self.run_number = getattr(self.config, "run_number", 1) # Default to 1 if not set
@@ -140,8 +140,8 @@ class GenericTrainer(BaseTrainer):
             # but it might be optionally used in Run 2 for analysis if needed.
             # No specific check for run_number needed here for activation, just for the 'purpose' log maybe.
             self.recorder = DataRecorder(
-                debug=recorder_debug,
-                verbose=recorder_verbose
+                debug=self.recorder_debug,
+                verbose=self.recorder_verbose
             )
             purpose = "coleta de dados" if self.run_number == 1 else "gravação opcional de dinâmica"
             logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.", lvl="debug", _console=self.console)
@@ -154,8 +154,8 @@ class GenericTrainer(BaseTrainer):
         if self.run_number == 2 and getattr(self.config, "adpt_dcoef_use_it", False):
             try:
                 self.adaptive_dcoef = AdaptiveDCoef(
-                    debug=dcoef_debug,
-                    verbose=dcoef_verbose
+                    debug=self.dcoef_debug,
+                    verbose=self.dcoef_verbose
                 )
                 logFun(f"[AdaptiveDCoef] Inicializado com sucesso.", lvl="success", _console=self.console)
             except (FileNotFoundError, ValueError, Exception) as e:
@@ -255,16 +255,22 @@ class GenericTrainer(BaseTrainer):
 
         # iniciando o convergecontrol aqui pra poder usar a função de calcular o tamanho do treino        
         if getattr(self.config, "convctrl_use_it", False):
-            # Lê a flag da configuração, com padrão True se não existir
-            enable_freeze_action_flag = getattr(self.config, "converge_control_enable_freeze", True)
-            logFun(f"ConvergeControl freeze action flag from config: {enable_freeze_action_flag}", lvl="LOOP", _console=self.console)
-            # END: Modificação solicitada - Ler e passar a flag enable_freeze_action
+            # Cria ConvCfg a partir dos atributos de self.config
+            # Os padrões da dataclass ConvCfg serão usados se os atributos não estiverem em self.config
+            # Certifique-se de que seu TrainConfig tenha atributos como 'cc_lambda', 'cc_eps_slope', etc.,
+            # ou confie nos padrões de ConvCfg.
+            cfg = ConvCfg(
+                lambda_=getattr(self.config, "cc_lambda", ConvCfg.lambda_),
+                eps_slope=getattr(self.config, "cc_eps_slope", ConvCfg.eps_slope),
+                eps_width=getattr(self.config, "cc_eps_width", ConvCfg.eps_width),
+                z_lim=getattr(self.config, "cc_z_lim", ConvCfg.z_lim),
+                k_confirm=getattr(self.config, "cc_k_confirm", ConvCfg.k_confirm), # Antigo: converge_control_k_confirm
+            )
 
             converge_control = ConvergeControl(
-                run_number=self.run_number,
-                k_confirm=getattr(self.config, "converge_control_k_confirm", 5),
-                total_epochs=self.config.epochs,
-                enable_freeze_action=enable_freeze_action_flag,  # Passa a flag lida da config
+                cfg=cfg,
+                verbose=self.converge_verbose, # Já definido no init do GenericTrainer
+                debug=self.converge_debug,     # Já definido no init do GenericTrainer
             )
 
             self.converge_control = converge_control
