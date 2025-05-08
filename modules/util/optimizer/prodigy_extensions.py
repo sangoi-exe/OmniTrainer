@@ -161,13 +161,8 @@ def step_prodigy(self, closure=None):
 
         self._stats_buffer.push(
             group_idx = group_idx,
-            step      = group["k"],               # k antes do incremento
-            lr        = lr,
-            d         = group["d"],
-            d_hat     = d_hat,                    # NEW — já calculado
-            d_coef    = group["d_coef"],          # NEW — valor atual
-            d0        = group["d0"],              # NEW — ref inicial
-            uwr       = float(global_d_numerator / (global_d_denom + 1e-12)),
+            step      = group["k"],               
+            d_max     = d_max,                    
         )
 
         # recompute dlr with the updated d (for this group)

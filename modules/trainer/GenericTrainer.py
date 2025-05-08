@@ -9,7 +9,7 @@ import collections
 from pathlib import Path
 from datetime import datetime
 from collections.abc import Callable
-from typing import Dict
+from typing import Dict, Optional
 from torch.profiler import profile, ProfilerActivity, schedule
 from numpy import dtype, inf
 
@@ -55,6 +55,14 @@ from modules.sangoi.DataRecorder import DataRecorder
 from modules.sangoi.TrainGPS import TrainGPS
 from modules.sangoi.logFun import logFun
 
+from rich.console import Console as RichConsole # Renomear para evitar conflito com console local
+from rich.live import Live
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table as RichTable # Para uso no layout se necessário
+from rich.columns import Columns
+
 class GenericTrainer(BaseTrainer):
     model_loader: BaseModelLoader
     model_setup: BaseModelSetup
@@ -79,6 +87,8 @@ class GenericTrainer(BaseTrainer):
     is_paused: bool
     pause_request_locked: bool # Para travar o switch da UI
     pause_requested_at_epoch_end: bool
+    
+    _rich_layout: Optional[Layout] = None # Para o Live display
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
@@ -109,6 +119,9 @@ class GenericTrainer(BaseTrainer):
         self.train_device =  torch.device(getattr(self.config, "train_device"))
         self.train_dtype: None
 
+        self.console = RichConsole() # Instancia do console para este trainer, usado pelo Live e logFun
+        self._setup_rich_layout() # Configura o layout Rich
+
         # Component initialization flags (from config, with defaults)
         dcoef_debug = getattr(self.config, "dcoef_debug", True)
         dcoef_verbose = getattr(self.config, "dcoef_verbose", True)
@@ -119,7 +132,7 @@ class GenericTrainer(BaseTrainer):
 
         # Determine the current run number
         self.run_number = getattr(self.config, "run_number", 1) # Default to 1 if not set
-        logFun(f"[Trainer] Configurando para Run {self.run_number}.", lvl="debug")
+        logFun(f"Configurando para Run {self.run_number}.", lvl="LOOP", _console=self.console)
 
         self.recorder = None
         if getattr(self.config, "data_recorder", False):
@@ -131,9 +144,9 @@ class GenericTrainer(BaseTrainer):
                 verbose=recorder_verbose
             )
             purpose = "coleta de dados" if self.run_number == 1 else "gravação opcional de dinâmica"
-            logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.", lvl="debug")
+            logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.", lvl="debug", _console=self.console)
         else:
-            logFun("[DataRecorder] Desativado (flag data_recorder=False).", lvl="debug")
+            logFun("[DataRecorder] Desativado (flag data_recorder=False).", lvl="debug", _console=self.console)
 
         # 2. AdaptiveDCoef
         self.adaptive_dcoef = None
@@ -144,12 +157,25 @@ class GenericTrainer(BaseTrainer):
                     debug=dcoef_debug,
                     verbose=dcoef_verbose
                 )
-                logFun(f"[AdaptiveDCoef] Inicializado com sucesso.", lvl="success")
+                logFun(f"[AdaptiveDCoef] Inicializado com sucesso.", lvl="success", _console=self.console)
             except (FileNotFoundError, ValueError, Exception) as e:
-                logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="debug")
+                logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="debug", _console=self.console)
                 self.adaptive_dcoef = None # Ensure it's None if init fails
         elif getattr(self.config, "adpt_dcoef_use_it", False):
-            logFun("[AdaptiveDCoef] Desativado (não é Run 2 ou flag adpt_dcoef_use_it=False).", lvl="debug")
+            logFun("[AdaptiveDCoef] Desativado (não é Run 2 ou flag adpt_dcoef_use_it=False).", lvl="debug", _console=self.console)
+
+    def _setup_rich_layout(self):
+        """Configura o layout base para o Rich Live display."""
+        self._rich_layout = Layout(name="root")
+        self._rich_layout.split_column(
+            Layout(name="header", size=1),
+            Layout(name="main_content", size=1),
+            Layout(name="converge_control_status", ratio=3, visible=False), # Inicialmente oculto
+            Layout(name="footer", size=1)
+        )
+        self._rich_layout["header"].update(Text("Treinamento Genérico - OneTrainer", justify="center", style="bold magenta"))
+        self._rich_layout["main_content"].update(Text("Aguardando início do treinamento...", justify="center"))
+        self._rich_layout["footer"].update(Text("Ctrl+C para parar", justify="right", style="dim"))
 
     def start(self):
         self.__save_config_to_workspace()
@@ -231,7 +257,7 @@ class GenericTrainer(BaseTrainer):
         if getattr(self.config, "convctrl_use_it", False):
             # Lê a flag da configuração, com padrão True se não existir
             enable_freeze_action_flag = getattr(self.config, "converge_control_enable_freeze", True)
-            logFun(f"[Trainer] ConvergeControl freeze action flag from config: {enable_freeze_action_flag}", lvl="debug")
+            logFun(f"ConvergeControl freeze action flag from config: {enable_freeze_action_flag}", lvl="LOOP", _console=self.console)
             # END: Modificação solicitada - Ler e passar a flag enable_freeze_action
 
             converge_control = ConvergeControl(
@@ -242,9 +268,11 @@ class GenericTrainer(BaseTrainer):
             )
 
             self.converge_control = converge_control
-            logFun(f"[ConvergeControl] Inicializado com sucesso.", lvl="debug")
+            logFun(f"[ConvergeControl] Inicializado com sucesso.", lvl="debug", _console=self.console)
+            if self._rich_layout: # Mostrar a seção do ConvergeControl se ele estiver ativo
+                self._rich_layout["converge_control_status"].visible = True            
         else:
-            logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug")
+            logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug", _console=self.console)
 
             
     def __save_config_to_workspace(self):
@@ -766,13 +794,13 @@ class GenericTrainer(BaseTrainer):
         if not self.is_paused: # Segurança extra
             return
 
-        logFun("[Trainer] Iniciando Pausa...", lvl="info")
+        logFun("Iniciando Pausa...", lvl="LOOP", _console=self.console)
         self.callbacks.on_update_status("Pausing... Moving model to CPU")
         try:
             self.model.to(self.temp_device) # Mover para CPU
             self.model.eval() # Garantir modo eval
             torch_gc() # Limpar VRAM
-            logFun(f"[Trainer] Modelo movido para {self.temp_device}. VRAM liberada.", lvl="success")
+            logFun(f"Modelo movido para {self.temp_device}. VRAM liberada.", lvl="success", _console=self.console)
             self.callbacks.on_update_status(f"Paused. Model on {self.temp_device}. Toggle switch to resume.")
             # Notificar UI que a pausa iniciou e o switch pode ser reativado (para desligar)
             if hasattr(self.callbacks, 'on_pause_initiated'):
@@ -782,13 +810,13 @@ class GenericTrainer(BaseTrainer):
             # Loop de espera pela retomada
             while self.is_paused:
                 if self.commands.get_stop_command():
-                    logFun("[Trainer] Comando STOP recebido durante a pausa. Interrompendo.", lvl="warning")
+                    logFun("Comando STOP recebido durante a pausa. Interrompendo.", lvl="warning")
                     self.is_paused = False # Força a saída do loop de pausa
                     # Mantém o comando de stop ativo para o loop principal
                     break
 
                 if self.commands.get_and_reset_resume_request():
-                    logFun("[Trainer] Comando RESUME recebido.", lvl="info")
+                    logFun("Comando RESUME recebido.", lvl="info", _console=self.console)
                     self.is_paused = False # Sinaliza para sair do loop
                     self.pause_request_locked = False # Desbloqueia a UI
                     # Notificar UI que o resume começou (switch ainda ativo)
@@ -799,29 +827,29 @@ class GenericTrainer(BaseTrainer):
                 time.sleep(0.5) # Evita busy-waiting, checa a cada 0.5s
 
             if not self.commands.get_stop_command(): # Só retoma se não for parar
-                logFun("[Trainer] Retomando treinamento...", lvl="info")
+                logFun("Retomando treinamento...", lvl="info", _console=self.console)
                 self.callbacks.on_update_status("Resuming... Moving model to GPU")
                 try:
                     # Recarregar para o dispositivo de treino
                     self.model_setup.setup_train_device(self.model, self.config)
                     torch_gc() # Limpeza extra
-                    logFun(f"[Trainer] Modelo movido de volta para {self.config.train_device}.", lvl="success")
+                    logFun(f"Modelo movido de volta para {self.config.train_device}.", lvl="success", _console=self.console)
                     self.callbacks.on_update_status("Training resumed.")
                     # Notificar UI que o resume foi concluído
                     if hasattr(self.callbacks, 'on_resume_completed'):
                         self.callbacks.on_resume_completed()
 
                 except Exception as e:
-                    logFun(f"[Trainer] Erro ao mover modelo de volta para GPU: {e}", lvl="error")
+                    logFun(f"Erro ao mover modelo de volta para GPU: {e}", lvl="error")
                     traceback.print_exc()
                     # Tentar continuar mesmo assim? Ou parar? Por segurança, parar.
                     self.commands.stop()
             else:
-                logFun("[Trainer] Retomada cancelada devido ao comando STOP.", lvl="warning")
+                logFun("Retomada cancelada devido ao comando STOP.", lvl="warning")
 
 
         except Exception as e:
-            logFun(f"[Trainer] Erro durante o processo de pausa/retomada: {e}", lvl="error")
+            logFun(f"Erro durante o processo de pausa/retomada: {e}", lvl="error")
             traceback.print_exc()
             self.is_paused = False # Garante que não fique preso no estado pausado
             self.pause_request_locked = False
@@ -874,493 +902,495 @@ class GenericTrainer(BaseTrainer):
 
         lr_scheduler = None
 
-        for _epoch in tqdm(
-            range(train_progress.epoch, self.config.epochs, 1), desc="epoch"
-        ):
+        # Envolver o loop de treinamento com Live
+        with Live(self._rich_layout, console=self.console, refresh_per_second=1, vertical_overflow="ellipsis", screen=False, transient=False) as live:
+            # `screen=False` e `transient=False` para que o logFun funcione normalmente
+            # Se quiser tela cheia, use screen=True, transient=True, mas logFun pode ser sobrescrito.
 
-            if self.is_paused:
-                logFun(f"[Trainer] Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info")
-                self._handle_pause_logic()
-                if self.commands.get_stop_command(): # Se o stop foi dado durante a pausa inicial
-                    logFun("[Trainer] Comando STOP ativo após pausa inicial. Encerrando.", lvl="warning")
-                    break # Sai do loop de épocas
+            for _epoch in tqdm(
+                range(train_progress.epoch, self.config.epochs, 1), desc="epoch", disable=True
+            ):
 
-            self.callbacks.on_update_status(f"Starting Epoch {train_progress.epoch + 1}/{self.config.epochs}")
+                if self.is_paused:
+                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info", _console=self.console)
+                    self._handle_pause_logic()
+                    if self.commands.get_stop_command(): # Se o stop foi dado durante a pausa inicial
+                        logFun("Comando STOP ativo após pausa inicial. Encerrando.", lvl="warning")
+                        break # Sai do loop de épocas
+                    
+                # Atualizar header do layout Rich
+                header_text = Text(f"Epoch {train_progress.epoch + 1}/{self.config.epochs}", justify="center")
+                self._rich_layout["header"].update(header_text)                   
 
-            if self.config.latent_caching:
-                self.data_loader.get_data_set().start_next_epoch()
-                self.model_setup.setup_train_device(self.model, self.config)
-            else:
-                self.model_setup.setup_train_device(self.model, self.config)
-                self.data_loader.get_data_set().start_next_epoch()
+                self.callbacks.on_update_status(f"Starting Epoch {train_progress.epoch + 1}/{self.config.epochs}")
 
-            # Special case for schedule-free optimizers, which need train()
-            # called before training. Can and should move this to a callback
-            # during a refactoring.
-            if self.config.optimizer.optimizer.is_schedule_free:
-                torch.clear_autocast_cache()
-                self.model.optimizer.train()
+                if self.config.latent_caching:
+                    self.data_loader.get_data_set().start_next_epoch()
+                    self.model_setup.setup_train_device(self.model, self.config)
+                else:
+                    self.model_setup.setup_train_device(self.model, self.config)
+                    self.data_loader.get_data_set().start_next_epoch()
 
-            torch_gc()
+                # Special case for schedule-free optimizers, which need train()
+                # called before training. Can and should move this to a callback
+                # during a refactoring.
+                if self.config.optimizer.optimizer.is_schedule_free:
+                    torch.clear_autocast_cache()
+                    self.model.optimizer.train()
 
-            if lr_scheduler is None:
-                lr_scheduler = create.create_lr_scheduler(
-                    config=self.config,
-                    optimizer=self.model.optimizer,
-                    learning_rate_scheduler=self.config.learning_rate_scheduler,
-                    warmup_steps=self.config.learning_rate_warmup_steps,
-                    num_cycles=self.config.learning_rate_cycles,
-                    min_factor=self.config.learning_rate_min_factor,
-                    num_epochs=self.config.epochs,
-                    approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
-                    batch_size=self.config.batch_size,
-                    gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-                    global_step=train_progress.global_step,
-                )
+                torch_gc()
 
-            current_epoch_length = self.data_loader.get_data_set().approximate_length()
-            step_tqdm = tqdm(
-                self.data_loader.get_data_loader(),
-                desc="step",
-                total=current_epoch_length,
-                initial=train_progress.epoch_step,
-            )
-
-            gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
-            for batch in step_tqdm:
-                if (
-                    self.__needs_sample(train_progress)
-                    or self.commands.get_and_reset_sample_default_command()
-                ):
-                    self.__enqueue_sample_during_training(
-                        lambda: self.__sample_during_training(
-                            train_progress, train_device
-                        )
+                if lr_scheduler is None:
+                    lr_scheduler = create.create_lr_scheduler(
+                        config=self.config,
+                        optimizer=self.model.optimizer,
+                        learning_rate_scheduler=self.config.learning_rate_scheduler,
+                        warmup_steps=self.config.learning_rate_warmup_steps,
+                        num_cycles=self.config.learning_rate_cycles,
+                        min_factor=self.config.learning_rate_min_factor,
+                        num_epochs=self.config.epochs,
+                        approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
+                        batch_size=self.config.batch_size,
+                        gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                        global_step=train_progress.global_step,
                     )
 
-                if self.__needs_backup(train_progress):
-                    self.commands.backup()
+                gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
+                current_epoch_length = self.data_loader.get_data_set().approximate_length()
+                # step_tqdm = tqdm(
+                #     self.data_loader.get_data_loader(),
+                #     desc="step",
+                #     total=current_epoch_length,
+                #     initial=train_progress.epoch_step,
+                # )
 
-                if self.__needs_save(train_progress):
-                    self.commands.save()
+                for batch_idx, batch in enumerate(self.data_loader.get_data_loader()):
+                    # Atualizar main_content com progresso do step
+                    step_progress_text = Text(
+                        f"Epoch {train_progress.epoch + 1}, Step {train_progress.epoch_step + 1}/{current_epoch_length} (Global: {train_progress.global_step +1})\n"
+                        f"Loss: {accumulated_loss.item() if isinstance(accumulated_loss, torch.Tensor) else accumulated_loss:.4f} | Smooth Loss: {ema_loss or 0.0:.4f}",
+                        justify="center"
+                    )
+                    self._rich_layout["main_content"].update(step_progress_text)
 
-                sample_commands = self.commands.get_and_reset_sample_custom_commands()
-                if sample_commands:
-
-                    def create_sample_commands_fun(sample_commands):
-                        def sample_commands_fun():
-                            self.__sample_during_training(
-                                train_progress, train_device, sample_commands
+                    if (
+                        self.__needs_sample(train_progress)
+                        or self.commands.get_and_reset_sample_default_command()
+                    ):
+                        self.__enqueue_sample_during_training(
+                            lambda: self.__sample_during_training(
+                                train_progress, train_device
                             )
+                        )
 
-                        return sample_commands_fun
+                    if self.__needs_backup(train_progress):
+                        self.commands.backup()
 
-                    self.__enqueue_sample_during_training(
-                        create_sample_commands_fun(sample_commands)
-                    )
+                    if self.__needs_save(train_progress):
+                        self.commands.save()
 
-                if self.__needs_gc(train_progress):
-                    torch_gc()
+                    sample_commands = self.commands.get_and_reset_sample_custom_commands()
+                    if sample_commands:
 
-                if not has_gradient:
-                    self.__execute_sample_during_training()
-                    transferred_to_temp_device = False
-
-                    if self.commands.get_and_reset_backup_command():
-                        self.model.to(self.temp_device)
-                        self.backup(train_progress, True, step_tqdm.write)
-                        transferred_to_temp_device = True
-
-                    if self.commands.get_and_reset_save_command():
-                        self.model.to(self.temp_device)
-                        self.save(train_progress, True, step_tqdm.write)
-                        transferred_to_temp_device = True
-
-                    if transferred_to_temp_device:
-                        self.model_setup.setup_train_device(self.model, self.config)
-
-                # def _end_epoch_cleanup(self):
-                #     """
-                #     Limpa tudo que não precisa atravessar épocas:
-                #     - snapshots de ConvergeControl
-                #     - históricos temporários
-                #     - libera cache da GPU
-                #     """
-                #     # 1) Se estiver usando ConvergeControl
-                #     if hasattr(self, "converge_control"):
-                #         logFun("[ConvergeControl]: Limpando essa merda..")
-                #         self.converge_control.prev_W.clear()
-                #         self.converge_control.g_hist.clear()
-                #         self.converge_control.rur_hist.clear()
-                # with TorchMemoryRecorder(enabled=False):
-                #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                #     loss = self.model_setup.calculate_loss(
-                #         self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
-                #     )
-                """
-                implementação de teste - remover os gradientes fora da mask
-                teoricamente isso impede que pesos fora da mask sejam atualizados
-                então a rede pode aloprar o quanto quiser ali, não vai mudar nada
-                """
-                # with torch.profiler.profile(
-                #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
-                #     record_shapes=True, profile_memory=True, with_stack=True
-                # ) as prof:         
-                with TorchMemoryRecorder(enabled=False):
-                    # Previsão original
-                    model_output_data = self.model_setup.predict(
-                        self.model,
-                        batch,
-                        self.config,
-                        train_progress,
-                    )
-
-                    if self.config.masked_training:
-                        # extrai o tensor previsto do dict
-                        predicted = model_output_data["predicted"]
-                        # zera gradiente fora da máscara
-                        predicted.register_hook(lambda g: g * batch["latent_mask"])
-
-                    # Cálculo de loss permanece inalterado
-                    loss = self.model_setup.calculate_loss(
-                        self.model,
-                        batch,
-                        model_output_data,
-                        self.config,
-                        train_progress,
-                    )
-
-                    loss = loss / float(self.config.gradient_accumulation_steps)
-
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-
-                    has_gradient = True
-                    if not isinstance(accumulated_loss, torch.Tensor):
-                        accumulated_loss = loss.detach()
-                    else:
-                        accumulated_loss += loss.detach()
-
-                    if self.__is_update_step(train_progress):
-                        if (
-                            scaler
-                            and self.config.optimizer.optimizer.supports_fused_back_pass()
-                            and self.config.optimizer.fused_back_pass
-                        ):
-                            scaler.step_after_unscale_parameter_(self.model.optimizer)
-                            scaler.update()
-                        elif scaler:
-                            scaler.unscale_(self.model.optimizer)
-                            if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(
-                                    self.parameters, self.config.clip_grad_norm
+                        def create_sample_commands_fun(sample_commands):
+                            def sample_commands_fun():
+                                self.__sample_during_training(
+                                    train_progress, train_device, sample_commands
                                 )
-                            scaler.step(self.model.optimizer)
-                            scaler.update()
+
+                            return sample_commands_fun
+
+                        self.__enqueue_sample_during_training(
+                            create_sample_commands_fun(sample_commands)
+                        )
+
+                    if self.__needs_gc(train_progress):
+                        torch_gc()
+
+                    if not has_gradient:
+                        self.__execute_sample_during_training()
+                        transferred_to_temp_device = False
+
+                        if self.commands.get_and_reset_backup_command():
+                            self.model.to(self.temp_device)
+                            # self.backup(train_progress, True, step_tqdm.write)
+                            self.backup(train_progress, True, lambda msg: logFun(msg, lvl="LOOP", _console=self.console))
+                            transferred_to_temp_device = True
+
+                        if self.commands.get_and_reset_save_command():
+                            self.model.to(self.temp_device)
+                            # self.save(train_progress, True, step_tqdm.write)
+                            self.save(train_progress, True, lambda msg: logFun(msg, lvl="LOOP", _console=self.console))
+                            transferred_to_temp_device = True
+
+                        if transferred_to_temp_device:
+                            self.model_setup.setup_train_device(self.model, self.config)
+
+                    # def _end_epoch_cleanup(self):
+                    #     """
+                    #     Limpa tudo que não precisa atravessar épocas:
+                    #     - snapshots de ConvergeControl
+                    #     - históricos temporários
+                    #     - libera cache da GPU
+                    #     """
+                    #     # 1) Se estiver usando ConvergeControl
+                    #     if hasattr(self, "converge_control"):
+                    #         logFun("[ConvergeControl]: Limpando essa merda..")
+                    #         self.converge_control.prev_W.clear()
+                    #         self.converge_control.g_hist.clear()
+                    #         self.converge_control.rur_hist.clear()
+                    # with TorchMemoryRecorder(enabled=False):
+                    #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+                    #     loss = self.model_setup.calculate_loss(
+                    #         self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
+                    #     )
+                    """
+                    implementação de teste - remover os gradientes fora da mask
+                    teoricamente isso impede que pesos fora da mask sejam atualizados
+                    então a rede pode aloprar o quanto quiser ali, não vai mudar nada
+                    """
+                    # with torch.profiler.profile(
+                    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+                    #     record_shapes=True, profile_memory=True, with_stack=True
+                    # ) as prof:         
+                    with TorchMemoryRecorder(enabled=False):
+                        # Previsão original
+                        model_output_data = self.model_setup.predict(
+                            self.model,
+                            batch,
+                            self.config,
+                            train_progress,
+                        )
+
+                        if self.config.masked_training:
+                            # extrai o tensor previsto do dict
+                            predicted = model_output_data["predicted"]
+                            # zera gradiente fora da máscara
+                            predicted.register_hook(lambda g: g * batch["latent_mask"])
+
+                        # Cálculo de loss permanece inalterado
+                        loss = self.model_setup.calculate_loss(
+                            self.model,
+                            batch,
+                            model_output_data,
+                            self.config,
+                            train_progress,
+                        )
+
+                        loss = loss / float(self.config.gradient_accumulation_steps)
+
+                        if scaler:
+                            scaler.scale(loss).backward()
                         else:
-                            if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(
-                                    self.parameters, self.config.clip_grad_norm
-                                )
+                            loss.backward()
 
-                        self.model.optimizer.step()
+                        has_gradient = True
+                        if not isinstance(accumulated_loss, torch.Tensor):
+                            accumulated_loss = loss.detach()
+                        else:
+                            accumulated_loss += loss.detach()
 
-                        try:
-                            current_stats_list = self.model.optimizer.pop_stats()
-                            if current_stats_list: # Only proceed if stats were generated
-                                mapped_stats_list = []
-                                for stat in current_stats_list:
-                                    # group_idx = stat["group_idx"]
-                                    # # DEBUG: mostra qual group_idx e nome está sendo mapeado
-                                    # try:
-                                    #     name = self.model.param_group_mapping[group_idx]
-                                    # except Exception:
-                                    #     name = None
-                                    # logFun(
-                                    #     f"[DEBUG Trainer] pop_stats → group_idx={group_idx}, "
-                                    #     f"name_mapped={name!r}",
-                                    #     lvl="debug"
-                                    # )
-                                    group_idx = stat["group_idx"] # Acesso direto, pode dar KeyError se não existir
-                                    if 0 <= group_idx < len(self.model.param_group_mapping):
-                                        name = self.model.param_group_mapping[group_idx]
-                                        # AQUI TÁ SUAVE
-                                        if name: # Garante que o nome não é vazio ou None
-                                            stat_with_name = stat.copy()
-                                            stat_with_name["name"] = name
-                                            mapped_stats_list.append(stat_with_name)
-                                        else: # Opcional: Logar se o nome mapeado for inválido
-                                            logFun(f"[Trainer] passou por else: # Opcional: Logar se o nome mapeado for inválido", lvl="warning")
+                        if self.__is_update_step(train_progress):
+                            if (
+                                scaler
+                                and self.config.optimizer.optimizer.supports_fused_back_pass()
+                                and self.config.optimizer.fused_back_pass
+                            ):
+                                scaler.step_after_unscale_parameter_(self.model.optimizer)
+                                scaler.update()
+                            elif scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(
+                                        self.parameters, self.config.clip_grad_norm
+                                    )
+                                scaler.step(self.model.optimizer)
+                                scaler.update()
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(
+                                        self.parameters, self.config.clip_grad_norm
+                                    )
+
+                            self.model.optimizer.step()
+
+                            # CONVERGE CONTROL DATA INGESTION
+                            try:
+                                current_stats_list = self.model.optimizer.pop_stats()
+                                if current_stats_list: # Only proceed if stats were generated
+                                    mapped_stats_list = []
+                                    for stat_idx, stat_data in enumerate(current_stats_list):
+                                        # group_idx = stat["group_idx"]
+                                        # # DEBUG: mostra qual group_idx e nome está sendo mapeado
+                                        # try:
+                                        #     name = self.model.param_group_mapping[group_idx]
+                                        # except Exception:
+                                        #     name = None
+                                        # logFun(
+                                        #     f"[DEBUG Trainer] pop_stats → group_idx={group_idx}, "
+                                        #     f"name_mapped={name!r}",
+                                        #     lvl="debug"
+                                        # )
+                                        group_idx = stat_data["group_idx"] # Acesso direto, pode dar KeyError se não existir
+                                        if 0 <= group_idx < len(self.model.param_group_mapping):
+                                            name = self.model.param_group_mapping[group_idx]
+                                            if name: # Garante que o nome não é vazio ou None
+                                                stat_with_name = stat_data.copy()
+                                                stat_with_name["name"] = name
+                                                mapped_stats_list.append(stat_with_name)
+                                            else: # Opcional: Logar se o nome mapeado for inválido
+                                                if hasattr(self.config, 'debug') and self.config.debug:
+                                                    logFun(f"Nome inválido mapeado para group_idx {group_idx}", lvl="LOOP", _console=self.console)
+                                        else: # Opcional: Logar se o índice estiver fora do range
                                             if hasattr(self.config, 'debug') and self.config.debug:
-                                                logFun(f"[Trainer] Nome inválido mapeado para group_idx {group_idx}", lvl="debug")
-                                    else: # Opcional: Logar se o índice estiver fora do range
-                                        logFun(f"[Trainer] passou por else: # Opcional: Logar se o índice estiver fora do range", lvl="warning")
-                                        if hasattr(self.config, 'debug') and self.config.debug:
-                                            logFun(f"[Trainer] group_idx {group_idx} fora do range do mapeamento (tam: {len(self.model.param_group_mapping)})", lvl="debug")
-                                if mapped_stats_list: # Procede apenas se houver stats válidos mapeados
-                                    current_deltas = {}
-                                    gps_instance: TrainGPS | None = getattr(self.model, "deltas", None) # Re-check instance existence
-                                    if gps_instance:
-                                        try:
-                                            # Get {name: delta_tensor} dict
-                                            # AQUI TÁ SUAVE
-                                            current_deltas = gps_instance._get_current_module_deltas(self.train_device, self.train_dtype)
-                                        except Exception as e_delta:
-                                            logFun(f"[Trainer] Error getting current deltas from TrainGPS: {e_delta}", lvl="error")
-                                            traceback.print_exc()
-                                            # Continue without deltas if error occurs
-                                    # Add delta_L2 to each stat dictionary
-                                    for s in mapped_stats_list:
-                                        module_name = s.get("name")
-                                        if module_name in current_deltas:
-                                            # Ensure we store a float, not a tensor
-                                            # AQUI TÁ SUAVE
-                                            s["delta_L2"] = current_deltas[module_name].item()
-                                        else:
-                                            logFun(f"[Trainer] passou por else: do  if module_name in current_deltas:", lvl="warning")
-                                            # Assign a default (e.g., 0.0 or None) if delta is missing for this module
-                                            s["delta_L2"] = 0.0
-                                            if gps_instance:
-                                                logFun(f"[Trainer] Delta_L2 not found for module '{module_name}' in current_deltas from TrainGPS.", lvl="debug")
-                                    if self.converge_control:
-                                        # AQUI TÁ SUAVE
-                                        global_step = self.model.train_progress.global_step
-                                        current_epoch = self.model.train_progress.epoch                                        
-                                        self.converge_control.set_current_time(current_epoch, global_step)
-                                        self.converge_control.ingest_and_process(mapped_stats_list)
-                                        # 4.c) Atualiza métricas por step diretamente nos módulos LoRA
-                                        for stat in mapped_stats_list:
-                                            stats_name = stat["name"]  # ex: 'lora_unet_mid_block_resnets_1_conv2'
-                                            peft_mod = self.model.unet_lora.get_module_for_stats(stats_name)
-                                            if peft_mod is None:
-                                                logFun(f"[Trainer DEBUG] PEFT module não encontrado para stats_name: {stats_name}", lvl="debug")
-                                                continue
-                                            # usa stats_name como chave para ConvergeControl, e o módulo correto
-                                            self.converge_control.update_step_metrics(stats_name, peft_mod)
-                                    # 2. Recorder log_step (Se ativo) - Usa a lista mapeada
-                                    if self.recorder:
-                                        # Pass necessary stats to recorder's log_step
-                                        # AQUI TÁ SUAVE
-                                        for mapped_stat in mapped_stats_list: # Itera sobre a lista já mapeada
-                                            # DataRecorder's log_step expects name, d_max
-                                            self.recorder.log_step(
-                                                name=mapped_stat["name"],
-                                                d_max=mapped_stat.get("d_max", 0.0), # Provide default if missing
-                                            )
-                        except KeyError as e:
-                            logFun(f"[Trainer] KeyError ao acessar stat['group_idx'] ou mapeamento. Chave ausente? Erro: {e}", lvl="error")
-                            traceback.print_exc()
-                        except IndexError as e:
-                            logFun(f"[Trainer] IndexError ao acessar self.model.param_group_mapping. group_idx fora do range? Erro: {e}", lvl="error")
-                            traceback.print_exc()
-                        except Exception as e:
-                            logFun(f"[Trainer@{global_step}] Exception during post-optimizer step processing (ConvergeControl/Recorder): {e}", lvl="error")
-                            traceback.print_exc()
+                                                logFun(f"group_idx {group_idx} fora do range do mapeamento (tam: {len(self.model.param_group_mapping)})", lvl="LOOP", _console=self.console)
+                                    if mapped_stats_list: # Procede apenas se houver stats válidos mapeados
+                                        current_deltas = {}
+                                        gps_instance: TrainGPS | None = getattr(self.model, "deltas", None) # Re-check instance existence
+                                        if gps_instance:
+                                            try: current_deltas = gps_instance._get_current_module_deltas(self.train_device, self.train_dtype)
+                                            except Exception as e_delta: logFun(f"Error getting current deltas from TrainGPS: {e_delta}", lvl="error",_console=self.console)
+                                        # Add delta_L2 to each stat dictionary
+                                        for s_map in mapped_stats_list:
+                                            module_name = s_map.get("name")
+                                            if module_name in current_deltas: s_map["delta_L2"] = current_deltas[module_name].item()
+                                            else: s_map["delta_L2"] = 0.0
+                                        if self.converge_control:
+                                            global_step = self.model.train_progress.global_step
+                                            current_epoch_cc = self.model.train_progress.epoch
+                                            self.converge_control.set_current_time(current_epoch_cc, global_step)
+                                            self.converge_control.ingest_and_process(mapped_stats_list)
+                                            # 4.c) Atualiza métricas por step diretamente nos módulos LoRA
+                                            for stat_item in mapped_stats_list:
+                                                stats_name = stat_item["name"]
+                                                peft_mod = self.model.unet_lora.get_module_for_stats(stats_name) # Assumindo que unet_lora existe
+                                                if peft_mod: self.converge_control.update_step_metrics(stats_name, peft_mod)
+                                        if self.recorder:
+                                            for mapped_stat_rec in mapped_stats_list:
+                                                self.recorder.log_step(name=mapped_stat_rec["name"], d_max=mapped_stat_rec.get("d_max", 0.0))
+                            except Exception as e:
+                                logFun(f"[Trainer@{train_progress.global_step}] Exception during post-optimizer step processing: {e}", lvl="error",_console=self.console)
+                                # traceback.print_exc() # logFun faz isso se configurado
 
-                        lr_scheduler.step() # Often done after optimizer step
-                        self.model.optimizer.zero_grad(set_to_none=True)
-                        has_gradient = False
+                            lr_scheduler.step() # Often done after optimizer step
+                            self.model.optimizer.zero_grad(set_to_none=True)
+                            has_gradient = False
 
-                        #prof.step()
+                            #prof.step()
 
-                        # Report learning rate after potential scheduler step
-                        self.model_setup.report_to_tensorboard(
-                            self.model, self.config, lr_scheduler
-                        )
-
-                        self.tensorboard.add_scalar(
-                            "loss/train_step",
-                            accumulated_loss.mean().item(),
-                            train_progress.global_step,
-                        )
-                        ema_loss = ema_loss or accumulated_loss.item()
-                        ema_loss = (ema_loss * 0.99) + (accumulated_loss.item() * 0.01)
-                        step_tqdm.set_postfix(
-                            {
-                                "loss": accumulated_loss.item(),
-                                "smooth loss": ema_loss,
-                            }
-                        )
-                        self.tensorboard.add_scalar(
-                            "smooth_loss/train_step",
-                            ema_loss,
-                            train_progress.global_step,
-                        )
-                        accumulated_loss = 0.0
-
-                        self.model_setup.after_optimizer_step(
-                            self.model, self.config, train_progress
-                        )
-                        if self.model.ema:
-                            update_step = (
-                                train_progress.global_step
-                                // self.config.gradient_accumulation_steps
+                            # Report learning rate after potential scheduler step
+                            self.model_setup.report_to_tensorboard(
+                                self.model, self.config, lr_scheduler
                             )
+
                             self.tensorboard.add_scalar(
-                                "ema_decay",
-                                self.model.ema.get_current_decay(update_step),
+                                "loss/train_step",
+                                accumulated_loss.mean().item(),
                                 train_progress.global_step,
                             )
-                            self.model.ema.step(self.parameters, update_step)
-                        #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)) 
-                        self.one_step_trained = True
+                            ema_loss = ema_loss or accumulated_loss.item()
+                            ema_loss = (ema_loss * 0.99) + (accumulated_loss.item() * 0.01)
+                            # step_tqdm.set_postfix(
+                            #     {
+                            #         "loss": accumulated_loss.item(),
+                            #         "smooth loss": ema_loss,
+                            #     }
+                            # )
+                            self.tensorboard.add_scalar(
+                                "smooth_loss/train_step",
+                                ema_loss,
+                                train_progress.global_step,
+                            )
+                            accumulated_loss = 0.0
 
-                if self.config.validation:
-                    self.__validate(train_progress)
+                            self.model_setup.after_optimizer_step(
+                                self.model, self.config, train_progress
+                            )
+                            if self.model.ema:
+                                update_step = (
+                                    train_progress.global_step
+                                    // self.config.gradient_accumulation_steps
+                                )
+                                self.tensorboard.add_scalar(
+                                    "ema_decay",
+                                    self.model.ema.get_current_decay(update_step),
+                                    train_progress.global_step,
+                                )
+                                self.model.ema.step(self.parameters, update_step)
+                            #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)) 
+                            self.one_step_trained = True
 
-                train_progress.next_step(self.config.batch_size)
+                    if self.config.validation:
+                        self.__validate(train_progress)
+
+                    train_progress.next_step(self.config.batch_size)
+                    self.callbacks.on_update_train_progress(
+                        train_progress, current_epoch_length, self.config.epochs
+                    )
+
+                    if self.converge_control and train_progress.global_step % 10 == 0: # Atualiza a cada 10 global steps
+                        # snapshot_epoch_weights agora só calcula, não imprime
+                        self.converge_control.snapshot_epoch_weights() # Calcula as estatísticas
+                        cc_renderable = self.converge_control.generate_status_renderable()
+                        self._rich_layout["converge_control_status"].update(cc_renderable)
+
+                # Ajusta d_coef POR ÉPOCA usando Δ-L2 actual
+                if self.run_number == 2 and self.adaptive_dcoef and gps_instance:
+                    try:
+                        # 1) coleta Δ-L2 (norma L2 atual de cada módulo)
+                        # AQUI TÁ SAFE
+                        deltas = gps_instance._get_current_module_deltas(self.train_device, self.train_dtype)
+                        names  = list(deltas.keys())
+                        if names:
+                            # AQUI TÁ SAFE        
+                            delta_vec = torch.tensor(
+                                [deltas[n] for n in names], device=self.train_device
+                            )
+                            # AQUI TÁ SAFE     
+                            scales = self.adaptive_dcoef.scale_vectorized(
+                                names, delta_vec, self.train_device, self.train_dtype
+                            )
+                            updated_count = 0
+                            for g in self.model.optimizer.param_groups:
+                                # AQUI NÃO TÁ MAIS DANDO MERDA, COLOQUEI UNIQUE NAME NA CRIAÇÃO DO PARAM_GROUPS PRA PODER ACESSAR DAQUI
+                                name = g.get("name")
+                                if name in scales:
+                                    base = self.adaptive_dcoef.d_coef_base.get(name, 1.0)
+                                    g["d_coef"] = (base * scales[name]).item()
+                                    updated_count += 1
+                                    if self.adaptive_dcoef.debug:
+                                        logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] "
+                                              f"{name}: base={base:.4g} * scale={scales[name].item():.4g}",
+                                                lvl="debug", _console=self.console)
+                            if updated_count > 0 and (self.adaptive_dcoef.debug or self.adaptive_dcoef.verbose):
+                                logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Updated d_coef for {updated_count} parameter groups.", lvl="info", _console=self.console)
+                    except Exception as e:
+                        logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Error applying dynamic d_coef adjustment: {e}", lvl="error")
+                        traceback.print_exc()
+                    
+
+                    if self.commands.get_stop_command():
+                        logFun("Comando STOP recebido durante a época. Encerrando...", lvl="warning")
+                        # Limpar handles de gradiente antes de sair se necessário
+                        for handle in self.grad_hook_handles:
+                            handle.remove()
+                        self.grad_hook_handles.clear()
+                        return # Sai do método train
+
+                # ATUALIZAÇÃO DO DISPLAY DO CONVERGE CONTROL AO FINAL DA ÉPOCA
+                if self.converge_control:
+                    self.converge_control.snapshot_epoch_weights() # Calcula as estatísticas da época
+                    cc_renderable = self.converge_control.generate_status_renderable()
+                    self._rich_layout["header"].update(header_text)
+
+                # if hasattr(self, "converge_control"):
+                    # self.converge_control._end_epoch_cleanup()
+
+                train_progress.next_epoch()
                 self.callbacks.on_update_train_progress(
                     train_progress, current_epoch_length, self.config.epochs
                 )
 
-            # Ajusta d_coef POR ÉPOCA usando Δ-L2 actual
-            if self.run_number == 2 and self.adaptive_dcoef and gps_instance:
-                try:
-                    # 1) coleta Δ-L2 (norma L2 atual de cada módulo)
-                    # AQUI TÁ SAFE
-                    deltas = gps_instance._get_current_module_deltas(self.train_device, self.train_dtype)
-                    names  = list(deltas.keys())
-                    if names:
-                        # AQUI TÁ SAFE        
-                        delta_vec = torch.tensor(
-                            [deltas[n] for n in names], device=self.train_device
-                        )
-                        # AQUI TÁ SAFE     
-                        scales = self.adaptive_dcoef.scale_vectorized(
-                            names, delta_vec, self.train_device, self.train_dtype
-                        )
-                        updated_count = 0
-                        for g in self.model.optimizer.param_groups:
-                            # AQUI NÃO TÁ MAIS DANDO MERDA, COLOQUEI UNIQUE NAME NA CRIAÇÃO DO PARAM_GROUPS PRA PODER ACESSAR DAQUI
-                            name = g.get("name")
-                            if name in scales:
-                                base = self.adaptive_dcoef.d_coef_base.get(name, 1.0)
-                                g["d_coef"] = (base * scales[name]).item()
-                                updated_count += 1
-                                if self.adaptive_dcoef.debug:
-                                    logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] "
-                                           f"{name}: base={base:.4g} * scale={scales[name].item():.4g}",
-                                            lvl="debug")
-                        if updated_count > 0 and (self.adaptive_dcoef.debug or self.adaptive_dcoef.verbose):
-                            logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Updated d_coef for {updated_count} parameter groups.", lvl="info")
-                except Exception as e:
-                    logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Error applying dynamic d_coef adjustment: {e}", lvl="error")
-                    traceback.print_exc()
-                
+                if self.commands.get_and_reset_pause_request():
+                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info", _console=self.console)
+                    self.pause_requested_at_epoch_end = True
+                    self.pause_request_locked = True # Trava a UI
+                    # Notificar a UI que a requisição foi aceita e o switch está travado
+                    if hasattr(self.callbacks, 'on_pause_request_accepted'):
+                        self.callbacks.on_pause_request_accepted()
 
+                # 2. Executar a pausa se foi agendada
+                if self.pause_requested_at_epoch_end and not self.is_paused:
+                    self.is_paused = True # Marca como pausado
+                    self.pause_requested_at_epoch_end = False # Limpa a flag de agendamento
+                    # A trava (pause_request_locked) continua TRUE até o resume
+
+                    # Chama a função que move o modelo e entra no loop de espera
+                    self._handle_pause_logic()
+
+                # Checagem de STOP ao final da época
                 if self.commands.get_stop_command():
-                    logFun("[Trainer] Comando STOP recebido durante a época. Encerrando...", lvl="warning")
-                    # Limpar handles de gradiente antes de sair se necessário
-                    for handle in self.grad_hook_handles:
-                        handle.remove()
-                    self.grad_hook_handles.clear()
-                    return # Sai do método train
-
-           # if hasattr(self, "converge_control"):
-               # self.converge_control._end_epoch_cleanup()
-
-            train_progress.next_epoch()
-            self.callbacks.on_update_train_progress(
-                train_progress, current_epoch_length, self.config.epochs
-            )
-
-            if self.commands.get_and_reset_pause_request():
-                logFun(f"[Trainer] Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info")
-                self.pause_requested_at_epoch_end = True
-                self.pause_request_locked = True # Trava a UI
-                # Notificar a UI que a requisição foi aceita e o switch está travado
-                if hasattr(self.callbacks, 'on_pause_request_accepted'):
-                    self.callbacks.on_pause_request_accepted()
-
-            # 2. Executar a pausa se foi agendada
-            if self.pause_requested_at_epoch_end and not self.is_paused:
-                self.is_paused = True # Marca como pausado
-                self.pause_requested_at_epoch_end = False # Limpa a flag de agendamento
-                # A trava (pause_request_locked) continua TRUE até o resume
-
-                # Chama a função que move o modelo e entra no loop de espera
-                self._handle_pause_logic()
-
-            # Checagem de STOP ao final da época
-            if self.commands.get_stop_command():
-                logFun("[Trainer] Comando STOP ativo no final da época. Encerrando...", lvl="info")
-                break # Sai do loop de épocas
-            
-            # 1. TrainGPS salva os deltas da epoch
-            if gps_instance is not None:
-                # Logar deltas do grupo se a opção estiver ativa
-                if self.config.train_gps_save_it:
+                    logFun("Comando STOP ativo no final da época. Encerrando...", lvl="info", _console=self.console)
+                    break # Sai do loop de épocas
+                
+                # 1. TrainGPS salva os deltas da epoch
+                if gps_instance is not None:
+                    # Logar deltas do grupo se a opção estiver ativa
+                    if self.config.train_gps_save_it:
+                        try:
+                            # Loga para a época que acabou de terminar
+                            epoch_idx = train_progress.epoch - 1
+                            gps_instance.log_group_deltas(epoch_idx)
+                            self.converge_control.snapshot_epoch_weights()
+                        except Exception as e:
+                            logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
+                            traceback.print_exc()
+                    # Logar normas totais para o TensorBoard
                     try:
-                        # Loga para a época que acabou de terminar
-                        epoch_idx = train_progress.epoch - 1
-                        gps_instance.log_group_deltas(epoch_idx)
-                        self.converge_control.snapshot_epoch_weights()
-                    except Exception as e:
-                        logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
-                        traceback.print_exc()
-                # Logar normas totais para o TensorBoard
-                try:
-                    current_norm, reference_norm = gps_instance.get_delta_norms()
-                    if current_norm is not None:
-                        self.tensorboard.add_scalar(
-                            "delta_pattern/current_total_delta_norm",
-                            current_norm,
-                            train_progress.global_step,
-                        )
-                    if reference_norm is not None:
-                        self.tensorboard.add_scalar(
-                            "delta_pattern/reference_delta_norm",
-                            reference_norm,
-                            train_progress.global_step,
-                        )
-                except Exception as e:
-                    logFun(f"[TrainGPS] Erro ao logar normas totais no TensorBoard: {e}", lvl="error")
-                    traceback.print_exc()
-            self.callbacks.on_update_train_progress(
-                train_progress, current_epoch_length, self.config.epochs
-            )
-            
-            # 3. ConvergeControl Decide/Aplica Congelamento (Run >= 2 e Ativo)
-            if self.converge_control:
-                logFun(f"[ConvergeControl] Δ Checking modules deltas..", lvl="info")
-                # Roda a avaliação e obtém o dict {name: should_freeze}
-                freeze_decisions = self.converge_control.decide()
-
-                # Aplica em cada módulo que ConvergeControl avaliou
-                for name, should_freeze in freeze_decisions.items():
-                    # Recupera o NamedParameterGroup pelo nome
-                    # AQUI TÁ SUAVE
-                    param_group_obj = self.model.parameters.by_unique_name(name)
-                    if not param_group_obj:
-                        #logFun(f"[Trainer] passou por if not param_group_obj:", lvl="warning")
-                        continue  # nome inválido ou não existe
-
-                    # Decide se deve estar habilitado (não congelado)
-                    should_be_enabled = not should_freeze
-                    is_currently_enabled = param_group_obj.is_enabled
-
-                    if is_currently_enabled != should_be_enabled:
-                        logFun(f"[Trainer] passou por if is_currently_enabled != should_be_enabled:)", lvl="warning")
-                        action = "Unfreeze" if should_be_enabled else "Freeze"
-                        if self.converge_control.verbose or self.converge_control.debug:
-                            logFun(
-                                f"[Trainer ApplyFreeze@{global_step}] "
-                                f"{action} module '{name}' based on ConvergeControl decision "
-                                f"(Run {self.run_number})",
-                                lvl="info"
+                        current_norm, reference_norm = gps_instance.get_delta_norms()
+                        if current_norm is not None:
+                            self.tensorboard.add_scalar(
+                                "delta_pattern/current_total_delta_norm",
+                                current_norm,
+                                train_progress.global_step,
                             )
-                        param_group_obj.set_requires_grad(should_be_enabled)
+                        if reference_norm is not None:
+                            self.tensorboard.add_scalar(
+                                "delta_pattern/reference_delta_norm",
+                                reference_norm,
+                                train_progress.global_step,
+                            )
+                    except Exception as e:
+                        logFun(f"[TrainGPS] Erro ao logar normas totais no TensorBoard: {e}", lvl="error")
+                        traceback.print_exc()
+                self.callbacks.on_update_train_progress(
+                    train_progress, current_epoch_length, self.config.epochs
+                )
+                
+                # 3. ConvergeControl Decide/Aplica Congelamento (Run >= 2 e Ativo)
+                if self.converge_control:
+                    logFun(f"[ConvergeControl] Δ Checking modules deltas..", lvl="info", _console=self.console)
+                    # Roda a avaliação e obtém o dict {name: should_freeze}
+                    freeze_decisions = self.converge_control.decide()
 
-            if self.commands.get_stop_command():
-                return
+                    # Aplica em cada módulo que ConvergeControl avaliou
+                    for name, should_freeze in freeze_decisions.items():
+                        # Recupera o NamedParameterGroup pelo nome
+                        # AQUI TÁ SUAVE
+                        param_group_obj = self.model.parameters.by_unique_name(name)
+                        if not param_group_obj:
+                            #logFun(f"passou por if not param_group_obj:", lvl="warning")
+                            continue  # nome inválido ou não existe
+
+                        # Decide se deve estar habilitado (não congelado)
+                        should_be_enabled = not should_freeze
+                        is_currently_enabled = param_group_obj.is_enabled
+
+                        if is_currently_enabled != should_be_enabled:
+                            logFun(f"passou por if is_currently_enabled != should_be_enabled:)", lvl="warning")
+                            action = "Unfreeze" if should_be_enabled else "Freeze"
+                            if self.converge_control.verbose or self.converge_control.debug:
+                                logFun(
+                                    f"[Trainer ApplyFreeze@{global_step}] "
+                                    f"{action} module '{name}' based on ConvergeControl decision "
+                                    f"(Run {self.run_number})",
+                                    lvl="info"
+                                )
+                            param_group_obj.set_requires_grad(should_be_enabled)
+
+                if self.commands.get_stop_command(): return
+            # --- FIM DO LOOP DE ÉPOCAS ---
+            self._rich_layout["header"].update(Text("Treinamento concluído ou interrompido.", justify="center", style="bold green" if not self.commands.get_stop_command() else "bold yellow" ))
+            if self.converge_control: # Última atualização do status do ConvergeControl
+                cc_renderable = self.converge_control.generate_status_renderable()
+                self._rich_layout["header"].update(cc_renderable)
+        # --- FIM DO `with Live(...)` ---                
 
     def end(self):
         if self.is_paused:
-            logFun("[Trainer] Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.", lvl="warning")
+            logFun("Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.", lvl="warning")
             # Força a saída da pausa (sem esperar comando) e tenta mover para GPU para salvar
             self.is_paused = False
             self.pause_request_locked = False
@@ -1368,9 +1398,9 @@ class GenericTrainer(BaseTrainer):
                 # Tenta mover de volta pra GPU rapidamente
                 self.model_setup.setup_train_device(self.model, self.config)
                 torch_gc()
-                logFun("[Trainer] Modelo movido para GPU para salvamento final.", lvl="info")
+                logFun("Modelo movido para GPU para salvamento final.", lvl="info", _console=self.console)
             except Exception as e:
-                logFun(f"[Trainer] Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).", lvl="error")
+                logFun(f"Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).", lvl="error")
                 # O modelo já está no self.temp_device, o save deve funcionar
                 pass # Continua para salvar do CPU
 
@@ -1427,7 +1457,7 @@ class GenericTrainer(BaseTrainer):
                 delta_filename = f"{model_name}_Deltas_Run{self.run_number}_{timestamp}.json"
                 delta_save_path = os.path.join(output_dir, delta_filename)
 
-                logFun(f"[TrainGPS] Salvando deltas (Run {self.run_number}) em: {delta_save_path}", lvl="info")
+                logFun(f"[TrainGPS] Salvando deltas (Run {self.run_number}) em: {delta_save_path}", lvl="info", _console=self.console)
                 # A função save_group_deltas salva o estado atual do delta_log_by_module
                 # que foi acumulado durante esta run específica.
                 gps_instance.save_group_deltas(delta_save_path)
@@ -1445,7 +1475,7 @@ class GenericTrainer(BaseTrainer):
                 profile_filename = f"{model_name}_Profile_Run{self.run_number}_{timestamp}.json.gz"
                 profile_save_path = os.path.join(output_dir, profile_filename)
 
-                logFun(f"[DataRecorder] Salvando perfil (Run {self.run_number}) em: {profile_save_path}", lvl="info")
+                logFun(f"[DataRecorder] Salvando perfil (Run {self.run_number}) em: {profile_save_path}", lvl="info", _console=self.console)
 
                 # DataRecorder's dump method now only takes the path
                 # It saves d_max_final and d_coef_base internally collected.

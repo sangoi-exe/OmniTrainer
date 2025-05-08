@@ -1,35 +1,47 @@
-import colorama
-from colorama import Fore, Style, Back
+from rich.console import Console as RichConsole  # Renomear para clareza
+from typing import Optional
 
-# Inicializa o colorama (necessário no Windows)
-# autoreset=True faz com que cada print() volte à cor padrão automaticamente
-colorama.init(autoreset=True)
+# Cria um console global padrão para logFun, se nenhum específico for passado
+_default_logfun_console = RichConsole()
 
 
-def logFun(mensagem, lvl="INFO"):
+def logFun(mensagem: str, lvl: str = "INFO", _console: Optional[RichConsole] = None) -> None:
     """
     Imprime uma mensagem de log colorida no console usando match-case.
 
     Args:
         mensagem (str): A mensagem a ser exibida.
-        lvl (str): O nível do log ('INFO', 'VERBOSE', 'WARNING', 'ERROR', 'DEBUG', 'SUCCESS').
-                    Determina a cor da mensagem.
+        lvl (str): O nível do log ('INFO', 'VERBOSE', 'WARNING', 'ERROR', 'DEBUG', 'SUCCESS', 'LOOP', 'CONVCTRL', 'TRAINGPS', 'LORA').
+                   Determina a cor da mensagem.
+        _console (Optional[RichConsole]): O console Rich a ser usado. Se None, usa um console padrão.
     """
-    level_upper = lvl.upper()  # Garante que o nível seja maiúsculo para o match
+    console_to_use = _console or _default_logfun_console
+    level_upper = lvl.upper()
 
     match level_upper:
         case "INFO":
-            print(f"{Fore.CYAN}[INFO] {mensagem}")
+            console_to_use.print(f"[dark_olive_green1][INFO][/dark_olive_green1] [sky_blue1]{mensagem}[/sky_blue1]")
+        case "LOOP":  # Usado pelo Trainer
+            console_to_use.print(f"[cyan][TRAINER][/cyan] [sky_blue1]{mensagem}[/sky_blue1]")
+        case "CONVCTRL":  # Específico para ConvergeControl
+            console_to_use.print(f"[light_salmon1][CONVCTRL][/light_salmon1] [sky_blue1]{mensagem}[/sky_blue1]")
+        case "TRAINGPS":
+            console_to_use.print(f"[light_steel_blue3][TRAINGPS][/light_steel_blue3] [sky_blue1]{mensagem}[/sky_blue1]")
+        case "LORA":
+            console_to_use.print(f"[slate_blue1][LORA][/slate_blue1] [sky_blue1]{mensagem}[/sky_blue1]")
         case "VERBOSE":
-            print(f"{Fore.LIGHTBLUE_EX}[VERBOSE] {mensagem}")
+            console_to_use.print(f"[orange3][VERBOSE][/orange3] [sky_blue1]{mensagem}[/sky_blue1]")
         case "WARNING":
-            print(f"{Fore.YELLOW}[WARNING] {mensagem}")
+            console_to_use.print(f"[gold1][WARNING][/gold1] [sky_blue1]{mensagem}[/sky_blue1]")
         case "ERROR":
-            print(f"{Fore.RED}[ERROR] {mensagem}")
+            console_to_use.print(f"[red][ERROR][/red] [pink1]{mensagem}[/pink1]",
+                                 soft_wrap=True)  # Adicionado soft_wrap
+            # Adicionar traceback aqui se desejado, condicionalmente
+            # import traceback
+            # console_to_use.print_exception(show_locals=True) # Ou False para menos verbosidade
         case "DEBUG":
-            print(f"{Fore.LIGHTBLACK_EX}[DEBUG] {mensagem}")
+            console_to_use.print(f"[grey35][DEBUG][/grey35] [sky_blue1]{mensagem}[/sky_blue1]")
         case "SUCCESS":
-            print(f"{Fore.GREEN}[SUCCESS] {mensagem}")
-        case _:  # Caso padrão (default) para níveis não reconhecidos
-            # Imprime com a cor padrão (resetada pelo autoreset=True)
-            print(f"[{level_upper}] {mensagem}")
+            console_to_use.print(f"[spring_green3][SUCCESS][/spring_green3] [sky_blue1]{mensagem}[/sky_blue1]")
+        case _:
+            console_to_use.print(f"[white][{level_upper}][/white] [sky_blue1]{mensagem}[/sky_blue1]")
