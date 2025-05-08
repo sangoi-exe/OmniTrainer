@@ -15,7 +15,10 @@ from scipy.stats import linregress
 from modules.sangoi.logFun import logFun
 from typing import Deque, Dict, Set, List, Optional, Tuple, Union # Adicionado Union
 from dataclasses import dataclass
-from tdigest import TDigest           # quantis streaming
+from river.stats import Quantile              # quantis streaming P² puro-Python
+from collections import defaultdict  
+import bisect
+from collections import deque
 
 # console = Console() # Pode ser removido se o Live display for o principal meio de output
 
@@ -27,18 +30,38 @@ class ConvCfg:
     eps_width: float = 0.02     # (P95-P5)/|P50|
     z_lim: float = 1.64         # α = 10 %  (Mann-Kendall)
     k_confirm: int = 4
+    k_confirm_steps: int = 50
+    min_quantile_samples: int = 20
 
 # ------------------- MK Streaming ----------------------
 class MKStream:
-    def __init__(self):
-        self.tdig = TDigest()
+    def __init__(self, maxlen: int = 200):
+        # buffer de chegada para remoção de itens antigos
+        self.buffer = deque()
+        # lista sempre ordenada para cdf(x)
+        self.sorted = []
+        self.maxlen = maxlen
         self.S = 0.0
         self.n = 0
     def update(self, x: float):
-        if self.n > 0: # tdig.cdf needs at least one point to not return nan for first x if x is outside existing range
-            rank = self.tdig.cdf(x)          # ∈ [0,1]
-            self.S += (rank - (1-rank)) * self.n
-        self.tdig.update(x); self.n += 1
+        # 1) calcule rank aproximado usando sorted list
+        if self.n > 0:
+            idx = bisect.bisect_left(self.sorted, x)
+            rank = idx / self.n
+            self.S += (rank - (1 - rank)) * self.n
+
+        # 2) insira em sorted e buffer
+        bisect.insort(self.sorted, x)
+        self.buffer.append(x)
+        self.n += 1
+
+        # 3) descarte item mais antigo se exceder maxlen
+        if len(self.buffer) > self.maxlen:
+            oldest = self.buffer.popleft()
+            pos = bisect.bisect_left(self.sorted, oldest)
+            # remove a primeira ocorrência
+            self.sorted.pop(pos)
+            self.n -= 1
     def z(self) -> float:
         if self.n < 8: return 0.0 # MK test typically needs n >= 8 or 10
         # Var(S) = n(n-1)(2n+5)/18 - Original formula, no ties
@@ -103,7 +126,6 @@ class ConvergeControl:
         self._slope_thresh_fallback_display = slope_thresh_fallback_display
         self._dynamic_k_delta_l2_display = dynamic_k_delta_l2_display
 
-        self._last_epoch_incr: Dict[str, int] = {}
         self.freeze_step_run2: Dict[str, int] = {}
         
         hint = delta_buffer_size or 0
@@ -136,13 +158,14 @@ class ConvergeControl:
         self.base_d_max: Dict[str, float] = {} # Para display
         self.base_snr: Dict[str, float] = {} # Para display
 
-        # --- novos estados MK / quantis ------------------------
-        self.mk_stream: Dict[str, MKStream] = collections.defaultdict(MKStream)
-        self.q_digest: Dict[str, TDigest]   = collections.defaultdict(TDigest)
-        self.ewma_slope: Dict[str, float]   = collections.defaultdict(float)
-        self.ewma_slope: Dict[str, float]        = collections.defaultdict(float)
-        self.last_ewma_slope: Dict[str, float]   = {}        
-        self.min_centroids = 20
+        # --- novos estados MK / quantis (River P²) -------------
+        self.mk_stream: Dict[str, MKStream] = defaultdict(MKStream)
+        self.ewma_slope: Dict[str, float]    = defaultdict(float)
+        # quantis P² para 5%, 50%, 95%
+        self.q5:    Dict[str, Quantile] = defaultdict(lambda: Quantile(0.05))
+        self.q50:   Dict[str, Quantile] = defaultdict(lambda: Quantile(0.50))
+        self.q95:   Dict[str, Quantile] = defaultdict(lambda: Quantile(0.95))
+        self.q_count: Dict[str, int]    = defaultdict(int)
 
         if self.debug:
             try:
@@ -195,11 +218,16 @@ class ConvergeControl:
                     if snr_val is not None:
                         self.g_hist_for_snr_baseline[name].append(snr_val) # MANTIDO PARA SNR DISPLAY
 
-            # ---------- d-max para MK & quantis ----------
-            if name in self.d_max_hist and self.d_max_hist[name]: # d_max_hist é populado em ingest_and_process
+            # --- d-max para MK + quantis River P² -----
+            if name in self.d_max_hist and self.d_max_hist[name]:
                 d_val = self.d_max_hist[name][-1]
+                # Mann–Kendall (igual)
                 self.mk_stream[name].update(d_val)
-                self.q_digest[name].update(d_val)
+                # P² quantis
+                self.q_count[name] += 1
+                self.q5[name].update(d_val)
+                self.q50[name].update(d_val)
+                self.q95[name].update(d_val)
                 
         except Exception as e:
             logFun(f"[ConvergeControl] Exception during update_step_metrics for '{name}': {e}", lvl="error")
@@ -303,20 +331,20 @@ class ConvergeControl:
                 # Temporariamente, vamos mostrar o ewma_slope atual e o 'prev' se disponível.
                 # Idealmente, o 'slope' calculado em _ready_to_freeze deveria ser armazenado se precisarmos dele aqui.
                 # Por agora, vamos exibir o valor EWMA atual
-                ewma_slope_text = Text(f"{slope:.2e}")
-                ewma_slope_text.stylize("green" if abs(slope)<self.cfg.eps_slope else "red")
                 # EWMA-slope: exibimos o delta guardado em self.last_ewma_slope
                 slope = self.last_ewma_slope.get(module_name, None)
                 if slope is not None:
                     ewma_slope_text = Text(f"{slope:.2e}")
                     style = "green" if abs(slope) < self.cfg.eps_slope else "red"
                     ewma_slope_text.stylize(style)
-                    ewma_slope_text.append(f" (Th< {self.cfg.eps_slope:.0e})", style="dim")
+                    ewma_slope_text.append(f" <{self.cfg.eps_slope:.0e}", style="dim")
 
 
-            qd = self.q_digest.get(module_name)
-            if qd and qd.centroids_count() >= 20: # Usando centroids_count() para tdigest >= 0.16
-                p5, p50, p95 = [qd.percentile(p) for p in (5, 50, 95)]
+            # exibição dos quantis P²
+            if self.q_count.get(module_name, 0) >= self.cfg.min_quantile_samples:
+                p5  = self.q5[module_name].get()
+                p50 = self.q50[module_name].get()
+                p95 = self.q95[module_name].get()
                 if abs(p50) > 1e-12 : # Evitar divisão por zero
                     width = (p95 - p5) / abs(p50)
                     quantile_width_text = Text(f"{width:.3f}")
@@ -324,7 +352,7 @@ class ConvergeControl:
                         quantile_width_text.stylize("green")
                     else:
                         quantile_width_text.stylize("red")
-                    quantile_width_text.append(f" (Th: <{self.cfg.eps_width:.2f})", style="dim")
+                    quantile_width_text.append(f" <{self.cfg.eps_width:.2f}", style="dim")
                 else:
                     quantile_width_text = Text(f"P50 near zero ({p50:.2e})")
 
@@ -337,7 +365,7 @@ class ConvergeControl:
                     mk_z_text.stylize("green")
                 else:
                     mk_z_text.stylize("red")
-                mk_z_text.append(f" (Th: |Z|<{self.cfg.z_lim:.2f})", style="dim")
+                mk_z_text.append(f" |Z|<{self.cfg.z_lim:.2f}", style="dim")
 
 
             # Status de congelamento (mantido)
@@ -351,7 +379,7 @@ class ConvergeControl:
                     freeze_status_combined_text.append(str(suspect_count), style="yellow")
                 else:
                     freeze_status_combined_text.append(str(suspect_count))
-                freeze_status_combined_text.append(f"/{self.k_confirm}", style="dim")
+                freeze_status_combined_text.append(f"/{self.cfg.k_confirm_steps}", style="dim")
 
 
             table = Table(title=None,
@@ -361,8 +389,8 @@ class ConvergeControl:
                           padding=(0, 1),
                           show_edge=False,
                           expand=True)
-            table.add_column("Métrica", style="cyan", ratio=2, overflow="fold", no_wrap=False)
-            table.add_column("Valor", justify="left", style="white", ratio=3)
+            table.add_column("Stat", style="cyan", ratio=9, overflow="fold", no_wrap=False)
+            table.add_column("Value", style="white", ratio=10)
 
             table.add_row("Δ-L2 Mean", mean_dl2_text)
             table.add_row("Δ-L2 CV", cv_dl2_text)
@@ -379,24 +407,23 @@ class ConvergeControl:
             snr_value_text = Text("N/A")
             snr_from_calc_win = self._calculate_snr(
                 self.g_vector_hist_for_snr_calc.get(module_name, collections.deque()))
-            if snr_from_calc_win is not None:
-                 snr_value_text = Text(f"{snr_from_calc_win:.2f}")
+            if snr_from_calc_win is not None: snr_value_text = Text(f"{snr_from_calc_win:.2f}")
             elif module_name in self.g_hist_for_snr_baseline and self.g_hist_for_snr_baseline[module_name]:
-                 snr_value_text = Text(f"{self.g_hist_for_snr_baseline[module_name][-1]:.2f}")
-            table.add_row("SNR (display only)", snr_value_text)
+                snr_value_text = Text(f"{self.g_hist_for_snr_baseline[module_name][-1]:.2f}")
+            table.add_row("SNR (info only)", snr_value_text)
 
             table.add_row("Freeze Status", freeze_status_combined_text)
 
             return Panel(table,
-                         title=f"[magenta]{short_module_name}[/] (E{self._current_epoch})",
-                         border_style="magenta",
-                         padding=(0, 0),
-                         width=30) # Largura ajustada para acomodar novas métricas
+                        title=f"[magenta]{short_module_name}[/] (E{self._current_epoch})",
+                        border_style="blue",
+                        padding=(0, 0),
+                        width=40) # Largura ajustada para acomodar novas métricas
         except Exception as e:
             logFun(f"Error generating card for {module_name}: {e}\n{traceback.format_exc()}", lvl="error")
             return Panel(Text(f"Error for {module_name}.", style="red"),
-                         title=f"[red]{module_name[:20]}... - ERR[/red]",
-                         width=30)
+                        title=f"[red]{module_name[:20]}... - ERR[/red]",
+                        width=40)
 
 
     def generate_status_renderable(self) -> Union[Group, Columns, Text]:  # Adicionado Columns
@@ -413,7 +440,7 @@ class ConvergeControl:
                            set(self.d_max_hist.keys()) | \
                            set(self.g_hist_for_snr_baseline.keys()) | \
                            set(self.mk_stream.keys()) | \
-                           set(self.q_digest.keys())
+                           set(self.q_count.keys())
 
 
         if not all_module_names:
@@ -446,18 +473,13 @@ class ConvergeControl:
 
     def _ready_to_freeze(self, name: str) -> bool:
         try:
-            qd = self.q_digest[name]
-            # Usando qd.centroids_count() para compatibilidade com tdigest >= 0.16
-            # ou len(qd.centroids()) para versões mais antigas se qd.centroids é uma propriedade
-            num_centroids = qd.centroids_count() if hasattr(qd, 'centroids_count') else len(qd.centroids())
-            if num_centroids < self.min_centroids:
-
+            # warm-up de quantis P²
+            if self.q_count[name] < self.cfg.min_quantile_samples:
                 return False
-
-            # --- largura relativa 5/95 -----------------
-            p5, p50, p95 = [qd.percentile(p) for p in (5, 50, 95)]
-            if abs(p50) < 1e-12: # Evitar divisão por zero ou instabilidade se p50 for muito pequeno
-                width = float('inf') # Considerar instável se p50 for zero
+            # --- largura relativa 5/95 via P² ----
+            p5, p50, p95 = self.q5[name].get(), self.q50[name].get(), self.q95[name].get()
+            if abs(p50) < 1e-12:
+                width = float('inf')
             else:
                 width = (p95 - p5) / abs(p50)
 
@@ -569,7 +591,12 @@ class ConvergeControl:
             decisions: Dict[str, bool] = {}
             # Decide on modules that have data for new criteria (MK/Quantile)
             # These are populated via d_max_hist -> update_step_metrics
-            module_names_to_decide = list(self.q_digest.keys() & self.mk_stream.keys() & self.d_max_hist.keys())
+            # só aqueles com quantis, MK e d_max já iniciados
+            module_names_to_decide = list(
+                set(self.q_count.keys()) &
+                set(self.mk_stream.keys()) &
+                set(self.d_max_hist.keys())
+            )
 
 
             for name in module_names_to_decide:
@@ -581,17 +608,10 @@ class ConvergeControl:
                     # _ready_to_freeze agora usa os novos critérios
                     is_module_stable = self._ready_to_freeze(name)
                     
-                    current_epoch, last_incr_epoch = self._current_epoch, self._last_epoch_incr.get(name, -1)
-                    
-                    if is_module_stable:
-                        if current_epoch > last_incr_epoch: # Incrementa contador apenas uma vez por época
-                            self.suspect_counter[name] += 1
-                            self._last_epoch_incr[name] = current_epoch
-                    elif current_epoch > last_incr_epoch: # Resetar se não estável, uma vez por época
-                        self.suspect_counter[name] = 0
-                        self._last_epoch_incr[name] = current_epoch
+                    if is_module_stable: self.suspect_counter[name] += 1
+                    else: self.suspect_counter[name] = 0
 
-                    should_freeze_eval = self.suspect_counter.get(name, 0) >= self.k_confirm # k_confirm from cfg
+                    should_freeze_eval = ( self.suspect_counter[name] >= self.cfg.k_confirm_steps )
                     decisions[name] = should_freeze_eval
                     
                     if should_freeze_eval and name not in self.perma_frozen:
@@ -680,15 +700,10 @@ class ConvergeControl:
             self.dyn_thresh_delta_l2.clear()
             
             # Contadores e flags de estado por época
-            self._last_epoch_incr.clear()
             # self.suspect_counter.clear() # Não limpar suspect_counter, pois k_confirm é mult-época
 
         except Exception as e:
             logFun(f"[ConvergeControl._end_epoch_cleanup] Error during cleanup: {e}", lvl="error")
-
-
-from collections import deque # Já importado globalmente, mas boa prática para classes standalone
-
 
 class RollingStats:
 

@@ -3,6 +3,16 @@ from typing import Optional
 
 # Cria um console global padrão para logFun, se nenhum específico for passado
 _default_logfun_console = RichConsole()
+_current_logfun_console = _default_logfun_console
+
+def set_logfun_console(console: RichConsole) -> None:
+    """
+    Redefine o console que o logFun vai usar por padrão.
+    Deve ser chamado antes de instanciar o Live, ex:
+        set_logfun_console(meu_trainer.console)
+    """
+    global _current_logfun_console
+    _current_logfun_console = console
 
 
 def logFun(mensagem: str, lvl: str = "INFO", _console: Optional[RichConsole] = None) -> None:
@@ -15,7 +25,7 @@ def logFun(mensagem: str, lvl: str = "INFO", _console: Optional[RichConsole] = N
                    Determina a cor da mensagem.
         _console (Optional[RichConsole]): O console Rich a ser usado. Se None, usa um console padrão.
     """
-    console_to_use = _console or _default_logfun_console
+    console_to_use = _console or _current_logfun_console
     level_upper = lvl.upper()
 
     match level_upper:

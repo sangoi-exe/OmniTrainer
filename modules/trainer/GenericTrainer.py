@@ -53,7 +53,7 @@ from modules.sangoi.ConvergeControl import ConvCfg, ConvergeControl
 from modules.sangoi.AdaptiveDCoef import AdaptiveDCoef
 from modules.sangoi.DataRecorder import DataRecorder
 from modules.sangoi.TrainGPS import TrainGPS
-from modules.sangoi.logFun import logFun
+from modules.sangoi.logFun import logFun, set_logfun_console
 
 from rich.console import Console as RichConsole # Renomear para evitar conflito com console local
 from rich.live import Live
@@ -132,7 +132,7 @@ class GenericTrainer(BaseTrainer):
 
         # Determine the current run number
         self.run_number = getattr(self.config, "run_number", 1) # Default to 1 if not set
-        logFun(f"Configurando para Run {self.run_number}.", lvl="LOOP", _console=self.console)
+        logFun(f"Configurando para Run {self.run_number}.", lvl="LOOP")
 
         self.recorder = None
         if getattr(self.config, "data_recorder", False):
@@ -144,9 +144,9 @@ class GenericTrainer(BaseTrainer):
                 verbose=self.recorder_verbose
             )
             purpose = "coleta de dados" if self.run_number == 1 else "gravação opcional de dinâmica"
-            logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.", lvl="debug", _console=self.console)
+            logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.", lvl="debug")
         else:
-            logFun("[DataRecorder] Desativado (flag data_recorder=False).", lvl="debug", _console=self.console)
+            logFun("[DataRecorder] Desativado (flag data_recorder=False).", lvl="debug")
 
         # 2. AdaptiveDCoef
         self.adaptive_dcoef = None
@@ -157,20 +157,20 @@ class GenericTrainer(BaseTrainer):
                     debug=self.dcoef_debug,
                     verbose=self.dcoef_verbose
                 )
-                logFun(f"[AdaptiveDCoef] Inicializado com sucesso.", lvl="success", _console=self.console)
+                logFun(f"[AdaptiveDCoef] Inicializado com sucesso.", lvl="success")
             except (FileNotFoundError, ValueError, Exception) as e:
-                logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="debug", _console=self.console)
+                logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="debug")
                 self.adaptive_dcoef = None # Ensure it's None if init fails
         elif getattr(self.config, "adpt_dcoef_use_it", False):
-            logFun("[AdaptiveDCoef] Desativado (não é Run 2 ou flag adpt_dcoef_use_it=False).", lvl="debug", _console=self.console)
+            logFun("[AdaptiveDCoef] Desativado (não é Run 2 ou flag adpt_dcoef_use_it=False).", lvl="debug")
 
     def _setup_rich_layout(self):
         """Configura o layout base para o Rich Live display."""
         self._rich_layout = Layout(name="root")
         self._rich_layout.split_column(
-            Layout(name="header", size=1),
-            Layout(name="main_content", size=1),
-            Layout(name="converge_control_status", ratio=3, visible=False), # Inicialmente oculto
+            Layout(name="header", size=2),
+            Layout(name="main_content", size=2),
+            Layout(name="converge_control_status", ratio=5, visible=False), # Inicialmente oculto
             Layout(name="footer", size=1)
         )
         self._rich_layout["header"].update(Text("Treinamento Genérico - OneTrainer", justify="center", style="bold magenta"))
@@ -178,6 +178,8 @@ class GenericTrainer(BaseTrainer):
         self._rich_layout["footer"].update(Text("Ctrl+C para parar", justify="right", style="dim"))
 
     def start(self):
+        set_logfun_console(self.console)
+        
         self.__save_config_to_workspace()
 
         if self.config.clear_cache_before_training and self.config.latent_caching:
@@ -269,16 +271,17 @@ class GenericTrainer(BaseTrainer):
 
             converge_control = ConvergeControl(
                 cfg=cfg,
+                run_number=2,
                 verbose=self.converge_verbose, # Já definido no init do GenericTrainer
                 debug=self.converge_debug,     # Já definido no init do GenericTrainer
             )
 
             self.converge_control = converge_control
-            logFun(f"[ConvergeControl] Inicializado com sucesso.", lvl="debug", _console=self.console)
+            logFun(f"[ConvergeControl] Inicializado com sucesso.", lvl="debug")
             if self._rich_layout: # Mostrar a seção do ConvergeControl se ele estiver ativo
                 self._rich_layout["converge_control_status"].visible = True            
         else:
-            logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug", _console=self.console)
+            logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug")
 
             
     def __save_config_to_workspace(self):
@@ -800,13 +803,13 @@ class GenericTrainer(BaseTrainer):
         if not self.is_paused: # Segurança extra
             return
 
-        logFun("Iniciando Pausa...", lvl="LOOP", _console=self.console)
+        logFun("Iniciando Pausa...", lvl="LOOP")
         self.callbacks.on_update_status("Pausing... Moving model to CPU")
         try:
             self.model.to(self.temp_device) # Mover para CPU
             self.model.eval() # Garantir modo eval
             torch_gc() # Limpar VRAM
-            logFun(f"Modelo movido para {self.temp_device}. VRAM liberada.", lvl="success", _console=self.console)
+            logFun(f"Modelo movido para {self.temp_device}. VRAM liberada.", lvl="success")
             self.callbacks.on_update_status(f"Paused. Model on {self.temp_device}. Toggle switch to resume.")
             # Notificar UI que a pausa iniciou e o switch pode ser reativado (para desligar)
             if hasattr(self.callbacks, 'on_pause_initiated'):
@@ -822,7 +825,7 @@ class GenericTrainer(BaseTrainer):
                     break
 
                 if self.commands.get_and_reset_resume_request():
-                    logFun("Comando RESUME recebido.", lvl="info", _console=self.console)
+                    logFun("Comando RESUME recebido.", lvl="info")
                     self.is_paused = False # Sinaliza para sair do loop
                     self.pause_request_locked = False # Desbloqueia a UI
                     # Notificar UI que o resume começou (switch ainda ativo)
@@ -833,13 +836,13 @@ class GenericTrainer(BaseTrainer):
                 time.sleep(0.5) # Evita busy-waiting, checa a cada 0.5s
 
             if not self.commands.get_stop_command(): # Só retoma se não for parar
-                logFun("Retomando treinamento...", lvl="info", _console=self.console)
+                logFun("Retomando treinamento...", lvl="info")
                 self.callbacks.on_update_status("Resuming... Moving model to GPU")
                 try:
                     # Recarregar para o dispositivo de treino
                     self.model_setup.setup_train_device(self.model, self.config)
                     torch_gc() # Limpeza extra
-                    logFun(f"Modelo movido de volta para {self.config.train_device}.", lvl="success", _console=self.console)
+                    logFun(f"Modelo movido de volta para {self.config.train_device}.", lvl="success")
                     self.callbacks.on_update_status("Training resumed.")
                     # Notificar UI que o resume foi concluído
                     if hasattr(self.callbacks, 'on_resume_completed'):
@@ -918,7 +921,7 @@ class GenericTrainer(BaseTrainer):
             ):
 
                 if self.is_paused:
-                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info", _console=self.console)
+                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info")
                     self._handle_pause_logic()
                     if self.commands.get_stop_command(): # Se o stop foi dado durante a pausa inicial
                         logFun("Comando STOP ativo após pausa inicial. Encerrando.", lvl="warning")
@@ -1020,13 +1023,13 @@ class GenericTrainer(BaseTrainer):
                         if self.commands.get_and_reset_backup_command():
                             self.model.to(self.temp_device)
                             # self.backup(train_progress, True, step_tqdm.write)
-                            self.backup(train_progress, True, lambda msg: logFun(msg, lvl="LOOP", _console=self.console))
+                            self.backup(train_progress, True, lambda msg: logFun(msg, lvl="LOOP"))
                             transferred_to_temp_device = True
 
                         if self.commands.get_and_reset_save_command():
                             self.model.to(self.temp_device)
                             # self.save(train_progress, True, step_tqdm.write)
-                            self.save(train_progress, True, lambda msg: logFun(msg, lvl="LOOP", _console=self.console))
+                            self.save(train_progress, True, lambda msg: logFun(msg, lvl="LOOP"))
                             transferred_to_temp_device = True
 
                         if transferred_to_temp_device:
@@ -1148,10 +1151,10 @@ class GenericTrainer(BaseTrainer):
                                                 mapped_stats_list.append(stat_with_name)
                                             else: # Opcional: Logar se o nome mapeado for inválido
                                                 if hasattr(self.config, 'debug') and self.config.debug:
-                                                    logFun(f"Nome inválido mapeado para group_idx {group_idx}", lvl="LOOP", _console=self.console)
+                                                    logFun(f"Nome inválido mapeado para group_idx {group_idx}", lvl="LOOP")
                                         else: # Opcional: Logar se o índice estiver fora do range
                                             if hasattr(self.config, 'debug') and self.config.debug:
-                                                logFun(f"group_idx {group_idx} fora do range do mapeamento (tam: {len(self.model.param_group_mapping)})", lvl="LOOP", _console=self.console)
+                                                logFun(f"group_idx {group_idx} fora do range do mapeamento (tam: {len(self.model.param_group_mapping)})", lvl="LOOP")
                                     if mapped_stats_list: # Procede apenas se houver stats válidos mapeados
                                         current_deltas = {}
                                         gps_instance: TrainGPS | None = getattr(self.model, "deltas", None) # Re-check instance existence
@@ -1236,7 +1239,7 @@ class GenericTrainer(BaseTrainer):
                         train_progress, current_epoch_length, self.config.epochs
                     )
 
-                    if self.converge_control and train_progress.global_step % 10 == 0: # Atualiza a cada 10 global steps
+                    if self.converge_control and (train_progress.global_step % 10 == 0 or train_progress.global_step == 1): # Atualiza a cada 10 global steps
                         # snapshot_epoch_weights agora só calcula, não imprime
                         self.converge_control.snapshot_epoch_weights() # Calcula as estatísticas
                         cc_renderable = self.converge_control.generate_status_renderable()
@@ -1267,11 +1270,12 @@ class GenericTrainer(BaseTrainer):
                                     g["d_coef"] = (base * scales[name]).item()
                                     updated_count += 1
                                     if self.adaptive_dcoef.debug:
-                                        logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] "
+                                        logFun(
+                                              f"[AdaptiveDCoef@epoch{train_progress.epoch}] "
                                               f"{name}: base={base:.4g} * scale={scales[name].item():.4g}",
-                                                lvl="debug", _console=self.console)
+                                              lvl="debug")
                             if updated_count > 0 and (self.adaptive_dcoef.debug or self.adaptive_dcoef.verbose):
-                                logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Updated d_coef for {updated_count} parameter groups.", lvl="info", _console=self.console)
+                                logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Updated d_coef for {updated_count} parameter groups.", lvl="info")
                     except Exception as e:
                         logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch}] Error applying dynamic d_coef adjustment: {e}", lvl="error")
                         traceback.print_exc()
@@ -1300,7 +1304,7 @@ class GenericTrainer(BaseTrainer):
                 )
 
                 if self.commands.get_and_reset_pause_request():
-                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info", _console=self.console)
+                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info")
                     self.pause_requested_at_epoch_end = True
                     self.pause_request_locked = True # Trava a UI
                     # Notificar a UI que a requisição foi aceita e o switch está travado
@@ -1318,7 +1322,7 @@ class GenericTrainer(BaseTrainer):
 
                 # Checagem de STOP ao final da época
                 if self.commands.get_stop_command():
-                    logFun("Comando STOP ativo no final da época. Encerrando...", lvl="info", _console=self.console)
+                    logFun("Comando STOP ativo no final da época. Encerrando...", lvl="info")
                     break # Sai do loop de épocas
                 
                 # 1. TrainGPS salva os deltas da epoch
@@ -1357,7 +1361,6 @@ class GenericTrainer(BaseTrainer):
                 
                 # 3. ConvergeControl Decide/Aplica Congelamento (Run >= 2 e Ativo)
                 if self.converge_control:
-                    logFun(f"[ConvergeControl] Δ Checking modules deltas..", lvl="info", _console=self.console)
                     # Roda a avaliação e obtém o dict {name: should_freeze}
                     freeze_decisions = self.converge_control.decide()
 
@@ -1382,7 +1385,8 @@ class GenericTrainer(BaseTrainer):
                                     f"[Trainer ApplyFreeze@{global_step}] "
                                     f"{action} module '{name}' based on ConvergeControl decision "
                                     f"(Run {self.run_number})",
-                                    lvl="info"
+                                    lvl="info",
+                                    console=self.console
                                 )
                             param_group_obj.set_requires_grad(should_be_enabled)
 
@@ -1404,9 +1408,9 @@ class GenericTrainer(BaseTrainer):
                 # Tenta mover de volta pra GPU rapidamente
                 self.model_setup.setup_train_device(self.model, self.config)
                 torch_gc()
-                logFun("Modelo movido para GPU para salvamento final.", lvl="info", _console=self.console)
+                logFun("Modelo movido para GPU para salvamento final.", lvl="info")
             except Exception as e:
-                logFun(f"Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).", lvl="error")
+                logFun(f"Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).", lvl="error", console=self.console)
                 # O modelo já está no self.temp_device, o save deve funcionar
                 pass # Continua para salvar do CPU
 
@@ -1463,7 +1467,7 @@ class GenericTrainer(BaseTrainer):
                 delta_filename = f"{model_name}_Deltas_Run{self.run_number}_{timestamp}.json"
                 delta_save_path = os.path.join(output_dir, delta_filename)
 
-                logFun(f"[TrainGPS] Salvando deltas (Run {self.run_number}) em: {delta_save_path}", lvl="info", _console=self.console)
+                logFun(f"[TrainGPS] Salvando deltas (Run {self.run_number}) em: {delta_save_path}", lvl="info")
                 # A função save_group_deltas salva o estado atual do delta_log_by_module
                 # que foi acumulado durante esta run específica.
                 gps_instance.save_group_deltas(delta_save_path)
@@ -1481,7 +1485,7 @@ class GenericTrainer(BaseTrainer):
                 profile_filename = f"{model_name}_Profile_Run{self.run_number}_{timestamp}.json.gz"
                 profile_save_path = os.path.join(output_dir, profile_filename)
 
-                logFun(f"[DataRecorder] Salvando perfil (Run {self.run_number}) em: {profile_save_path}", lvl="info", _console=self.console)
+                logFun(f"[DataRecorder] Salvando perfil (Run {self.run_number}) em: {profile_save_path}", lvl="info")
 
                 # DataRecorder's dump method now only takes the path
                 # It saves d_max_final and d_coef_base internally collected.
