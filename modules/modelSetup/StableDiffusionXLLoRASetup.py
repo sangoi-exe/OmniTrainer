@@ -1,6 +1,8 @@
 import os
 import traceback
 from typing import Optional
+
+import inspect
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
@@ -17,6 +19,45 @@ from modules.module.LoRAModule import PeftBase
 from modules.util.TensorBoardManager import TensorBoardManager
 
 import torch
+
+def log_tau_requires_grad_status(module: torch.nn.Module, module_name_prefix: str, stage_description: str):
+    print(f"\n--- {stage_description} --- Estado de 'requires_grad' para 'log_tau' em '{module_name_prefix}' ---")
+    found_any_tau = False
+    found_trainable_tau = False
+    
+    # Se o módulo tiver o nosso ModuleDict customizado
+    if hasattr(module, 'registered_learnable_tau_processors'):
+        print(f"  Inspecionando '{module_name_prefix}.registered_learnable_tau_processors':")
+        for proc_module_name, proc_module_instance in module.registered_learnable_tau_processors.items():
+            for param_name, param in proc_module_instance.named_parameters(recurse=False):
+                if "log_tau" in param_name:
+                    found_any_tau = True
+                    full_param_name = f"{module_name_prefix}.registered_learnable_tau_processors.{proc_module_name}.{param_name}"
+                    print(f"    {full_param_name}: requires_grad = {param.requires_grad}")
+                    if param.requires_grad:
+                        found_trainable_tau = True
+        if not found_any_tau:
+            print(f"    Nenhum 'log_tau' encontrado em '{module_name_prefix}.registered_learnable_tau_processors'.")
+
+    # Tenta encontrar 'log_tau' em outros lugares (caso a estrutura seja diferente)
+    # Isso pode ser útil se os processadores foram injetados de outra forma
+    # ou se os parâmetros LoRA também tiverem 'log_tau' (improvável, mas para cobrir).
+    # else: # Ou inspeciona todos os parâmetros do módulo se o ModuleDict não existir
+    #     print(f"  Inspecionando todos os parâmetros de '{module_name_prefix}' (fallback):")
+    #     for param_name, param in module.named_parameters():
+    #         if "log_tau" in param_name: # Pode gerar muitos falsos positivos se "log_tau" for comum
+    #             found_any_tau = True
+    #             print(f"    {module_name_prefix}.{param_name}: requires_grad = {param.requires_grad}")
+    #             if param.requires_grad:
+    #                 found_trainable_tau = True
+    
+    if not found_any_tau:
+        print(f"  Nenhum parâmetro 'log_tau' encontrado em '{module_name_prefix}' durante esta inspeção.")
+    elif found_trainable_tau:
+        print(f"  Pelo menos um 'log_tau' em '{module_name_prefix}' está TREINÁVEL.")
+    else:
+        print(f"  Todos os 'log_tau' encontrados em '{module_name_prefix}' estão CONGELADOS.")
+    print(f"--- Fim da inspeção para {stage_description} ---")
 
 PRESETS = {
     "attn-mlp": ["attentions"],
@@ -122,27 +163,114 @@ class StableDiffusionXLLoRASetup(
         model: StableDiffusionXLModel,
         config: TrainConfig,
     ):
+        # // GEMINI-CODE {timestamp} - INÍCIO DA INSPEÇÃO DE CHAMADA
+        # global_step = getattr(model.train_progress, 'step', 'DESCONHECIDO') # Tenta pegar o step atual
+        
+        # print(f"\n\n--- EXECUTANDO __setup_requires_grad (Step: {global_step}) ---")
+        
+        # Imprimir o call stack para depuração
+        # Limitamos a profundidade para não poluir demais, mas ajuste se necessário
+        # O primeiro frame (índice 0) é a própria __setup_requires_grad
+        # O segundo frame (índice 1) é quem a chamou diretamente
+        # O terceiro frame (índice 2) é quem chamou o chamador, e assim por diante.
+        
+        # print("  Call Stack (quem está chamando esta função?):")
+        # stack = inspect.stack()
+        # # Começamos do frame 1 (quem chamou __setup_requires_grad)
+        # # e vamos até uns 5 níveis acima, ou menos se a pilha for curta.
+        # for i in range(1, min(6, len(stack))): 
+        #     frame = stack[i]
+        #     # frame[0] é o objeto frame
+        #     # frame[1] é o nome do arquivo
+        #     # frame[2] é o número da linha
+        #     # frame[3] é o nome da função/método
+        #     # frame[4] são as linhas de contexto do código (pode ser None)
+        #     # frame[5] é o índice da linha atual no contexto (pode ser None)
+        #     print(f"    -> Nível {i}: Função '{frame.function}' no arquivo '{frame.filename}', linha {frame.lineno}")
+        #     # Se quiser ver o código da linha que chamou (pode ser útil):
+        #     # if frame.code_context:
+        #     #    print(f"       Contexto: {''.join(frame.code_context).strip()}")
+        # if len(stack) <=1:
+        #     print("    -> Call stack muito curto, chamada direta de um escopo global ou similar?")
+        # print("--- FIM DA INSPEÇÃO DE CHAMADA ---\n")
+        # // GEMINI-CODE {timestamp} - Log ANTES de qualquer modificação na UNet
+        # if hasattr(model, 'unet'):
+        #     log_tau_requires_grad_status(model.unet, "model.unet", "Início de __setup_requires_grad (antes de modificações na UNet)")
+        # if hasattr(model, 'unet_lora') and model.unet_lora is not None:
+        #      log_tau_requires_grad_status(model.unet_lora, "model.unet_lora", "Início de __setup_requires_grad (antes de modificações na UNet LoRA)")
+
         self._setup_embeddings_requires_grad(model, config)
         model.text_encoder_1.requires_grad_(False)
         model.text_encoder_2.requires_grad_(False)
+        # --- UNet Base ---
+        # print("\n>>> APLICANDO: model.unet.requires_grad_(False)")
         model.unet.requires_grad_(False)
+        # // GEMINI-CODE {timestamp} - Log DEPOIS de congelar model.unet
+        # log_tau_requires_grad_status(model.unet, "model.unet", "Após model.unet.requires_grad_(False)")
+        
         model.vae.requires_grad_(False)
 
+        # --- LoRA para Text Encoders (se existirem) ---
         if model.text_encoder_1_lora is not None:
             train_text_encoder_1 = config.text_encoder.train and not self.stop_text_encoder_training_elapsed(
                 config, model.train_progress
             )
+            # print(f">>> APLICANDO: model.text_encoder_1_lora.requires_grad_({train_text_encoder_1})")
             model.text_encoder_1_lora.requires_grad_(train_text_encoder_1)
+            # log_tau_requires_grad_status(model.text_encoder_1_lora, "model.text_encoder_1_lora", "Após setup de text_encoder_1_lora")
+
 
         if model.text_encoder_2_lora is not None:
             train_text_encoder_2 = config.text_encoder_2.train and not self.stop_text_encoder_2_training_elapsed(
                 config, model.train_progress
             )
+            # print(f">>> APLICANDO: model.text_encoder_2_lora.requires_grad_({train_text_encoder_2})")
             model.text_encoder_2_lora.requires_grad_(train_text_encoder_2)
+            # log_tau_requires_grad_status(model.text_encoder_2_lora, "model.text_encoder_2_lora", "Após setup de text_encoder_2_lora")
 
+
+        # --- LoRA para UNet (se existir) ---
         if model.unet_lora is not None:
             train_unet = config.unet.train and not self.stop_unet_training_elapsed(config, model.train_progress)
+            # print(f"\n>>> APLICANDO: model.unet_lora.requires_grad_({train_unet})")
             model.unet_lora.requires_grad_(train_unet)
+            # // GEMINI-CODE {timestamp} - Log DEPOIS de configurar model.unet_lora
+            # log_tau_requires_grad_status(model.unet_lora, "model.unet_lora", "Após model.unet_lora.requires_grad_()")
+        
+        # // GEMINI-CODE {timestamp} - Descongela os parâmetros Tau especificamente
+        # print("\n>>> CHAMANDO: self.__ensure_tau_params_trainable(model) para reativar 'log_tau'")
+        self.__ensure_tau_params_trainable(model) # Passa o objeto model completo
+
+        # // GEMINI-CODE {timestamp} - Log FINAL para model.unet (para ver o estado combinado)
+        # log_tau_requires_grad_status(model.unet, "model.unet", "Fim de __setup_requires_grad (após descongelamento específico do Tau)")
+
+    # // GEMINI-CODE {timestamp} - Mantenha esta função para ser chamada APÓS __setup_requires_grad
+    def __ensure_tau_params_trainable(self, model: StableDiffusionXLModel):
+        if hasattr(model, 'unet') and hasattr(model.unet, 'registered_learnable_tau_processors'):
+            print("\n--- Trainer: Garantindo que parâmetros 'log_tau' são treináveis (pós-setup global) ---")
+            made_trainable_count = 0
+            total_log_tau_params = 0
+            for module_name, module_instance in model.unet.registered_learnable_tau_processors.items():
+                for param_name, param in module_instance.named_parameters(recurse=False):
+                    if "log_tau" in param_name:
+                        total_log_tau_params +=1
+                        if not param.requires_grad:
+                            param.requires_grad_(True)
+                            # print(f"  DESCONGELADO (via __ensure_tau_params_trainable): model.unet.registered_learnable_tau_processors.{module_name}.{param_name}")
+                            made_trainable_count +=1
+                        # else:
+                        #    print(f"  JÁ TREINÁVEL: model.unet.registered_learnable_tau_processors.{module_name}.{param_name}")
+            
+            if total_log_tau_params > 0:
+                if made_trainable_count > 0:
+                    print(f"  {made_trainable_count}/{total_log_tau_params} parâmetros 'log_tau' foram explicitamente definidos como treináveis por esta função.")
+                else:
+                    print(f"  Todos os {total_log_tau_params} parâmetros 'log_tau' encontrados já estavam treináveis ou não foram encontrados para descongelar.")
+            else:
+                print("  Nenhum parâmetro 'log_tau' encontrado em 'registered_learnable_tau_processors' para verificar/descongelar.")
+
+        else:
+            print("--- Trainer: Nenhum 'registered_learnable_tau_processors' encontrado na UNet para a verificação final do Tau.")
 
     def setup_model(
         self, model: StableDiffusionXLModel, config: TrainConfig, tensorboard: Optional[TensorBoardManager] = None
@@ -203,10 +331,7 @@ class StableDiffusionXLLoRASetup(
         model.parameters = parameter_collection
 
         # testar esse mamute do gemini, cheio de verificações e etc
-        # START: Modificação solicitada - Refined TrainGPS initialization
         from modules.sangoi.TrainGPS import TrainGPS
-        import torch # Ensure torch is imported
-
         # Garante que deltas é None por padrão
         model.deltas = None
 

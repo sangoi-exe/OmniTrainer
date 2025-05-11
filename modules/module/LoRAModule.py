@@ -1471,9 +1471,9 @@ class LoRAModuleWrapper:
             logFun(f"Error writing key file '{output_filename}': {e}", lvl="error")
             traceback.print_exc()
 
-    def get_module_for_stats(self, stats_name: str) -> nn.Module | None:
+    def get_module_for_stats(self, name: str) -> nn.Module | None:
         """
-        Dado um stats_name (ex: 'lora_unet_mid_block_resnets_1_conv2'),
+        Dado um name (ex: 'lora_unet_mid_block_resnets_1_conv2'),
         retorna o objeto PEFT correto em self.lora_modules,
         ou None se não encontrar.
         """
@@ -1481,6 +1481,6 @@ class LoRAModuleWrapper:
         prefix = self.prefix  # ex: 'lora_unet'
         for orig_name, peft_mod in self.lora_modules.items():
             candidate = f"{prefix}_{orig_name.replace('.', '_')}"
-            if candidate == stats_name:
+            if candidate == name:
                 return peft_mod
         return None

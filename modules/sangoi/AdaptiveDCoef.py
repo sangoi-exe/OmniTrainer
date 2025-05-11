@@ -8,78 +8,77 @@ from typing import Dict, List, Tuple, Any, Optional
 
 from modules.sangoi.logFun import logFun
 
-
 class AdaptiveDCoef:
-    """
-    Ajusta d_coef por módulo na Run-2 usando o perfil dumpado.
-    Pode também expor dados carregados do perfil para outros módulos.
-    """
-
-    # Manter sincronizado com ConvergeControl
-    ConvergencePoint = Tuple[
-        int,
-        float,
-        float,
-        float,
-        float,
-        float,
-        Optional[float],
-        Optional[float],
-        Optional[float],
-        bool,
-    ]
-
     def __init__(
         self,
         gamma: float = 2.0,
-        alpha: float = 1.0,
-        min_scale: float = 1e-3,
+        min_scale: float = 0.1,
+        max_scale: float = 3.0,
         debug: bool = True,
         verbose: bool = True,
     ):
-
+        
         self.gam = gamma
-        self.alpha = alpha
         self.min_scale = min_scale
+        self.max_scale = max_scale
         self.debug = debug
         self.verbose = verbose
 
-        self.d_hat_final: Dict[str, float] = {}
-        self.d_coef_base: Dict[str, float] = {}
+        self.module_prodigy_d_final_run1: Dict[str, float] = {} 
 
-    # ------------------------------------------------------------------
-    # Escala dinâmica **apenas** com base no delta_L2 atual
-    #   • delta_now  : Δ-L2 corrente do módulo (precisa ser fornecido)
-    #   • ref_delta  : d_hat_final gravado na run-1  (fallback 1.0)
-    #   • Formula    : scale = max(min_scale, (delta_now / ref_delta)^gamma)
-    # ------------------------------------------------------------------
-    def scale(self, name: str, delta_now: float) -> float:
-        ref = max(1e-12, self.d_hat_final.get(name, 1.0))
-        ratio = (delta_now / ref) ** self.gam
-        s = max(self.min_scale, ratio)
+    def load_prodigy_d_final_run1(self, data_recorder_dump_path: Optional[str]):
+        if data_recorder_dump_path and os.path.exists(data_recorder_dump_path):
+            try:
+                with gzip.open(data_recorder_dump_path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.module_prodigy_d_final_run1 = data.get("d_pdgy_final", {})
+                if self.verbose and self.module_prodigy_d_final_run1:
+                    logFun(f"[AdaptiveDCoef] 'd_pdgy_final' da Run 1 carregado para {len(self.module_prodigy_d_final_run1)} módulos.", lvl="info")
+                elif not self.module_prodigy_d_final_run1:
+                    logFun(f"[AdaptiveDCoef] Perfil '{data_recorder_dump_path}' carregado, mas 'd_pdgy_final' está vazio ou ausente.", lvl="warning")
+            except Exception as e:
+                logFun(f"[AdaptiveDCoef] Falha ao carregar 'd_pdgy_final' de '{data_recorder_dump_path}': {e}", lvl="error")
+                traceback.print_exc()
+        else:
+            logFun(f"[AdaptiveDCoef] Caminho do perfil 'd_pdgy_final' da Run 1 ('{data_recorder_dump_path}') não encontrado ou não fornecido. Scales individuais podem usar fallback.", lvl="info")
 
-        if self.debug:
-            logFun(f"[AdaptiveDCoef] {name}: Δ_now={delta_now:.4g} / ref={ref:.4g} "
-                  f"→ scale={s:.4g}", lvl="debug")
-        return s
+    def load_module_scores_run1(self, path: str) -> Dict[str, float]:
+        data = json.load(open(path, "r"))
+        return {
+            prefix: metrics["snr"]  # ou escolha entre "snr", "gd", "gns", etc.
+            for prefix, metrics in data["modules"].items()
+        }
 
-    def scale_vectorized(
-        self,
-        names: list[str],
-        delta_now: torch.Tensor,   # tensor [len(names)] de Δ-L2 atuais
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ) -> dict[str, torch.Tensor]:
-        if not names:
-            return {}
+    def calculate_individual_d_coef(
+            self,
+            module_scores_run1: Dict[str, float],
+            current_module_scores: Dict[str, float],
+            gamma: float,
+            min_scale: float,
+            max_scale: float,
+        ) -> Dict[str, float]:
+        
+        final_d_coefs: Dict[str, float] = {}
 
-        ref = torch.tensor(
-            [max(1e-12, self.d_hat_final.get(n, 1.0)) for n in names],
-            device=device, dtype=dtype
-        )
-        scales = torch.clamp((delta_now / ref) ** self.gam, min=self.min_scale)
+        if not self.module_prodigy_d_final_run1 and self.verbose:
+            logFun(f"[AdaptiveDCoef] Calculando d_coefs, mas 'd_pdgy_final' da Run 1 não foi carregado. Todos os módulos usarão fallback para ref_prodigy_d_run1.", lvl="warning")
 
-        if self.debug:
-            logFun(f"[AdaptiveDCoef] vector scale Δ={delta_now[:5].tolist()} "
-                   f"→ {scales[:5].tolist()}", lvl="debug")
-        return {n: scales[i] for i, n in enumerate(names)}
+        for prefix in self.module_prefixes:
+            # 1) Score atual e referência (fallback 1.0)
+            score_now = current_module_scores.get(prefix, 1.0)
+            ref_score = module_scores_run1.get(prefix, 1.0)  # se não existir, assume 1.0
+
+            # 2) Cálculo da escala individual
+            individual_scale = (score_now / ref_score) ** gamma
+
+            # 3) Clamping
+            clamped = torch.clamp(individual_scale, min_scale, max_scale)
+
+            # 4) Dcoef final = escala (sem global)
+            final_d_coefs[prefix] = clamped
+
+            # Log de debug
+            logFun(f"{prefix:40s} | score_now={score_now:.4f} | "
+                        f"ref={ref_score:.4f} | scale={individual_scale:.4f} | "
+                        f"clamped={clamped:.4f}", lvl="debug")
+        return final_d_coefs

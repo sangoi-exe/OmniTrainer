@@ -450,6 +450,9 @@ class TrainConfig(BaseConfig):
 		# which run
     run_number: int = 1
     
+		# grad_sample
+    add_grad_sample: bool = False
+    
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -823,6 +826,7 @@ class TrainConfig(BaseConfig):
         data.append(("adpt_dcoef_path", "", str, False))
         data.append(("data_recorder", False, bool, False))
         data.append(("convctrl_use_it", False, bool, False))
+        data.append(("add_grad_sample", False, bool, False))
         data.append(("run_number", 1, int, False))
         data.append(("log_cosh_strength", 0.0, float, False))
         data.append(("vb_loss_strength", 1.0, float, False))
