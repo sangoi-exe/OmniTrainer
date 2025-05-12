@@ -2,48 +2,70 @@ import traceback
 import json, gzip, os
 from modules.sangoi.logFun import logFun
 from typing import Dict, Optional, List, Tuple, Any
+from collections import defaultdict
 
 
 class DataRecorder:
-    """
-    Guarda perfil de cada módulo durante o treino:
-      • d_pdgy_final (estimativa 'd' do Prodigy no final da Run 1)
-    Dumpa em .json.gz no final.
-    """
 
     def __init__(self, debug: bool = True, verbose: bool = True):
-        self.d_pdgy_final: Dict[str, float] = {}
+        # Estrutura: module_name -> metric_name -> list_of_values
+        self.metrics_history: Dict[str, Dict[str, List[Optional[float]]]] = defaultdict(lambda: defaultdict(list))
+        self.current_step = 0  # Para possivelmente registrar o step junto com as métricas
         self.debug = debug
         self.verbose = verbose
 
-    def log_step(
-            self,
-            name: str,  # Nome do módulo/grupo de parâmetros
-            d_pdgy: float,  # Valor 'd' do otimizador Prodigy para este módulo
-    ):
-        """Registra o d_pdgy mais recente para o módulo."""
-        # O 'd_pdgy' aqui é o 'd' do grupo de params do Prodigy, que é a estimativa da distância ao ótimo.
-        self.d_pdgy_final[name] = d_pdgy
-        # if self.debug and step % 500 == 0: ...
+    def set_current_step(self, step: int):
+        self.current_step = step
 
-    def dump(
+    def log_metrics_step(
         self,
-        path: str,
+        name: str,  # Nome do módulo
+        gd: Optional[float] = None,
+        snr: Optional[float] = None,
+        gns_t: Optional[float] = None,
+        d_pdgy: Optional[float] = None,
+        gd_ewma: Optional[float] = None,
+        gd_std_ewma_var: Optional[float] = None,  # EWMA da variância do GD
+        snr_median: Optional[float] = None,
+        snr_iqr: Optional[float] = None,
+        gns_t_median: Optional[float] = None,
+        gns_t_iqr: Optional[float] = None,
+        latest_mu_temporal_norm_sq: Optional[float] = None,
+        # E as próprias condições primárias e de estabilidade se quiser (bools)
     ):
-        """Salva os dados coletados (d_pdgy_final)."""
+        """Registra todas as métricas relevantes para o módulo no step atual."""
+        if gd is not None:
+            self.metrics_history[name]["gd"].append(gd)
+        if snr is not None:
+            self.metrics_history[name]["snr"].append(snr)
+        if gns_t is not None:
+            self.metrics_history[name]["gns_t"].append(gns_t)
+        if d_pdgy is not None:
+            self.metrics_history[name]["d_pdgy"].append(d_pdgy)
+        if gd_ewma is not None:
+            self.metrics_history[name]["gd_ewma"].append(gd_ewma)
+        if gd_std_ewma_var is not None:
+            self.metrics_history[name]["gd_std_ewma_var"].append(gd_std_ewma_var)
+
+
+        # Alternativa: sempre adicionar algo para cada métrica para manter o comprimento das listas igual
+        # self.metrics_history[name]["gd"].append(gd if gd is not None else float('nan'))
+        # self.metrics_history[name]["snr"].append(snr if snr is not None else float('nan'))
+        # etc.
+
+    def dump(self, path: str):
         output_dir = os.path.dirname(path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        data_to_dump = {
-            "d_pdgy_final": self.d_pdgy_final,}
+        # Converter defaultdicts para dicts normais para serialização JSON
+        data_to_dump = {"metrics_history": {k: dict(v) for k, v in self.metrics_history.items()}}
 
         try:
             with gzip.open(path, "wt", encoding="utf-8") as f:
-                json.dump(data_to_dump, f, indent=2)
+                json.dump(data_to_dump, f)  # indent=2 pode ser muito grande para dados de série temporal
             if self.verbose:
-                logFun(f"[DataRecorder] Perfil (d_pdgy_final) salvo com sucesso em {path}", lvl="success")
+                logFun(f"[DataRecorder] Histórico de métricas salvo com sucesso em {path}", lvl="success")
         except Exception as e:
-            # IA_MODIFICACAO: Corrigido o log de erro para usar logFun e passar o nível corretamente.
-            logFun(f"[DataRecorder] ERRO ao salvar perfil em {path}: {e}", lvl="error")
+            logFun(f"[DataRecorder] ERRO ao salvar histórico de métricas em {path}: {e}", lvl="error")
             traceback.print_exc()

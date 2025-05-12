@@ -8,10 +8,13 @@ from rich.panel import Panel
 from rich.layout import Layout
 from rich.table import Table
 from rich import box
-from typing import Deque, Dict, Set, Union
+from typing import Deque, Dict, Optional, Set, Union
 from dataclasses import dataclass
 from collections import defaultdict, deque
+from rich.text import Text
 
+
+from modules.sangoi.DataRecorder import DataRecorder
 from modules.sangoi.logFun import logFun
 
 # ------------------- Config -------------------
@@ -20,7 +23,7 @@ class ConvCfg:
     # k_confirm: int = 4 # Este será substituído/reinterpretado
     # GD
     gd_std_k: float = 1.5
-    gd_hist_len: int = 30
+    gd_hist_len: int = 32
     gd_ewma_alpha: float = 0.1
     gd_std_ewma_alpha: float = 0.1
     gd_stable_confirm_steps: int = 10 # Novo: k individual para GD
@@ -35,8 +38,9 @@ class ConvCfg:
     snr_stability_std_thresh: float = 0.01 # Novo: Limiar absoluto para std do SNR
 
     # GNS Temporal
-    gns_temporal_thresh: float = 10.0 # Corrigido para float
     gns_temporal_k_window: int = 10
+
+    gns_temporal_thresh: float = 12.0 # Corrigido para float
     gns_temporal_hist_len: int = 32
     gns_max_value_clamp: float = 1000.0
     gns_temporal_k_iqr_factor: float = 1.0
@@ -47,9 +51,9 @@ class ConvCfg:
 
 
     # Warm-up
-    min_gd_hist_eval: int = 15
+    min_gd_hist_eval: int = 16
     min_snr_hist_eval: int = 16
-    min_hist_gns_temporal_eval: int = 10
+    min_hist_gns_temporal_eval: int = 12
 
 def module_type(name: str) -> str:
     if "attention" in name or "attn" in name: return "attn"
@@ -142,7 +146,9 @@ class ConvergeControl:
         *,
         verbose: bool = True,
         debug: bool = True,
+        data_recorder: Optional[DataRecorder] = None,
     ):
+        self.data_recorder = data_recorder
         self.run_number = run_number
         self.cfg_by_type = TYPE_CFG
         self.verbose = verbose
@@ -498,102 +504,131 @@ class ConvergeControl:
     def get_latest_scores(self) -> Dict[str, float]:
         return {name: self.snr_hist[name][-1] for name in self.snr_hist if self.snr_hist[name]}
 
+    def _format_metric_cell(self, value, current_steps, target_steps, primary_cond_text, 
+                            stability_cond_text, is_primary_met, is_stable, 
+                            value_format="{:.2e}", nan_text="N/A") -> Text:
+        """Helper para formatar o conteúdo de uma célula de métrica em uma única linha."""
+        
+        val_disp = value_format.format(value) if not (isinstance(value, str) or np.isnan(value)) else nan_text
+        
+        color = "green" if is_primary_met and is_stable else "red"
+        # Se for N/A e as condições não forem atendidas (is_primary_met e is_stable são False),
+        # não pintar explicitamente de vermelho; deixar a cor padrão ou uma cor neutra.
+        if val_disp == nan_text and not (is_primary_met and is_stable):
+            color = "default" # Ou "dim white" ou outra cor neutra
+
+        count_disp = f"({current_steps}/{target_steps})"
+
+        text_elements = []
+        text_elements.append((f"{val_disp} {count_disp} ", color if val_disp != nan_text else "default")) # Cor no valor e contador
+        
+        # Adicionar um separador visual sutil se não for N/A para as condições
+        # Ou simplesmente um espaço
+        # text_elements.append(("| ", "dim")) if primary_cond_text != f"P:hist<{target_steps}" else (" ", "dim") # Exemplo de separador
+        
+        text_elements.append((f"{primary_cond_text} ", "dim"))
+        text_elements.append((stability_cond_text, "dim"))
+        
+        return Text.assemble(*text_elements)
+
     def generate_status_renderable(self) -> Union[Columns, Group, Text]:
-            cards = []
-            # Usa _deques_initialized_for_module para garantir que temos todos os dados para os módulos
-            monitored_modules = sorted(list(self._deques_initialized_for_module))
+        monitored_modules = sorted(list(self._deques_initialized_for_module))
 
-            for name in monitored_modules:
-                cfg = self._get_cfg_for_module(name) # Use _get_cfg_for_module
+        if not monitored_modules:
+            return Text("Sem módulos ativos para convergência.", justify="center")
+
+        # Dividir módulos para duas tabelas
+        split_point = (len(monitored_modules) + 1) // 2
+        modules_table1 = monitored_modules[:split_point]
+        modules_table2 = monitored_modules[split_point:]
+
+        tables = []
+
+        for i, module_list in enumerate([modules_table1, modules_table2]):
+            if not module_list:
+                continue
+
+            table = Table(box=box.ROUNDED, show_edge=True, expand=True,
+                          header_style="bold magenta", show_header=True, title=f"Convergence Status {i+1}")
+            
+            # Ajustar min_width para acomodar uma única linha mais longa nas células de métrica
+            table.add_column("Module", style="cyan", min_width=18, no_wrap=True) # Pode manter ou reduzir um pouco
+            table.add_column("GD", justify="left", min_width=30) # Aumentado (era ~17)
+            table.add_column("SNR", justify="left", min_width=28) # Aumentado (era ~17)
+            table.add_column("GNS-T", justify="left", min_width=32) # Aumentado (era ~20)
+            table.add_column("SNR*GNS", justify="right", min_width=7) # Mantém
+            table.add_column("Status", justify="left", min_width=15) # Mantém
+
+            for name in module_list:
+                cfg = self._get_cfg_for_module(name)
                 is_frozen = name in self.perma_frozen
-                
-                # Determina a cor da borda com base no progresso dos contadores
-                progress_color = "yellow"
-                if is_frozen:
-                    progress_color = "green"
-                else:
-                    # Verifica se algum contador está progredindo significativamente
-                    gd_prog = self.stable_green_gd_steps.get(name,0) / cfg.gd_stable_confirm_steps
-                    snr_prog = self.stable_green_snr_steps.get(name,0) / cfg.snr_stable_confirm_steps
-                    gns_prog = self.stable_green_gns_t_steps.get(name,0) / cfg.gns_t_stable_confirm_steps
-                    if max(gd_prog, snr_prog, gns_prog) > 0.5 : progress_color = "blue" # Um pouco de progresso
-                    if max(gd_prog, snr_prog, gns_prog) == 0 : progress_color = "red"   # Nenhum progresso
 
-                table = Table(box=box.HORIZONTALS, show_edge=False, expand=True, border_style=progress_color,
-                              header_style="bold white", show_header=True, collapse_padding=True, pad_edge=False)
-                table.add_column("Stat", style="cyan", ratio=4, no_wrap=True)
-                table.add_column("Value", style="white", ratio=4, justify="left", no_wrap=True)
-                table.add_column("Cond", style="dim white", ratio=5, no_wrap=True)
-
+                # Coletar dados (similar à versão anterior, mas para preencher células da tabela)
                 gd_hist_vals = self.gradient_disparity_hist.get(name, deque())
                 snr_hist_vals = self.snr_hist.get(name, deque())
                 gns_temporal_hist_vals = self.gns_temporal_hist.get(name, deque())
                 snr_stability_hist = self.snr_value_hist_for_stability.get(name, deque())
                 gns_t_stability_hist = self.gns_t_value_hist_for_stability.get(name, deque())
 
-                # --- GD ---
-                gd_val_str, gd_cond_str, gd_met_primary, gd_is_stable_disp = "N/A", f"hist<{cfg.min_gd_hist_eval}", False, False
+                # --- GD Cell ---
+                current_gd, gd_met_primary, gd_is_stable_disp = np.nan, False, False
+                gd_prim_cond_text, gd_stab_cond_text = f"P:hist<{cfg.min_gd_hist_eval}", "S:N/A"
                 if gd_hist_vals and len(gd_hist_vals) >= cfg.min_gd_hist_eval:
                     current_gd = gd_hist_vals[-1]
                     ewma_gd = self.gd_ewma.get(name, np.nan)
                     ewma_var_gd = self.gd_std_ewma.get(name, np.nan)
-                    gd_val_str = f"{current_gd:.2e}"
                     if not np.isnan(ewma_gd) and not np.isnan(ewma_var_gd):
                         std_gd_from_ewma_var = math.sqrt(max(0, ewma_var_gd))
                         gd_target_threshold = ewma_gd - cfg.gd_std_k * std_gd_from_ewma_var
                         gd_met_primary = current_gd <= gd_target_threshold
-                        gd_cond_str = f"<= {gd_target_threshold:.2e} (μ-kσ)"
-                        # Estabilidade do GD para display
-                        gd_is_stable_disp = std_gd_from_ewma_var < (abs(ewma_gd) * cfg.gd_stability_std_thresh_factor + 1e-9)
-                        gd_cond_str += f"\nσ(GD)<{abs(ewma_gd) * cfg.gd_stability_std_thresh_factor:.1e}" if not np.isnan(ewma_gd) else "\nσ(GD) N/A"
+                        gd_prim_cond_text = f"P:<={gd_target_threshold:.1e}"
+                        
+                        stab_thresh_gd = abs(ewma_gd) * cfg.gd_stability_std_thresh_factor + 1e-9
+                        gd_is_stable_disp = std_gd_from_ewma_var < stab_thresh_gd
+                        gd_stab_cond_text = f"S:σ<{stab_thresh_gd:.1e} ({std_gd_from_ewma_var:.1e})"
+                    else:
+                        gd_prim_cond_text = "P:EWMA warm"
+                        gd_stab_cond_text = "S:EWMA warm"
+                
+                gd_cell = self._format_metric_cell(current_gd, self.stable_green_gd_steps.get(name,0),
+                                                   cfg.gd_stable_confirm_steps, gd_prim_cond_text,
+                                                   gd_stab_cond_text, gd_met_primary, gd_is_stable_disp)
 
-                gd_color = "green" if gd_met_primary and gd_is_stable_disp else "red"
-                gd_count_str = f" ({self.stable_green_gd_steps.get(name,0)}/{cfg.gd_stable_confirm_steps})"
-                table.add_row(
-                    "GD",
-                    f"[{gd_color}]{gd_val_str}[/{gd_color}]{gd_count_str}",
-                    gd_cond_str
-                )
-
-                # --- SNR ---
-                snr_val_str, snr_cond_str, snr_met_primary, snr_is_stable_disp = "N/A", f"hist<{cfg.min_snr_hist_eval}", False, False
+                # --- SNR Cell ---
+                current_snr, snr_met_primary, snr_is_stable_disp = np.nan, False, False
+                snr_prim_cond_text, snr_stab_cond_text = f"P:hist<{cfg.min_snr_hist_eval}", "S:N/A"
                 if snr_hist_vals and len(snr_hist_vals) >= cfg.min_snr_hist_eval:
                     current_snr = snr_hist_vals[-1]
                     median_snr = float(np.median(list(snr_hist_vals)))
                     q75_snr, q25_snr = np.percentile(list(snr_hist_vals), [75, 25])
                     iqr_snr = q75_snr - q25_snr
                     snr_target_value = median_snr - cfg.snr_k * iqr_snr if iqr_snr > 1e-9 else median_snr
-                    snr_val_str = f"{current_snr:.2f}"
                     snr_met_primary = current_snr <= snr_target_value
-                    snr_cond_str = f"<= {snr_target_value:.2f}"
+                    snr_prim_cond_text = f"P:<={snr_target_value:.2f}"
                     if snr_stability_hist and len(snr_stability_hist) >= cfg.snr_stability_window_len:
                         std_snr_stability = np.std(list(snr_stability_hist))
                         snr_is_stable_disp = std_snr_stability < cfg.snr_stability_std_thresh
-                        snr_cond_str += f"\nσ(SNR)<{cfg.snr_stability_std_thresh:.2f} ({std_snr_stability:.2f})"
+                        snr_stab_cond_text = f"S:σ<{cfg.snr_stability_std_thresh:.2f} ({std_snr_stability:.2f})"
                     else:
-                        snr_cond_str += f"\nσ(SNR) N/A (hist:{len(snr_stability_hist)}/{cfg.snr_stability_window_len})"
-
-
-                snr_color = "green" if snr_met_primary and snr_is_stable_disp else "red"
-                snr_count_str = f" ({self.stable_green_snr_steps.get(name,0)}/{cfg.snr_stable_confirm_steps})"
-                table.add_row(
-                    "SNR",
-                    f"[{snr_color}]{snr_val_str}[/{snr_color}]{snr_count_str}",
-                    snr_cond_str
-                )
-
-                # --- GNS-T ---
-                gns_t_val_str, gns_t_cond_str, gns_t_met_primary, gns_t_is_stable_disp = "N/A", f"hist<{cfg.min_hist_gns_temporal_eval}", False, False
+                        snr_stab_cond_text = f"S:hist<{len(snr_stability_hist)}/{cfg.snr_stability_window_len}"
+                
+                snr_cell = self._format_metric_cell(current_snr, self.stable_green_snr_steps.get(name,0),
+                                                    cfg.snr_stable_confirm_steps, snr_prim_cond_text,
+                                                    snr_stab_cond_text, snr_met_primary, snr_is_stable_disp, value_format="{:.2f}")
+                
+                # --- GNS-T Cell ---
+                current_gns_t, gns_t_met_primary, gns_t_is_stable_disp = np.nan, False, False
+                gns_t_prim_cond_text, gns_t_stab_cond_text = f"P:hist<{cfg.min_hist_gns_temporal_eval}", "S:N/A"
                 if gns_temporal_hist_vals and len(gns_temporal_hist_vals) >= cfg.min_hist_gns_temporal_eval:
                     current_gns_t = gns_temporal_hist_vals[-1]
                     mu_norm_sq_gns = self.latest_mu_temporal_norm_sq.get(name, float('inf'))
-                    gns_t_val_str = f"{current_gns_t:.2f}"
                     gns_inf_is_valid = (math.isinf(current_gns_t) and current_gns_t > 0 and mu_norm_sq_gns < cfg.gns_mu_norm_sq_conv_thresh)
 
                     if gns_inf_is_valid:
                         gns_t_met_primary = True
-                        gns_t_is_stable_disp = True # Considerado estável
-                        gns_t_cond_str = "> dyn (inf valid)"
+                        gns_t_is_stable_disp = True
+                        gns_t_prim_cond_text = "P:inf valid"
+                        gns_t_stab_cond_text = "S:inf valid"
                     elif not math.isinf(current_gns_t):
                         median_gns_t = float(np.median(list(gns_temporal_hist_vals)))
                         q75_gns_t, q25_gns_t = np.percentile(list(gns_temporal_hist_vals), [75, 25])
@@ -601,24 +636,24 @@ class ConvergeControl:
                         dynamic_gns_thresh_display = median_gns_t + cfg.gns_temporal_k_iqr_factor * iqr_gns_t
                         if iqr_gns_t <= 1e-9: dynamic_gns_thresh_display = median_gns_t
                         gns_t_met_primary = current_gns_t >= dynamic_gns_thresh_display
-                        gns_t_cond_str = f">= {dynamic_gns_thresh_display:.2f} (μ_med+kσ)"
+                        gns_t_prim_cond_text = f"P:>={dynamic_gns_thresh_display:.2f}"
                         if gns_t_stability_hist and len(gns_t_stability_hist) >= cfg.gns_t_stability_window_len:
                             std_gns_t_stability = np.std(list(gns_t_stability_hist))
                             gns_t_is_stable_disp = std_gns_t_stability < cfg.gns_t_stability_std_thresh
-                            gns_t_cond_str += f"\nσ(GNS)<{cfg.gns_t_stability_std_thresh:.2f} ({std_gns_t_stability:.2f})"
+                            gns_t_stab_cond_text = f"S:σ<{cfg.gns_t_stability_std_thresh:.2f} ({std_gns_t_stability:.2f})"
                         else:
-                            gns_t_cond_str += f"\nσ(GNS) N/A (hist:{len(gns_t_stability_hist)}/{cfg.gns_t_stability_window_len})"
-
-                    else: # GNS é -inf ou NaN
-                        gns_t_cond_str = "invalid GNS"
+                             gns_t_stab_cond_text = f"S:hist<{len(gns_t_stability_hist)}/{cfg.gns_t_stability_window_len}"
+                    else:
+                        gns_t_prim_cond_text = "P:invalid GNS"
+                        gns_t_stab_cond_text = "S:invalid GNS"
                 
-                gns_t_color = "green" if gns_t_met_primary and gns_t_is_stable_disp else "red"
-                gns_t_count_str = f" ({self.stable_green_gns_t_steps.get(name,0)}/{cfg.gns_t_stable_confirm_steps})"
-                table.add_row("GNS-T", f"[{gns_t_color}]{gns_t_val_str}[/{gns_t_color}]{gns_t_count_str}", gns_t_cond_str)
+                gns_t_cell = self._format_metric_cell(current_gns_t, self.stable_green_gns_t_steps.get(name,0),
+                                                      cfg.gns_t_stable_confirm_steps, gns_t_prim_cond_text,
+                                                      gns_t_stab_cond_text, gns_t_met_primary, gns_t_is_stable_disp, value_format="{:.2f}")
 
-                # --- SNR * GNS-T (informativo) ---
-                # (como antes)
+                # --- SNR*GNS Cell ---
                 snr_gns_product_str = "N/A"
+                # (Lógica para calcular snr_gns_product_str como antes)
                 actual_current_snr_for_prod = snr_hist_vals[-1] if snr_hist_vals else np.nan
                 actual_current_gns_t_for_prod = gns_temporal_hist_vals[-1] if gns_temporal_hist_vals else np.nan
                 if not np.isnan(actual_current_snr_for_prod) and \
@@ -627,24 +662,25 @@ class ConvergeControl:
                     abs(actual_current_gns_t_for_prod) > 1e-9:
                     snr_gns_product = actual_current_snr_for_prod * actual_current_gns_t_for_prod
                     snr_gns_product_str = f"{snr_gns_product:.2f}"
-                table.add_row("SNR*GNS", snr_gns_product_str, "≈1?")
 
 
-                status_text = "[green]✓ FROZEN[/]" if is_frozen else "[red]✗ Active[/]"
-                # Poderíamos adicionar mais detalhes ao status ativo, como "Prog: X%"
-                if not is_frozen:
+                # --- Status Cell ---
+                status_text_obj = Text()
+                if is_frozen:
+                    status_text_obj = Text("✓ FROZEN", style="green")
+                else:
                     total_target_steps = cfg.gd_stable_confirm_steps + cfg.snr_stable_confirm_steps + cfg.gns_t_stable_confirm_steps
                     current_total_steps = self.stable_green_gd_steps.get(name,0) + \
                                           self.stable_green_snr_steps.get(name,0) + \
                                           self.stable_green_gns_t_steps.get(name,0)
-                    if total_target_steps > 0 :
+                    prog_percent = 0
+                    if total_target_steps > 0:
                         prog_percent = (current_total_steps / total_target_steps) * 100
-                        status_text = f"[yellow]✗ Active ({prog_percent:.0f}%)[/]"
+                    status_text_obj = Text(f"✗ Active ({prog_percent:.0f}%)", style="yellow" if prog_percent > 0 else "red")
 
 
-                table.add_row("Status", status_text, "")
-
-                # ... (lógica de nome do painel como antes) ...
+                # --- Module Name Cell (shortened) ---
+                # (Lógica de encurtamento de nome como antes)
                 original_module_name = name
                 base_short_name = original_module_name 
                 parts = original_module_name.split('_')
@@ -653,71 +689,30 @@ class ConvergeControl:
                     last_meaningful_index = len(parts)
                     while last_meaningful_index > 0 and parts[last_meaningful_index - 1].isdigit():
                         last_meaningful_index -= 1
-
                     temp_end_segments = []
-                    current_idx = last_meaningful_index - 1 
+                    current_idx_name = last_meaningful_index - 1 
                     segments_taken_from_end = 0 
-
-                    while current_idx >= 0 and segments_taken_from_end < 3:
-                        if parts[current_idx] in ["blocks", "attentions"] and current_idx < 5 and len(parts) > 7: break
-                        if current_idx <= 2 and len(parts) < 6: break
-                        temp_end_segments.insert(0, parts[current_idx])
+                    while current_idx_name >= 0 and segments_taken_from_end < 3:
+                        if parts[current_idx_name] in ["blocks", "attentions"] and current_idx_name < 5 and len(parts) > 7: break
+                        if current_idx_name <= 2 and len(parts) < 6: break
+                        temp_end_segments.insert(0, parts[current_idx_name])
                         segments_taken_from_end += 1
-                        current_idx -= 1
+                        current_idx_name -= 1
                     if temp_end_segments:
                         end_part = "_".join(temp_end_segments)
                         base_short_name = f"{third_segment_from_start}_{end_part}"
                     else: 
                         base_short_name = third_segment_from_start
-                elif len(original_module_name) > 30: 
-                    base_short_name = original_module_name[:15] + "..." + original_module_name[-12:]
-                final_panel_title = base_short_name
+                elif len(original_module_name) > 25 : # Shorten very long names if not fitting pattern
+                    base_short_name = original_module_name[:12] + "..." + original_module_name[-10:]
+                
+                table.add_row(base_short_name, gd_cell, snr_cell, gns_t_cell, snr_gns_product_str, status_text_obj)
+            
+            tables.append(table)
 
-
-                cards.append(Panel(
-                    table,
-                    expand=True,
-                    title=final_panel_title,
-                    border_style="blue", # Ou use 'progress_color'
-                ))
-
-
-            if not cards:
-                return Text("Sem módulos ativos para convergência.", justify="center")
-
-            num_target_columns = 5
-
-            # Se houver menos cards que colunas, ou apenas 1 card, tratar de forma simples
-            if len(cards) == 0: # Já coberto acima, mas para segurança
-                return Text("Sem módulos ativos para convergência.", justify="center")
-            if len(cards) == 1:
-                # Para um único card, podemos apenas retorná-lo ou envolvê-lo em um Group simples
-                # Para garantir que ele possa se expandir, é melhor não usar Columns aqui.
-                # Um Panel com expand=True sozinho tentará ocupar o espaço disponível.
-                # Ou, se quiser centralizado, Align.center(cards[0])
-                return Group(*cards) # Ou Align.center(cards[0])
-
-            # Criar o Layout principal para as colunas
-            column_layout = Layout(name="converge_columns_wrapper")
-
-            # Definir os nomes e ratios para as colunas do Layout
-            # Todos com ratio=1 para tentar divisão igualitária
-            layout_column_definitions = [
-                Layout(name=f"layout_col_{i}", ratio=1) for i in range(num_target_columns)
-            ]
-            column_layout.split_row(*layout_column_definitions)
-
-            # Distribuir os cards nas colunas do Layout
-            # Criaremos um Group de cards para cada coluna do Layout
-            cards_in_layout_columns = [[] for _ in range(num_target_columns)]
-            for i, card_panel in enumerate(cards):
-                cards_in_layout_columns[i % num_target_columns].append(card_panel)
-
-            # Atualizar cada coluna do Layout com seu grupo de cards
-            for i in range(num_target_columns):
-                if cards_in_layout_columns[i]: # Se a coluna tem cards
-                    column_layout[f"layout_col_{i}"].update(Group(*cards_in_layout_columns[i]))
-                else: # Se a coluna ficar vazia (menos cards que colunas)
-                    column_layout[f"layout_col_{i}"].update("") # Deixa vazia
-
-            return column_layout
+        if not tables: # Should not happen if monitored_modules is not empty
+             return Text("No data to display.", justify="center")
+        if len(tables) == 1:
+            return tables[0] # Se apenas uma tabela for populada (ex: poucos módulos)
+            
+        return Columns(tables, expand=True, equal=False, padding=1)

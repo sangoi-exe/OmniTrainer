@@ -20,7 +20,6 @@ from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 
-
 from modules.util import create, path_util
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
@@ -44,7 +43,7 @@ from modules.util.TensorBoardManager import TensorBoardManager
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
-from tqdm import tqdm
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, TaskProgressColumn, SpinnerColumn
 from requests.exceptions import ConnectionError
 
 from modules.sangoi.ConvergeControl import ConvergeControl
@@ -58,9 +57,11 @@ from rich.live import Live
 from rich.layout import Layout
 from rich.text import Text
 
+
 def format_time_delta(seconds: float) -> str:
-    if seconds < 0 or not isinstance(seconds, (int, float)): return "??:??" # Lida com valores inválidos
-    seconds = abs(seconds) # Garante que é positivo para cálculo
+    if seconds < 0 or not isinstance(seconds, (int, float)):
+        return "??:??"  # Lida com valores inválidos
+    seconds = abs(seconds)  # Garante que é positivo para cálculo
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -68,6 +69,7 @@ def format_time_delta(seconds: float) -> str:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     else:
         return f"{minutes:02d}:{secs:02d}"
+
 
 class GenericTrainer(BaseTrainer):
     model_loader: BaseModelLoader
@@ -86,8 +88,8 @@ class GenericTrainer(BaseTrainer):
     adaptive_dcoef: AdaptiveDCoef | None
     recorder: DataRecorder | None
     converge_control: ConvergeControl | None
-    is_run2: bool # Flag to easily check run mode
-    _temp_recorder_data: collections.defaultdict # Temporary storage for recorder data before log_step
+    is_run2: bool  # Flag to easily check run mode
+    _temp_recorder_data: collections.defaultdict  # Temporary storage for recorder data before log_step
 
     adaptive_dcoef_normal_d_coef: float
     adaptive_dcoef_fine_tune_d_coef: float
@@ -99,37 +101,36 @@ class GenericTrainer(BaseTrainer):
     adaptive_dcoef_initial_boost_d_coef: float
     adaptive_dcoef_convergence_threshold_low: float
     adaptive_dcoef_convergence_threshold_high: float
-    data_recorder_run1_path: Optional[str] # Caminho para o dump da Run 1
+    data_recorder_run1_path: Optional[str]  # Caminho para o dump da Run 1
 
     # atributos para pause
     is_paused: bool
-    pause_request_locked: bool # Para travar o switch da UI
+    pause_request_locked: bool  # Para travar o switch da UI
     pause_requested_at_epoch_end: bool
-    
-    _rich_layout: Optional[Layout] = None # Para o Live display
+
+    _rich_layout: Optional[Layout] = None  # Para o Live display
+    _rich_progress_footer: Optional[Progress] = None  # Para as barras no rodapé
 
     _current_step_duration_s: float = 0.0
     _epoch_time_elapsed_s: float = 0.0
     _avg_step_time_epoch_s: float = 0.0
-    _ema_step_time_s: Optional[float] = None # Para média móvel exponencial
-    _ema_alpha: float = 0.05 # Ajuste para mais ou menos suavização (menor = mais suave)
-    _total_training_time_start_s: Optional[float] = None # Para tempo total de treino
-    
-    _epoch_start_time_s: Optional[float] = None # Para calcular tempo da epoch e ETA
+    _ema_step_time_s: Optional[float] = None  # Para média móvel exponencial
+    _ema_alpha: float = 0.05  # Ajuste para mais ou menos suavização (menor = mais suave)
+    _total_training_time_start_s: Optional[float] = None  # Para tempo total de treino
+
+    _epoch_start_time_s: Optional[float] = None  # Para calcular tempo da epoch e ETA
     _num_total_epochs: int = 0
-    _steps_per_epoch: int = 0    
+    _steps_per_epoch: int = 0
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
 
         tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
         os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
-        self.tensorboard = TensorBoardManager(
-            log_dir=os.path.join(
-                tensorboard_log_dir,
-                f"{config.save_filename_prefix}{get_string_timestamp()}",
-            )
-        )
+        self.tensorboard = TensorBoardManager(log_dir=os.path.join(
+            tensorboard_log_dir,
+            f"{config.save_filename_prefix}{get_string_timestamp()}",
+        ))
         if config.tensorboard:
             super()._start_tensorboard()
 
@@ -144,21 +145,36 @@ class GenericTrainer(BaseTrainer):
         self.train_dtype = None
         self.pause_request_locked = False
         self.pause_requested_at_epoch_end = False
-        self.train_device =  torch.device(getattr(self.config, "train_device"))
+        self.train_device = torch.device(getattr(self.config, "train_device"))
 
         self.adaptive_dcoef_fine_tune_d_coef = getattr(config, "adaptive_dcoef_fine_tune_d_coef", 0.25)
         self.adaptive_dcoef_normal_d_coef = getattr(config, "adaptive_dcoef_normal_d_coef", 1.0)
         self.adaptive_dcoef_base_d_coef = getattr(config, "adaptive_dcoef_base_d_coef", 1.0)
         self.adaptive_dcoef_pivot_score = getattr(config, "adaptive_dcoef_pivot_score", 0.5)
         self.adaptive_dcoef_initial_boost_d_coef = getattr(config, "adaptive_dcoef_initial_boost_d_coef", 2.0)
-        self.adaptive_dcoef_modulation_strength = getattr(config, "adaptive_dcoef_modulation_strength", 0.4) 
+        self.adaptive_dcoef_modulation_strength = getattr(config, "adaptive_dcoef_modulation_strength", 0.4)
         self.adaptive_dcoef_min_global_target = getattr(config, "adaptive_dcoef_min_global_target", 0.5)
         self.adaptive_dcoef_max_global_target = getattr(config, "adaptive_dcoef_max_global_target", 2.0)
-        self.adaptive_dcoef_convergence_threshold_low = getattr(config, "adaptive_dcoef_convergence_threshold_low", 0.33)
-        self.adaptive_dcoef_convergence_threshold_high = getattr(config, "adaptive_dcoef_convergence_threshold_high", 0.66)
+        self.adaptive_dcoef_convergence_threshold_low = getattr(config, "adaptive_dcoef_convergence_threshold_low",
+                                                                0.33)
+        self.adaptive_dcoef_convergence_threshold_high = getattr(config, "adaptive_dcoef_convergence_threshold_high",
+                                                                 0.66)
         self.data_recorder_run1_path = getattr(config, "adpt_dcoef_path", None)
 
         self.console = RichConsole()
+        # // GEMINI-CODE 2024-08-29T11:00:00 - Inicializa o objeto Progress para o rodapé
+        self._rich_progress_footer = Progress(
+            SpinnerColumn(),
+            "[progress.description]{task.description}",
+            BarColumn(),
+            TaskProgressColumn(),  # Mostra X/Y ou porcentagem
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            TextColumn("• {task.speed:.2f} it/s"),
+            console=self.console,
+            transient=True,  # Limpa a barra quando concluída
+            refresh_per_second=4  # Taxa de atualização para as barras no rodapé
+        )
         self._setup_rich_layout()
         self._num_total_epochs = config.epochs
 
@@ -177,115 +193,112 @@ class GenericTrainer(BaseTrainer):
             # Recorder is active based on its flag. Its behavior (recording) is mainly for Run 1,
             # but it might be optionally used in Run 2 for analysis if needed.
             # No specific check for run_number needed here for activation, just for the 'purpose' log maybe.
-            self.recorder = DataRecorder(
-                debug=self.recorder_debug,
-                verbose=self.recorder_verbose
-            )
+            self.recorder = DataRecorder(debug=self.recorder_debug, verbose=self.recorder_verbose)
             purpose = "coleta de dados" if self.run_number == 1 else "gravação opcional de dinâmica"
-            logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.", lvl="debug")
+            logFun(f"[DataRecorder] Inicializado (flag data_recorder=True) para {purpose} na Run {self.run_number}.",
+                   lvl="debug")
         else:
-            logFun("[DataRecorder] Desativado (flag data_recorder=False).", lvl="debug")        
+            logFun("[DataRecorder] Desativado (flag data_recorder=False).", lvl="debug")
 
         # 2. AdaptiveDCoef
         self.adaptive_dcoef = None
         if self.run_number == 2 and getattr(self.config, "adpt_dcoef_use_it", False):
             try:
-                self.adaptive_dcoef = AdaptiveDCoef(
-                    debug=self.dcoef_debug,
-                    verbose=self.dcoef_verbose
-                )
+                self.adaptive_dcoef = AdaptiveDCoef(debug=self.dcoef_debug, verbose=self.dcoef_verbose)
                 logFun(f"[AdaptiveDCoef] Inicializado com sucesso para Run 2.", lvl="success")
                 if self.data_recorder_run1_path:
-                    logFun(f"[AdaptiveDCoef] Tentando carregar perfil da Run 1 de: {self.data_recorder_run1_path}", lvl="info")
+                    logFun(f"[AdaptiveDCoef] Tentando carregar perfil da Run 1 de: {self.data_recorder_run1_path}",
+                           lvl="info")
                     self.adaptive_dcoef.load_prodigy_d_final_run1(self.data_recorder_run1_path)
                 else:
-                    logFun("[AdaptiveDCoef] Caminho do perfil da Run 1 (adpt_dcoef_profile_path) não fornecido. 'd_pdgy_final' não será carregado.", lvl="warning")
-            except Exception as e: 
-                  logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="warning") 
-                  traceback.print_exc()
-                  self.adaptive_dcoef = None 
-        elif getattr(self.config, "adpt_dcoef_use_it", False) and self.run_number != 2 : 
+                    logFun(
+                        "[AdaptiveDCoef] Caminho do perfil da Run 1 (adpt_dcoef_profile_path) não fornecido. 'd_pdgy_final' não será carregado.",
+                        lvl="warning")
+            except Exception as e:
+                logFun(
+                    f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.",
+                    lvl="warning")
+                traceback.print_exc()
+                self.adaptive_dcoef = None
+        elif getattr(self.config, "adpt_dcoef_use_it", False) and self.run_number != 2:
             try:
-                self.adaptive_dcoef = AdaptiveDCoef(
-                    debug=self.dcoef_debug,
-                    verbose=self.dcoef_verbose
-                )
+                self.adaptive_dcoef = AdaptiveDCoef(debug=self.dcoef_debug, verbose=self.dcoef_verbose)
                 logFun(f"[AdaptiveDCoef] Inicializado com sucesso para Run 1.", lvl="success")
-            except Exception as e: 
-                  logFun(f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.", lvl="warning") 
-                  traceback.print_exc()                
+            except Exception as e:
+                logFun(
+                    f"[Trainer Aviso] Falha ao inicializar AdaptiveDCoef para Run 2: {e}. d_coef dinâmico será desativado.",
+                    lvl="warning")
+                traceback.print_exc()
         else:
-              logFun("[AdaptiveDCoef] Desativado (flag adpt_dcoef_use_it=False).", lvl="debug")                
+            logFun("[AdaptiveDCoef] Desativado (flag adpt_dcoef_use_it=False).", lvl="debug")
 
     def _setup_rich_layout(self):
         """Configura o layout base para o Rich Live display."""
         self._rich_layout = Layout(name="root")
-        self._rich_layout.split_column(
-            Layout(name="header", size=1), # Mantém size=1, o Text vai se ajustar
-            Layout(name="main_content", size=3),
-            Layout(name="converge_control_status", ratio=5, visible=False),
-            Layout(name="footer", size=1)
-        )
-        # // GEMINI-CODE {timestamp} - Atualiza o header inicialmente
-        self._rich_layout["main_content"].update(Text("Aguardando início do treinamento...", justify="center"))
-        self._rich_layout["footer"].update(Text("Ctrl+C para parar", justify="right", style="dim"))
+        # // GEMINI-CODE 2024-08-29T11:00:00 - Layout ajustado para remover header e incluir área de progresso no footer
+        self._rich_layout.split_column(Layout(name="main_content", size=3),
+                                       Layout(name="converge_control_status", ratio=5, visible=False),
+                                       Layout(name="footer_tqdm_area", size=2))
+        # // GEMINI-CODE 2024-08-29T10:30:01 - Atualiza o main_content inicialmente e placeholder para novo footer
+        self._rich_layout["main_content"].update(
+            Text("Aguardando início do treinamento...\n(Ctrl+C para parar)", justify="center", style="dim"))
+        self._rich_layout["footer_tqdm_area"].update(
+            self._rich_progress_footer)  # Área do rodapé agora usa o objeto Progress
 
     # // GEMINI-CODE {timestamp} - NOVA FUNÇÃO PARA ATUALIZAR O HEADER
-    def _generate_main_content_text(self, current_loss: Optional[float] = None, current_ema_loss: Optional[float] = None) -> Text:
+    def _generate_main_content_text(self,
+                                    current_loss: Optional[float] = None,
+                                    current_ema_loss: Optional[float] = None) -> Text:
         tp = self.model.train_progress if self.model and hasattr(self.model, 'train_progress') else None
-        
+
         # Linha 1: Progresso Epoch/Step
         epoch_str = f"Epoch: {tp.epoch + 1}/{self._num_total_epochs}" if tp else f"Epoch: ?/{self._num_total_epochs}"
         step_str = f"Step: {tp.epoch_step + 1}/{self._steps_per_epoch}" if tp and self._steps_per_epoch > 0 else "Step: ?"
         global_step_str = f"Global: {tp.global_step + 1}" if tp else "Global: ?"
-        line1 = Text.assemble((epoch_str, "bold cyan"), " | ", (step_str, "bold cyan"), " | ", (global_step_str, "dim cyan"))
+        line1 = Text.assemble((epoch_str, "bold cyan"), " | ", (step_str, "bold cyan"), " | ",
+                              (global_step_str, "dim cyan"))
 
         # Linha 2: Losses
         loss_str = f"Loss: {current_loss:.4f}" if current_loss is not None else "Loss: N/A"
         ema_loss_str = f"Smooth: {current_ema_loss:.4f}" if current_ema_loss is not None else "Smooth: N/A"
         line2 = Text.assemble((loss_str, "yellow"), " | ", (ema_loss_str, "bright_yellow"))
-        
+
         # Linha 3: Temporização
         step_time_disp = f"StepTime: {self._current_step_duration_s:.2f}s"
-        
+
         effective_avg_step_time = self._avg_step_time_epoch_s
         if self._ema_step_time_s is not None and self._ema_step_time_s > 0:
             effective_avg_step_time = self._ema_step_time_s
-        
+
         avg_step_disp = f"AvgStep: {effective_avg_step_time:.2f}s/it" if effective_avg_step_time > 0 else "AvgStep: Calc..."
         epoch_elapsed_disp = f"EpochElap: {format_time_delta(self._epoch_time_elapsed_s)}"
-        
+
         eta_epoch_disp = "ETAEpoch: Calc..."
         if tp and self._steps_per_epoch > 0 and effective_avg_step_time > 0:
             remaining_steps = self._steps_per_epoch - (tp.epoch_step + 1)
-            if remaining_steps >= 0: # >=0 para incluir o caso do último step
+            if remaining_steps >= 0:  # >=0 para incluir o caso do último step
                 eta_s = remaining_steps * effective_avg_step_time
                 eta_epoch_disp = f"ETAEpoch: {format_time_delta(eta_s)}"
             # Se remaining_steps < 0, algo está errado ou a epoch acabou
             # elif tp.epoch_step + 1 >= self._steps_per_epoch:
             # eta_epoch_disp = "ETAEpoch: Done!"
 
-
         total_time_str = ""
         if self._total_training_time_start_s is not None:
             total_elapsed = time.monotonic() - self._total_training_time_start_s
             total_time_str = f"TotalRun: {format_time_delta(total_elapsed)}"
 
-        line3 = Text.assemble(
-            (step_time_disp, "green"), " | ",
-            (avg_step_disp, "blue"), " | ",
-            (epoch_elapsed_disp, "magenta"), " | ",
-            (eta_epoch_disp, "magenta"),
-            (" | " + total_time_str if total_time_str else "", "dim white")
-        )
-        
+        line3 = Text.assemble((step_time_disp, "green"), " | ", (avg_step_disp, "blue"), " | ",
+                              (epoch_elapsed_disp, "magenta"), " | ", (eta_epoch_disp, "magenta"),
+                              (" | " + total_time_str if total_time_str else "", "dim white"))
+
         # Combina as linhas com quebras de linha, centralizadas
         final_text = Text("\n", justify="center").join([line1, line2, line3])
         return final_text
 
     def start(self):
         set_logfun_console(self.console)
-        
+
         self.__save_config_to_workspace()
 
         if self.config.clear_cache_before_training and self.config.latent_caching:
@@ -343,12 +356,9 @@ class GenericTrainer(BaseTrainer):
         self.model.eval()
         torch_gc()
 
-
         self.callbacks.on_update_status("creating the data loader/caching")
 
-        self.data_loader = self.create_data_loader(
-            self.model, self.model.train_progress
-        )
+        self.data_loader = self.create_data_loader(self.model, self.model.train_progress)
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -357,30 +367,29 @@ class GenericTrainer(BaseTrainer):
 
         self.parameters = self.model.parameters.parameters()
         if self.config.validation:
-            self.validation_data_loader = self.create_data_loader(
-                self.model, self.model.train_progress, is_validation=True
-            )
+            self.validation_data_loader = self.create_data_loader(self.model,
+                                                                  self.model.train_progress,
+                                                                  is_validation=True)
 
-        # iniciando o convergecontrol aqui pra poder usar a função de calcular o tamanho do treino        
+        # iniciando o convergecontrol aqui pra poder usar a função de calcular o tamanho do treino
         if getattr(self.config, "convctrl_use_it", False):
             converge_control_instance = ConvergeControl(
-                run_number=self.run_number, # Passa o run_number atual do Trainer
-                # Nenhum 'cfg' ou 'default_cfg_override' é passado aqui
+                run_number=self.run_number,  # Passa o run_number atual do Trainer
                 verbose=self.converge_verbose,
                 debug=self.converge_debug,
-            )
-            
+                data_recorder=self.recorder)
+
             self.converge_control = converge_control_instance
-            logFun(f"[ConvergeControl] Inicializado com sucesso para Run {self.run_number} (usando padrões internos).", lvl="debug")
+            logFun(f"[ConvergeControl] Inicializado com sucesso para Run {self.run_number} (usando padrões internos).",
+                   lvl="debug")
             if self._rich_layout:
-                self._rich_layout["converge_control_status"].visible = True            
+                self._rich_layout["converge_control_status"].visible = True
         else:
-            self.converge_control = None 
+            self.converge_control = None
             logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug")
             if self._rich_layout:
                 self._rich_layout["converge_control_status"].visible = False
 
-            
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
         os.makedirs(Path(path).absolute(), exist_ok=True)
@@ -389,27 +398,29 @@ class GenericTrainer(BaseTrainer):
             json.dump(self.config.to_pack_dict(secrets=False), f, indent=4)
 
     def __clear_cache(self):
-        print(
-            f"Clearing cache directory {self.config.cache_dir}!"
-            f"You can disable this if you want to continue using the same cache."
-        )
+        print(f"Clearing cache directory {self.config.cache_dir}!"
+              f"You can disable this if you want to continue using the same cache.")
         if os.path.isdir(self.config.cache_dir):
-            for filename in os.listdir(self.config.cache_dir):
-                path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (
-                    filename.startswith("epoch-") or filename in ["image", "text"]
-                ):
+            # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress
+            files_to_delete = [
+                f for f in os.listdir(self.config.cache_dir)
+                if os.path.isdir(os.path.join(self.config.cache_dir, f)) and
+                (f.startswith("epoch-") or f in ["image", "text"])]
+            if files_to_delete and self._rich_progress_footer:
+                task_id = self._rich_progress_footer.add_task("Limpando cache...", total=len(files_to_delete))
+                for filename in files_to_delete:
+                    path = os.path.join(self.config.cache_dir, filename)
                     shutil.rmtree(path)
+                    self._rich_progress_footer.update(task_id, advance=1)
+                self._rich_progress_footer.remove_task(task_id)
 
     def __prune_backups(self, backups_to_keep: int):
         backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
         if os.path.exists(backup_dirpath):
             backup_directories = sorted(
                 [
-                    dirpath
-                    for dirpath in os.listdir(backup_dirpath)
-                    if os.path.isdir(os.path.join(backup_dirpath, dirpath))
-                ],
+                    dirpath for dirpath in os.listdir(backup_dirpath)
+                    if os.path.isdir(os.path.join(backup_dirpath, dirpath))],
                 reverse=True,
             )
 
@@ -462,10 +473,7 @@ class GenericTrainer(BaseTrainer):
                     )
 
                     def on_sample_default(sampler_output: ModelSamplerOutput):
-                        if (
-                            self.config.samples_to_tensorboard
-                            and sampler_output.file_type == FileType.IMAGE
-                        ):
+                        if (self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE):
                             self.tensorboard.add_image(
                                 f"sample{str(i)} - {safe_prompt}",
                                 pil_to_tensor(sampler_output.data),  # noqa: B023
@@ -476,14 +484,9 @@ class GenericTrainer(BaseTrainer):
                     def on_sample_custom(sampler_output: ModelSamplerOutput):
                         self.callbacks.on_sample_custom(sampler_output)
 
-                    on_sample = (
-                        on_sample_custom if is_custom_sample else on_sample_default
-                    )
-                    on_update_progress = (
-                        self.callbacks.on_update_sample_custom_progress
-                        if is_custom_sample
-                        else self.callbacks.on_update_sample_default_progress
-                    )
+                    on_sample = (on_sample_custom if is_custom_sample else on_sample_default)
+                    on_update_progress = (self.callbacks.on_update_sample_custom_progress
+                                          if is_custom_sample else self.callbacks.on_update_sample_default_progress)
 
                     self.model.to(self.temp_device)
                     self.model.eval()
@@ -566,9 +569,7 @@ class GenericTrainer(BaseTrainer):
     def __validate(self, train_progress: TrainProgress):
         if self.__needs_validate(train_progress):
             self.validation_data_loader.get_data_set().start_next_epoch()
-            current_epoch_length_validation = (
-                self.validation_data_loader.get_data_set().approximate_length()
-            )
+            current_epoch_length_validation = (self.validation_data_loader.get_data_set().approximate_length())
 
             if current_epoch_length_validation == 0:
                 return
@@ -578,63 +579,61 @@ class GenericTrainer(BaseTrainer):
 
             torch_gc()
 
-            step_tqdm_validation = tqdm(
-                self.validation_data_loader.get_data_loader(),
-                desc="validation_step",
-                total=current_epoch_length_validation,
-            )
-
             accumulated_loss_per_concept = {}
             concept_counts = {}
             mapping_seed_to_label = {}
             mapping_label_to_seed = {}
 
-            for validation_batch in step_tqdm_validation:
-                if self.__needs_gc(train_progress):
-                    torch_gc()
+            # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress para validação
+            validation_task_id = None
+            if self._rich_progress_footer:
+                validation_task_id = self._rich_progress_footer.add_task("Validação...",
+                                                                         total=current_epoch_length_validation)
 
-                with torch.no_grad():
-                    model_output_data = self.model_setup.predict(
-                        self.model,
-                        validation_batch,
-                        self.config,
-                        train_progress,
-                        deterministic=True,
-                    )
-                    loss_validation = self.model_setup.calculate_loss(
-                        self.model, validation_batch, model_output_data, self.config
-                    )
+            try:
+                for validation_batch in self.validation_data_loader.get_data_loader():
+                    if self.__needs_gc(train_progress):
+                        torch_gc()
 
-                # since validation batch size = 1
-                concept_name = validation_batch["concept_name"][0]
-                concept_path = validation_batch["concept_path"][0]
-                concept_seed = validation_batch["concept_seed"].item()
-                loss = loss_validation.item()
+                    with torch.no_grad():
+                        model_output_data = self.model_setup.predict(
+                            self.model,
+                            validation_batch,
+                            self.config,
+                            train_progress,
+                            deterministic=True,
+                        )
+                        loss_validation = self.model_setup.calculate_loss(self.model, validation_batch,
+                                                                          model_output_data, self.config)
 
-                label = concept_name if concept_name else os.path.basename(concept_path)
-                # check and fix collision to display both graphs in tensorboard
-                if (
-                    label in mapping_label_to_seed
-                    and mapping_label_to_seed[label] != concept_seed
-                ):
-                    suffix = 1
-                    new_label = f"{label}({suffix})"
-                    while (
-                        new_label in mapping_label_to_seed
-                        and mapping_label_to_seed[new_label] != concept_seed
-                    ):
-                        suffix += 1
+                    # since validation batch size = 1
+                    concept_name = validation_batch["concept_name"][0]
+                    concept_path = validation_batch["concept_path"][0]
+                    concept_seed = validation_batch["concept_seed"].item()
+                    loss = loss_validation.item()
+
+                    label = concept_name if concept_name else os.path.basename(concept_path)
+                    # check and fix collision to display both graphs in tensorboard
+                    if (label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed):
+                        suffix = 1
                         new_label = f"{label}({suffix})"
-                    label = new_label
+                        while (new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed):
+                            suffix += 1
+                            new_label = f"{label}({suffix})"
+                        label = new_label
 
-                if concept_seed not in mapping_seed_to_label:
-                    mapping_seed_to_label[concept_seed] = label
-                    mapping_label_to_seed[label] = concept_seed
+                    if concept_seed not in mapping_seed_to_label:
+                        mapping_seed_to_label[concept_seed] = label
+                        mapping_label_to_seed[label] = concept_seed
 
-                accumulated_loss_per_concept[concept_seed] = (
-                    accumulated_loss_per_concept.get(concept_seed, 0) + loss
-                )
-                concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
+                    accumulated_loss_per_concept[concept_seed] = (accumulated_loss_per_concept.get(concept_seed, 0) +
+                                                                  loss)
+                    concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
+                    if validation_task_id is not None and self._rich_progress_footer:
+                        self._rich_progress_footer.update(validation_task_id, advance=1)
+            finally:
+                if validation_task_id is not None and self._rich_progress_footer:
+                    self._rich_progress_footer.remove_task(validation_task_id)
 
             for concept_seed, total_loss in accumulated_loss_per_concept.items():
                 average_loss = total_loss / concept_counts[concept_seed]
@@ -646,9 +645,7 @@ class GenericTrainer(BaseTrainer):
                 )
 
             if len(concept_counts) > 1:
-                total_loss = sum(
-                    accumulated_loss_per_concept[key] for key in concept_counts
-                )
+                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
                 total_count = sum(concept_counts[key] for key in concept_counts)
                 total_average_loss = total_loss / total_count
 
@@ -678,14 +675,12 @@ class GenericTrainer(BaseTrainer):
         train_progress: TrainProgress,
         print_msg: bool = True,
         print_cb: Callable[[str], None] = print,
-    ):
+    ):  # // GEMINI-CODE 2024-08-29T11:00:00 - print_cb agora usa logFun
         torch_gc()
 
         self.callbacks.on_update_status("creating backup")
 
-        backup_name = (
-            f"{get_string_timestamp()}-backup-{train_progress.filename_string()}"
-        )
+        backup_name = (f"{get_string_timestamp()}-backup-{train_progress.filename_string()}")
         backup_path = os.path.join(self.config.workspace_dir, "backup", backup_name)
 
         # Special case for schedule-free optimizers.
@@ -695,7 +690,7 @@ class GenericTrainer(BaseTrainer):
 
         try:
             if print_msg:
-                print_cb("Creating Backup " + backup_path)
+                logFun("Creating Backup " + backup_path, lvl="LOOP") # Uso de logFun
 
             self.model_saver.save(
                 self.model,
@@ -732,7 +727,7 @@ class GenericTrainer(BaseTrainer):
         train_progress: TrainProgress,
         print_msg: bool = True,
         print_cb: Callable[[str], None] = print,
-    ):
+    ): # // GEMINI-CODE 2024-08-29T11:00:00 - print_cb agora usa logFun
         torch_gc()
 
         self.callbacks.on_update_status("saving")
@@ -743,7 +738,7 @@ class GenericTrainer(BaseTrainer):
             f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{train_progress.filename_string()}{self.config.output_model_format.file_extension()}",
         )
         if print_msg:
-            print_cb("Saving " + save_path)
+            logFun("Saving " + save_path, lvl="LOOP") # Uso de logFun
 
         try:
             if self.model.ema:
@@ -815,9 +810,7 @@ class GenericTrainer(BaseTrainer):
         )
 
     def __needs_gc(self, train_progress: TrainProgress):
-        return self.repeating_action_needed(
-            "gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False
-        )
+        return self.repeating_action_needed("gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False)
 
     def __needs_validate(self, train_progress: TrainProgress):
         return self.repeating_action_needed(
@@ -837,10 +830,7 @@ class GenericTrainer(BaseTrainer):
         )
 
     def __apply_fused_back_pass(self, scaler):
-        if (
-            self.config.optimizer.optimizer.supports_fused_back_pass()
-            and self.config.optimizer.fused_back_pass
-        ):
+        if (self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass):
             if self.config.gradient_accumulation_steps > 1:
                 print(
                     "Warning: activating fused_back_pass with gradient_accumulation_steps > 1 does not reduce VRAM usage."
@@ -853,38 +843,23 @@ class GenericTrainer(BaseTrainer):
                     if parameter.requires_grad:
                         if scaler:
 
-                            def __grad_hook(
-                                tensor: Tensor, param_group=param_group, i=i
-                            ):
+                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
                                 if self.__is_update_step(self.model.train_progress):
-                                    scaler.unscale_parameter_(
-                                        tensor, self.model.optimizer
-                                    )
+                                    scaler.unscale_parameter_(tensor, self.model.optimizer)
                                     if self.config.clip_grad_norm is not None:
-                                        nn.utils.clip_grad_norm_(
-                                            tensor, self.config.clip_grad_norm
-                                        )
-                                    scaler.maybe_opt_step_parameter(
-                                        tensor, param_group, i, self.model.optimizer
-                                    )
+                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                                    scaler.maybe_opt_step_parameter(tensor, param_group, i, self.model.optimizer)
                                     tensor.grad = None
                         else:
-                            def __grad_hook(
-                                tensor: Tensor, param_group=param_group, i=i
-                            ):
+
+                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
                                 if self.__is_update_step(self.model.train_progress):
                                     if self.config.clip_grad_norm is not None:
-                                        nn.utils.clip_grad_norm_(
-                                            tensor, self.config.clip_grad_norm
-                                        )
-                                    self.model.optimizer.step_parameter(
-                                        tensor, param_group, i
-                                    )
+                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                                    self.model.optimizer.step_parameter(tensor, param_group, i)
                                     tensor.grad = None
 
-                        handle = parameter.register_post_accumulate_grad_hook(
-                            __grad_hook
-                        )
+                        handle = parameter.register_post_accumulate_grad_hook(__grad_hook)
                         self.grad_hook_handles.append(handle)
 
     def __before_eval(self):
@@ -897,48 +872,47 @@ class GenericTrainer(BaseTrainer):
 
     def _handle_pause_logic(self):
         """Executa a lógica de pausa, movendo o modelo e esperando."""
-        if not self.is_paused: # Segurança extra
+        if not self.is_paused:  # Segurança extra
             return
 
         logFun("Iniciando Pausa...", lvl="LOOP")
         self.callbacks.on_update_status("Pausing... Moving model to CPU")
         try:
-            self.model.to(self.temp_device) # Mover para CPU
-            self.model.eval() # Garantir modo eval
-            torch_gc() # Limpar VRAM
+            self.model.to(self.temp_device)  # Mover para CPU
+            self.model.eval()  # Garantir modo eval
+            torch_gc()  # Limpar VRAM
             logFun(f"Modelo movido para {self.temp_device}. VRAM liberada.", lvl="success")
             self.callbacks.on_update_status(f"Paused. Model on {self.temp_device}. Toggle switch to resume.")
             # Notificar UI que a pausa iniciou e o switch pode ser reativado (para desligar)
             if hasattr(self.callbacks, 'on_pause_initiated'):
                 self.callbacks.on_pause_initiated()
 
-
             # Loop de espera pela retomada
             while self.is_paused:
                 if self.commands.get_stop_command():
                     logFun("Comando STOP recebido durante a pausa. Interrompendo.", lvl="warning")
-                    self.is_paused = False # Força a saída do loop de pausa
+                    self.is_paused = False  # Força a saída do loop de pausa
                     # Mantém o comando de stop ativo para o loop principal
                     break
 
                 if self.commands.get_and_reset_resume_request():
                     logFun("Comando RESUME recebido.", lvl="info")
-                    self.is_paused = False # Sinaliza para sair do loop
-                    self.pause_request_locked = False # Desbloqueia a UI
+                    self.is_paused = False  # Sinaliza para sair do loop
+                    self.pause_request_locked = False  # Desbloqueia a UI
                     # Notificar UI que o resume começou (switch ainda ativo)
                     if hasattr(self.callbacks, 'on_resume_started'):
                         self.callbacks.on_resume_started()
-                    break # Sai do loop de espera
+                    break  # Sai do loop de espera
 
-                time.sleep(0.5) # Evita busy-waiting, checa a cada 0.5s
+                time.sleep(0.5)  # Evita busy-waiting, checa a cada 0.5s
 
-            if not self.commands.get_stop_command(): # Só retoma se não for parar
+            if not self.commands.get_stop_command():  # Só retoma se não for parar
                 logFun("Retomando treinamento...", lvl="info")
                 self.callbacks.on_update_status("Resuming... Moving model to GPU")
                 try:
                     # Recarregar para o dispositivo de treino
                     self.model_setup.setup_train_device(self.model, self.config)
-                    torch_gc() # Limpeza extra
+                    torch_gc()  # Limpeza extra
                     logFun(f"Modelo movido de volta para {self.config.train_device}.", lvl="success")
                     self.callbacks.on_update_status("Training resumed.")
                     # Notificar UI que o resume foi concluído
@@ -953,11 +927,10 @@ class GenericTrainer(BaseTrainer):
             else:
                 logFun("Retomada cancelada devido ao comando STOP.", lvl="warning")
 
-
         except Exception as e:
             logFun(f"Erro durante o processo de pausa/retomada: {e}", lvl="error")
             traceback.print_exc()
-            self.is_paused = False # Garante que não fique preso no estado pausado
+            self.is_paused = False  # Garante que não fique preso no estado pausado
             self.pause_request_locked = False
             # Considerar parar o treino em caso de erro grave aqui
             self.commands.stop()
@@ -965,37 +938,36 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         scheduler_step_counter = 0
+
         # Determine target device and dtype from a model parameter if available
 
         def wrap_scheduler_step(orig_step):
+
             def wrapped(*args, **kwargs):
                 nonlocal scheduler_step_counter
                 scheduler_step_counter += 1
-                print(
-                    f"[DEBUG] scheduler.step() chamado {scheduler_step_counter} vezes"
-                )
+                print(f"[DEBUG] scheduler.step() chamado {scheduler_step_counter} vezes")
                 print(f"[DEBUG] scheduler.last_epoch = {lr_scheduler.last_epoch}")
                 return orig_step(*args, **kwargs)
 
             return wrapped
 
-        train_device = torch.device(self.config.train_device)        
+        train_device = torch.device(self.config.train_device)
 
         train_progress = self.model.train_progress
 
         if self.config.only_cache:
             self.callbacks.on_update_status("caching")
-            for _epoch in tqdm(
-                range(train_progress.epoch, self.config.epochs, 1), desc="epoch"
-            ):
-                self.data_loader.get_data_set().start_next_epoch()
-            return
+            # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress para caching
+            if self._rich_progress_footer:
+                cache_task_id = self._rich_progress_footer.add_task("Caching latents...", total=self.config.epochs - train_progress.epoch)
+                for _epoch in range(train_progress.epoch, self.config.epochs, 1):
+                    self.data_loader.get_data_set().start_next_epoch()
+                    self._rich_progress_footer.update(cache_task_id, advance=1)
+                self._rich_progress_footer.remove_task(cache_task_id)
+            return # Retorna após o caching
 
-        scaler = (
-            create_grad_scaler()
-            if enable_grad_scaling(self.config.train_dtype, self.parameters)
-            else None
-        )
+        scaler = (create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None)
 
         self.__apply_fused_back_pass(scaler)
 
@@ -1009,27 +981,31 @@ class GenericTrainer(BaseTrainer):
         lr_scheduler = None
         self._total_training_time_start_s = time.monotonic()
         # Envolver o loop de treinamento com Live
-        with Live(self._rich_layout, console=self.console, refresh_per_second=2, vertical_overflow="ellipsis", screen=False, transient=False) as live:
+        with Live(self._rich_layout,
+                  console=self.console,
+                  refresh_per_second=2,
+                  vertical_overflow="ellipsis",
+                  screen=False,
+                  transient=False) as live:
             # `screen=False` e `transient=False` para que o logFun funcione normalmente
             # Se quiser tela cheia, use screen=True, transient=True, mas logFun pode ser sobrescrito.
 
-            for _epoch in tqdm(
-                range(train_progress.epoch, self.config.epochs, 1), desc="epoch", disable=True
-            ):
+            # // GEMINI-CODE 2024-08-29T11:00:00 - tqdm removido do loop de épocas (já estava disable=True)
+            for _epoch in range(train_progress.epoch, self.config.epochs, 1):
 
                 self._epoch_start_time_s = time.monotonic()
-                self._steps_per_epoch = self.data_loader.get_data_set().approximate_length() # Pega o total de steps para a epoch atual
+                self._steps_per_epoch = self.data_loader.get_data_set().approximate_length(
+                )  # Pega o total de steps para a epoch atual
 
                 if self.is_paused:
-                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info")
+                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...",
+                           lvl="info")
                     self._handle_pause_logic()
-                    if self.commands.get_stop_command(): # Se o stop foi dado durante a pausa inicial
+                    if self.commands.get_stop_command():  # Se o stop foi dado durante a pausa inicial
                         logFun("Comando STOP ativo após pausa inicial. Encerrando.", lvl="warning")
-                        break # Sai do loop de épocas
-                    
-                # Atualizar header do layout Rich
-                header_text = Text(f"Epoch {train_progress.epoch + 1}/{self.config.epochs}", justify="center")
-                self._rich_layout["header"].update(header_text)                   
+                        break  # Sai do loop de épocas
+
+                # // GEMINI-CODE 2024-08-29T10:30:01 - Remoção da atualização do layout "header", pois foi removido. A info da época já está no main_content.
 
                 self.callbacks.on_update_status(f"training")
 
@@ -1066,24 +1042,12 @@ class GenericTrainer(BaseTrainer):
 
                 gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
                 current_epoch_length = self.data_loader.get_data_set().approximate_length()
-                # step_tqdm = tqdm(
-                #     self.data_loader.get_data_loader(),
-                #     desc="step",
-                #     total=current_epoch_length,
-                #     initial=train_progress.epoch_step,
-                # )
 
                 for batch_idx, batch in enumerate(self.data_loader.get_data_loader()):
                     step_start_time_s = time.monotonic()
-                    if (
-                        self.__needs_sample(train_progress)
-                        or self.commands.get_and_reset_sample_default_command()
-                    ):
+                    if (self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command()):
                         self.__enqueue_sample_during_training(
-                            lambda: self.__sample_during_training(
-                                train_progress, train_device
-                            )
-                        )
+                            lambda: self.__sample_during_training(train_progress, train_device))
 
                     if self.__needs_backup(train_progress):
                         self.commands.backup()
@@ -1095,16 +1059,13 @@ class GenericTrainer(BaseTrainer):
                     if sample_commands:
 
                         def create_sample_commands_fun(sample_commands):
+
                             def sample_commands_fun():
-                                self.__sample_during_training(
-                                    train_progress, train_device, sample_commands
-                                )
+                                self.__sample_during_training(train_progress, train_device, sample_commands)
 
                             return sample_commands_fun
 
-                        self.__enqueue_sample_during_training(
-                            create_sample_commands_fun(sample_commands)
-                        )
+                        self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
 
                     if self.__needs_gc(train_progress):
                         torch_gc()
@@ -1115,13 +1076,11 @@ class GenericTrainer(BaseTrainer):
 
                         if self.commands.get_and_reset_backup_command():
                             self.model.to(self.temp_device)
-                            # self.backup(train_progress, True, step_tqdm.write)
                             self.backup(train_progress, True, lambda msg: logFun(msg, lvl="LOOP"))
                             transferred_to_temp_device = True
 
                         if self.commands.get_and_reset_save_command():
                             self.model.to(self.temp_device)
-                            # self.save(train_progress, True, step_tqdm.write)
                             self.save(train_progress, True, lambda msg: logFun(msg, lvl="LOOP"))
                             transferred_to_temp_device = True
 
@@ -1156,7 +1115,7 @@ class GenericTrainer(BaseTrainer):
                     #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                     #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
                     #     record_shapes=True, profile_memory=True, with_stack=True
-                    # ) as prof:         
+                    # ) as prof:
                     with TorchMemoryRecorder(enabled=False):
                         model_output_data = self.model_setup.predict(
                             self.model,
@@ -1169,7 +1128,6 @@ class GenericTrainer(BaseTrainer):
                             predicted = model_output_data["predicted"]
                             predicted.register_hook(lambda g: g * batch["latent_mask"])
 
-
                         loss = self.model_setup.calculate_loss(
                             self.model,
                             batch,
@@ -1177,7 +1135,6 @@ class GenericTrainer(BaseTrainer):
                             self.config,
                             train_progress,
                         )
-
 
                         loss = loss / self.config.gradient_accumulation_steps
 
@@ -1189,28 +1146,21 @@ class GenericTrainer(BaseTrainer):
                         has_gradient = True
 
                         accumulated_loss += loss.item()
-                        
+
                         if self.__is_update_step(train_progress):
-                            if (
-                                scaler
-                                and self.config.optimizer.optimizer.supports_fused_back_pass()
-                                and self.config.optimizer.fused_back_pass
-                            ):
+                            if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
+                                    self.config.optimizer.fused_back_pass):
                                 scaler.step_after_unscale_parameter_(self.model.optimizer)
                                 scaler.update()
                             elif scaler:
                                 scaler.unscale_(self.model.optimizer)
                                 if self.config.clip_grad_norm is not None:
-                                    nn.utils.clip_grad_norm_(
-                                        self.parameters, self.config.clip_grad_norm
-                                    )
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                                 scaler.step(self.model.optimizer)
                                 scaler.update()
                             else:
                                 if self.config.clip_grad_norm is not None:
-                                    nn.utils.clip_grad_norm_(
-                                        self.parameters, self.config.clip_grad_norm
-                                    )
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                                 self.model.optimizer.step()
 
                             try:
@@ -1250,17 +1200,16 @@ class GenericTrainer(BaseTrainer):
                                 if self.run_number == 1 and self.recorder:
                                     for group in self.model.optimizer.param_groups:
                                         group_name = group.get("name")
-                                        d_pdgy_value = group.get('d') 
+                                        d_pdgy_value = group.get('d')
                                         if group_name and d_pdgy_value is not None:
                                             if isinstance(d_pdgy_value, torch.Tensor):
                                                 d_pdgy_value_float = d_pdgy_value.item()
                                             else:
                                                 d_pdgy_value_float = float(d_pdgy_value)
-                                            self.recorder.log_step(group_name, d_pdgy_value_float)
+                                            self.recorder.log_metrics_step(group_name, d_pdgy_value_float)
                             except Exception as e:
                                 logFun(f"Deu merda no first loop: {e}", lvl="error")
                                 traceback.print_exc()
-
 
                             # Scheduler de learning rate
                             lr_scheduler.step()
@@ -1268,44 +1217,40 @@ class GenericTrainer(BaseTrainer):
                             # Reset de gradientes
                             self.model.optimizer.zero_grad(set_to_none=True)
                             has_gradient = False
-                            
+
                             self._current_step_duration_s = time.monotonic() - step_start_time_s
                             # EMA step time
                             if self._ema_step_time_s is None:
                                 self._ema_step_time_s = self._current_step_duration_s
                             else:
-                                self._ema_step_time_s = (self._ema_alpha * self._current_step_duration_s + 
-                                                        (1 - self._ema_alpha) * self._ema_step_time_s)
+                                self._ema_step_time_s = (self._ema_alpha * self._current_step_duration_s +
+                                                         (1 - self._ema_alpha) * self._ema_step_time_s)
 
-                            self._epoch_time_elapsed_s = time.monotonic() - self._epoch_start_time_s 
+                            self._epoch_time_elapsed_s = time.monotonic() - self._epoch_start_time_s
 
                             # Média simples da epoch (se preferir em vez de EMA para ETA da epoch)
                             # epoch_step_times_sum += self._current_step_duration_s
                             # self._avg_step_time_epoch_s = epoch_step_times_sum / (train_progress.epoch_step + 1)
                             # OU usar EMA como avg_step_time_epoch_s se quiser simplificar
                             if self._ema_step_time_s is not None:
-                                self._avg_step_time_epoch_s = self._ema_step_time_s # Usar EMA para o display de AvgStep
-
+                                self._avg_step_time_epoch_s = self._ema_step_time_s  # Usar EMA para o display de AvgStep
 
                             # Atualiza o display do Rich
                             self._rich_layout["main_content"].update(
                                 self._generate_main_content_text(
-                                    current_loss=accumulated_loss, # Passe a loss do step
-                                    current_ema_loss=ema_loss      # Passe a EMA da loss
-                                )
-                            )
+                                    current_loss=accumulated_loss,  # Passe a loss do step
+                                    current_ema_loss=ema_loss  # Passe a EMA da loss
+                                ))
                             # prof.step()
 
-                            self.model_setup.report_to_tensorboard(
-                                self.model, self.config, lr_scheduler
-                            )
+                            self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler)
 
                             self.tensorboard.add_scalar(
                                 "loss/train_step",
-                                accumulated_loss, # Use .mean() se accumulated_loss for um tensor com >1 elemento
+                                accumulated_loss,  # Use .mean() se accumulated_loss for um tensor com >1 elemento
                                 train_progress.global_step,
                             )
-                            ema_loss = ema_loss or accumulated_loss # Use .item() se accumulated_loss for escalar
+                            ema_loss = ema_loss or accumulated_loss  # Use .item() se accumulated_loss for escalar
                             ema_loss = (ema_loss * 0.99) + (accumulated_loss * 0.01)
                             self.tensorboard.add_scalar(
                                 "smooth_loss/train_step",
@@ -1314,16 +1259,11 @@ class GenericTrainer(BaseTrainer):
                             )
 
                             accumulated_loss = 0.0
-                            self._rich_layout["main_content"].update(self._generate_main_content_text())
-
                             # self.model_setup.after_optimizer_step(
                             #     self.model, self.config, train_progress
                             # )
                             if self.model.ema:
-                                update_step = (
-                                    train_progress.global_step,
-                                    self.config.gradient_accumulation_steps
-                                )
+                                update_step = (train_progress.global_step, self.config.gradient_accumulation_steps)
                                 self.tensorboard.add_scalar(
                                     "ema_decay",
                                     self.model.ema.get_current_decay(update_step),
@@ -1336,18 +1276,17 @@ class GenericTrainer(BaseTrainer):
                         self.__validate(train_progress)
 
                     train_progress.next_step(self.config.batch_size)
-                    self.callbacks.on_update_train_progress(
-                        train_progress, current_epoch_length, self.config.epochs
-                    )
+                    self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
                     # ATUALIZAÇÃO DO DISPLAY DO ConvergeControl em intervalos
-                    if self.converge_control and (train_progress.global_step % 10 == 0 or train_progress.global_step == 1):
+                    if self.converge_control and (train_progress.global_step % 10 == 0 or
+                                                  train_progress.global_step == 1):
                         cc_renderable = self.converge_control.generate_status_renderable()
                         # Supondo que self._rich_layout["converge_control_status"] ainda existe
                         if self._rich_layout:
-                              self._rich_layout["converge_control_status"].update(cc_renderable)
-                        else: # Fallback se o layout específico não existir, atualiza o header ou um log
-                              self._rich_layout["converge_control_status"].update(cc_renderable)
+                            self._rich_layout["converge_control_status"].update(cc_renderable)
+                        else:  # Fallback se o layout específico não existir, atualiza o header ou um log
+                            self._rich_layout["converge_control_status"].update(cc_renderable)
                     # ATUALIZAÇÃO DO DISPLAY DO CONVERGE CONTROL AO FINAL DA ÉPOCA
                     if self.converge_control:
                         # self.converge_control.snapshot_epoch_weights() # REMOVIDO - Não existe mais
@@ -1356,29 +1295,27 @@ class GenericTrainer(BaseTrainer):
                         self._rich_layout["converge_control_status"].update(cc_renderable)
 
                 train_progress.next_epoch()
-                self.callbacks.on_update_train_progress(
-                    train_progress, current_epoch_length, self.config.epochs
-                )
+                self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
                 # Log de final de epoch no console Rich, se desejar (o header já foi atualizado)
                 final_epoch_duration = time.monotonic() - self._epoch_start_time_s
-                avg_step_final_epoch = self._avg_step_time_epoch_s # Usa o valor final calculado
+                avg_step_final_epoch = self._avg_step_time_epoch_s  # Usa o valor final calculado
                 self.console.log(
                     f"[bold green]Epoch {train_progress.epoch} concluída em {format_time_delta(final_epoch_duration)} "
-                    f"(Avg step: {avg_step_final_epoch:.3f}s/it)[/bold green]"
-                )                
+                    f"(Avg step: {avg_step_final_epoch:.3f}s/it)[/bold green]")
 
                 if self.commands.get_and_reset_pause_request():
-                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info")
+                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.",
+                           lvl="info")
                     self.pause_requested_at_epoch_end = True
-                    self.pause_request_locked = True # Trava a UI
+                    self.pause_request_locked = True  # Trava a UI
                     # Notificar a UI que a requisição foi aceita e o switch está travado
                     if hasattr(self.callbacks, 'on_pause_request_accepted'):
                         self.callbacks.on_pause_request_accepted()
 
                 # 2. Executar a pausa se foi agendada
                 if self.pause_requested_at_epoch_end and not self.is_paused:
-                    self.is_paused = True # Marca como pausado
-                    self.pause_requested_at_epoch_end = False # Limpa a flag de agendamento
+                    self.is_paused = True  # Marca como pausado
+                    self.pause_requested_at_epoch_end = False  # Limpa a flag de agendamento
                     # A trava (pause_request_locked) continua TRUE até o resume
 
                     # Chama a função que move o modelo e entra no loop de espera
@@ -1387,7 +1324,7 @@ class GenericTrainer(BaseTrainer):
                 # Checagem de STOP ao final da época
                 if self.commands.get_stop_command():
                     logFun("Comando STOP ativo no final da época. Encerrando...", lvl="info")
-                    break # Sai do loop de épocas
+                    break  # Sai do loop de épocas
 
                 # 1. TrainGPS salva os deltas da epoch (mantido, independente do CC)
                 if gps_instance is not None:
@@ -1396,43 +1333,52 @@ class GenericTrainer(BaseTrainer):
                             epoch_idx = train_progress.epoch - 1
                             gps_instance.log_group_deltas(epoch_idx)
                         except Exception as e:
-                            logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
+                            logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}",
+                                   lvl="error")
                             traceback.print_exc()
 
                 if self.run_number == 2 and self.adaptive_dcoef and gps_instance:
-                    current_target_d_coef = self.adaptive_dcoef_normal_d_coef # Default
-                    
+                    current_target_d_coef = self.adaptive_dcoef_normal_d_coef  # Default
+
                     if self.converge_control:
                         conv_score = self.converge_control.get_global_convergence_score()
                         if conv_score < self.adaptive_dcoef_convergence_threshold_low:
                             current_target_d_coef = self.adaptive_dcoef_initial_boost_d_coef
-                            logFun(f"[AdaptiveDCoef] ConvScore ({conv_score:.2f}) < LowThresh ({self.adaptive_dcoef_convergence_threshold_low:.2f}). Target D-Coef: BOOST ({current_target_d_coef})", lvl="info")
+                            logFun(
+                                f"[AdaptiveDCoef] ConvScore ({conv_score:.2f}) < LowThresh ({self.adaptive_dcoef_convergence_threshold_low:.2f}). Target D-Coef: BOOST ({current_target_d_coef})",
+                                lvl="info")
                         elif conv_score < self.adaptive_dcoef_convergence_threshold_high:
                             current_target_d_coef = self.adaptive_dcoef_normal_d_coef
-                            logFun(f"[AdaptiveDCoef] ConvScore ({conv_score:.2f}) < HighThresh ({self.adaptive_dcoef_convergence_threshold_high:.2f}). Target D-Coef: NORMAL ({current_target_d_coef})", lvl="info")
+                            logFun(
+                                f"[AdaptiveDCoef] ConvScore ({conv_score:.2f}) < HighThresh ({self.adaptive_dcoef_convergence_threshold_high:.2f}). Target D-Coef: NORMAL ({current_target_d_coef})",
+                                lvl="info")
                         else:
                             current_target_d_coef = self.adaptive_dcoef_fine_tune_d_coef
-                            logFun(f"[AdaptiveDCoef] ConvScore ({conv_score:.2f}) >= HighThresh ({self.adaptive_dcoef_convergence_threshold_high:.2f}). Target D-Coef: FINE-TUNE ({current_target_d_coef})", lvl="info")
+                            logFun(
+                                f"[AdaptiveDCoef] ConvScore ({conv_score:.2f}) >= HighThresh ({self.adaptive_dcoef_convergence_threshold_high:.2f}). Target D-Coef: FINE-TUNE ({current_target_d_coef})",
+                                lvl="info")
                     else:
-                        logFun(f"[AdaptiveDCoef] ConvergeControl não ativo. Usando target d_coef normal: {current_target_d_coef}", lvl="info")
-                        
+                        logFun(
+                            f"[AdaptiveDCoef] ConvergeControl não ativo. Usando target d_coef normal: {current_target_d_coef}",
+                            lvl="info")
+
                     try:
                         # Obter deltas L2 atuais (run 2) do TrainGPS
                         # _get_current_module_deltas retorna Dict[str, torch.Tensor(escalar)]
-                        current_deltas_tensor_map = gps_instance._get_current_module_deltas(self.train_device, self.train_dtype)
+                        current_deltas_tensor_map = gps_instance._get_current_module_deltas(
+                            self.train_device, self.train_dtype)
                         current_deltas_float_map: Dict[str, float] = {
-                            name: tensor.item() 
-                            for name, tensor in current_deltas_tensor_map.items() 
-                            if tensor is not None
-                        }
-                        
+                            name: tensor.item()
+                            for name, tensor in current_deltas_tensor_map.items()
+                            if tensor is not None}
+
                         # Obter nomes dos módulos/grupos de parâmetros gerenciados pelo otimizador
                         module_names_in_optimizer = [
-                            pg['name'] for pg in self.model.optimizer.param_groups if 'name' in pg
-                        ]
+                            pg['name'] for pg in self.model.optimizer.param_groups if 'name' in pg]
                         if not module_names_in_optimizer:
-                            logFun("[AdaptiveDCoef] Nenhum grupo de parâmetros nomeado encontrado no otimizador.", lvl="warning")
-                        
+                            logFun("[AdaptiveDCoef] Nenhum grupo de parâmetros nomeado encontrado no otimizador.",
+                                   lvl="warning")
+
                         # Calcular dcoef individualmente e aplicar se necessário
                         updated_count = 0
                         for group in self.model.optimizer.param_groups:
@@ -1440,7 +1386,7 @@ class GenericTrainer(BaseTrainer):
                             self.adaptive_dcoef.load_prodigy_d_final_run1(self.data_recorder_run1_path)
                             module_scores_run1 = self.adaptive_dcoef.module_prodigy_d_final_run1 or {}
                             # usa o d_pdgy mais recente capturado pelo DataRecorder
-                            current_module_scores = self.recorder.d_pdgy_final  # d_pdgy_final: distância ao ótimo                    
+                            current_module_scores = self.recorder.d_pdgy_final  # d_pdgy_final: distância ao ótimo
                             # cálculo do dcoef já com todos os parâmetros
                             dcoefs = self.adaptive_dcoef.calculate_individual_d_coef(
                                 module_scores_run1=module_scores_run1,
@@ -1448,7 +1394,7 @@ class GenericTrainer(BaseTrainer):
                                 gamma=self.adaptive_dcoef.gam,
                                 min_scale=self.adaptive_dcoef.min_scale,
                                 max_scale=self.adaptive_dcoef.max_scale,
-                            )                            
+                            )
                             name = group.get("name")
                             if name in dcoefs:
                                 old = group["d_coef"]
@@ -1456,12 +1402,17 @@ class GenericTrainer(BaseTrainer):
                                 if old != new:
                                     group["d_coef"] = new
                                     updated_count += 1
-                                    logFun(f"[AdaptiveDCoef] Module '{name}': d_coef alterado para {new:.4f} (era {old})", lvl="info")
+                                    logFun(
+                                        f"[AdaptiveDCoef] Module '{name}': d_coef alterado para {new:.4f} (era {old})",
+                                        lvl="info")
                         if updated_count > 0 and (self.adaptive_dcoef.verbose or self.adaptive_dcoef.debug):
-                            logFun(f"[AdaptiveDCoef] d_coef atualizado para {updated_count} grupos de parâmetros.", lvl="info")
-                                
+                            logFun(f"[AdaptiveDCoef] d_coef atualizado para {updated_count} grupos de parâmetros.",
+                                   lvl="info")
+
                     except Exception as e:
-                        logFun(f"[AdaptiveDCoef@epoch{train_progress.epoch-1}] Erro ao aplicar ajuste dinâmico de d_coef: {e}", lvl="error")
+                        logFun(
+                            f"[AdaptiveDCoef@epoch{train_progress.epoch-1}] Erro ao aplicar ajuste dinâmico de d_coef: {e}",
+                            lvl="error")
                         traceback.print_exc()
 
                 # 3. ConvergeControl Decide/Aplica Congelamento (Run >= 2 e Ativo)
@@ -1481,22 +1432,25 @@ class GenericTrainer(BaseTrainer):
                                     f"{action} module '{name}' based on ConvergeControl decision "
                                     f"(Run {self.run_number})",
                                     lvl="info",
-                                    _console=self.console
-                                )
+                                    _console=self.console)
                             param_group_obj.set_requires_grad(should_be_enabled)
 
-                if self.commands.get_stop_command(): return
+                if self.commands.get_stop_command():
+                    return
             if self.converge_control:
                 cc_renderable = self.converge_control.generate_status_renderable()
                 self._rich_layout["converge_control_status"].update(cc_renderable)
-        total_training_duration = time.monotonic() - self._total_training_time_start_s if self._total_training_time_start_s else 0
-        if self._rich_layout: # Garante que o layout ainda existe
-             self._rich_layout["main_content"].update(self._generate_main_content_text())
-        self.console.log(f"[bold blue]Treinamento completo! Tempo total: {format_time_delta(total_training_duration)}[/bold blue]")
+        total_training_duration = time.monotonic(
+        ) - self._total_training_time_start_s if self._total_training_time_start_s else 0
+        if self._rich_layout:  # Garante que o layout ainda existe
+            self._rich_layout["main_content"].update(self._generate_main_content_text())
+        self.console.log(
+            f"[bold blue]Treinamento completo! Tempo total: {format_time_delta(total_training_duration)}[/bold blue]")
 
     def end(self):
         if self.is_paused:
-            logFun("Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.", lvl="warning")
+            logFun("Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.",
+                   lvl="warning")
             # Força a saída da pausa (sem esperar comando) e tenta mover para GPU para salvar
             self.is_paused = False
             self.pause_request_locked = False
@@ -1506,16 +1460,19 @@ class GenericTrainer(BaseTrainer):
                 torch_gc()
                 logFun("Modelo movido para GPU para salvamento final.", lvl="info")
             except Exception as e:
-                logFun(f"Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).", lvl="error", console=self.console)
+                logFun(
+                    f"Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).",
+                    lvl="error",
+                    console=self.console)
                 # O modelo já está no self.temp_device, o save deve funcionar
-                pass # Continua para salvar do CPU
+                pass  # Continua para salvar do CPU
 
         if self.one_step_trained:
             self.model.to(self.temp_device)
             torch_gc()
 
             if self.config.backup_before_save:
-                self.backup(self.model.train_progress) # Backup já usa o modelo no temp_device
+                self.backup(self.model.train_progress)  # Backup já usa o modelo no temp_device
 
             # Special case for schedule-free optimizers.
             if self.config.optimizer.optimizer.is_schedule_free:
@@ -1526,10 +1483,8 @@ class GenericTrainer(BaseTrainer):
 
             if self.model.ema:
                 self.model.ema.copy_ema_to(self.parameters, store_temp=False)
-            if (
-                os.path.isdir(self.config.output_model_destination)
-                and self.config.output_model_format.is_single_file()
-            ):
+            if (os.path.isdir(self.config.output_model_destination) and
+                    self.config.output_model_format.is_single_file()):
                 save_path = os.path.join(
                     self.config.output_model_destination,
                     f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}",
@@ -1549,7 +1504,7 @@ class GenericTrainer(BaseTrainer):
             self.model.to(self.temp_device)
 
         model_filename = os.path.basename(save_path)
-        model_name, _ = os.path.splitext(model_filename) # Get model name without extension
+        model_name, _ = os.path.splitext(model_filename)  # Get model name without extension
 
         # --- Save Delta Pattern (If train_gps_save_it is True AND instance exists) ---
         gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
@@ -1575,7 +1530,7 @@ class GenericTrainer(BaseTrainer):
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 # Use a consistent naming scheme/directory if desired
-                output_dir = os.path.join(self.config.workspace_dir, "data_recorder") # Or reuse training_deltas dir?
+                output_dir = os.path.join(self.config.workspace_dir, "data_recorder")  # Or reuse training_deltas dir?
                 os.makedirs(output_dir, exist_ok=True)
                 # Include Run number for clarity
                 profile_filename = f"{model_name}_Profile_Run{self.run_number}_{timestamp}.json.gz"
