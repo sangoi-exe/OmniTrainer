@@ -1197,16 +1197,31 @@ class GenericTrainer(BaseTrainer):
                                                     self.converge_control.update_step_metrics(name, peft_mod)
                                                     processed_modules_for_cc.add(name)
 
-                                if self.run_number == 1 and self.recorder:
-                                    for group in self.model.optimizer.param_groups:
-                                        group_name = group.get("name")
-                                        d_pdgy_value = group.get('d')
-                                        if group_name and d_pdgy_value is not None:
-                                            if isinstance(d_pdgy_value, torch.Tensor):
-                                                d_pdgy_value_float = d_pdgy_value.item()
-                                            else:
-                                                d_pdgy_value_float = float(d_pdgy_value)
-                                            self.recorder.log_metrics_step(group_name, d_pdgy_value_float)
+                                        if self.recorder and name in self.converge_control._deques_initialized_for_module: # Garante que o módulo é monitorado pelo CC
+                                            cc_gd = self.converge_control.gradient_disparity_hist[name][-1] if self.converge_control.gradient_disparity_hist.get(name) else None
+                                            cc_snr = self.converge_control.snr_hist[name][-1] if self.converge_control.snr_hist.get(name) else None
+                                            cc_gns_t = self.converge_control.gns_temporal_hist[name][-1] if self.converge_control.gns_temporal_hist.get(name) else None
+                                            cc_gd_ewma = self.converge_control.gd_ewma.get(name, None)
+                                            cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name, None) # Esta é a EWMA da variância
+                                            
+                                            # Pegar o d_pdgy do otimizador para este grupo/módulo, se disponível
+                                            d_pdgy_val = None
+                                            for group in self.model.optimizer.param_groups:
+                                                if group.get("name") == name:
+                                                    d_pdgy_val_raw = group.get('d')
+                                                    if d_pdgy_val_raw is not None:
+                                                        d_pdgy_val = float(d_pdgy_val_raw.item() if isinstance(d_pdgy_val_raw, torch.Tensor) else d_pdgy_val_raw)
+                                                    break
+                                            
+                                            self.recorder.log_metrics_step(
+                                                name=name,
+                                                gd=cc_gd,
+                                                snr=cc_snr,
+                                                gns_t=cc_gns_t,
+                                                d_pdgy=d_pdgy_val,
+                                                gd_ewma=cc_gd_ewma,
+                                                gd_std_ewma_var=cc_gd_std_ewma_var
+                                            )
                             except Exception as e:
                                 logFun(f"Deu merda no first loop: {e}", lvl="error")
                                 traceback.print_exc()

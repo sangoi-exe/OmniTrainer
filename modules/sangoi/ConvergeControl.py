@@ -17,7 +17,6 @@ from rich.text import Text
 from modules.sangoi.DataRecorder import DataRecorder
 from modules.sangoi.logFun import logFun
 
-# ------------------- Config -------------------
 @dataclass
 class ConvCfg:
     # k_confirm: int = 4 # Este será substituído/reinterpretado
@@ -60,16 +59,39 @@ def module_type(name: str) -> str:
     elif "conv" in name or "resnet" in name or "res_block" in name: return "resnet"
     return "resnet"
 
+TYPE_CFG_DEFAULT_FALLBACK = ConvCfg(
+    # GD
+    gd_std_k=1.5,
+    gd_hist_len=30, # Ajustado para ser um valor default razoável
+    gd_ewma_alpha=0.1,
+    gd_std_ewma_alpha=0.1,
+    gd_stable_confirm_steps=15, # Ajustado
+    gd_stability_std_thresh_factor=0.15, # Ajustado
 
-TYPE_CFG_DEFAULT_FALLBACK = ConvCfg()
+    # SNR
+    snr_k=1.0,
+    snr_calc_win=16,
+    snr_hist_len=32,
+    snr_stable_confirm_steps=15, # Ajustado
+    snr_stability_window_len=12, # Ajustado
+    snr_stability_std_thresh=0.02, # Ajustado
 
-TYPE_CFG = ConvCfg(
-    gd_stable_confirm_steps=20, gd_stability_std_thresh_factor=0.15,
-    snr_stable_confirm_steps=20, snr_stability_window_len=15, snr_stability_std_thresh=0.02,
-    gns_t_stable_confirm_steps=20, gns_t_stability_window_len=15, gns_t_stability_std_thresh=0.75
+    # GNS Temporal
+    gns_temporal_k_window=10,
+    gns_temporal_thresh=10.0, # Ajustado para um default geral
+    gns_temporal_hist_len=32,
+    gns_max_value_clamp=1000.0,
+    gns_temporal_k_iqr_factor=1.0,
+    gns_mu_norm_sq_conv_thresh=1e-8,
+    gns_t_stable_confirm_steps=15, # Ajustado
+    gns_t_stability_window_len=12, # Ajustado
+    gns_t_stability_std_thresh=0.75, # Ajustado
+
+    # Warm-up
+    min_gd_hist_eval=15, # Ajustado
+    min_snr_hist_eval=15, # Ajustado
+    min_hist_gns_temporal_eval=10 # Ajustado
 )
-
-TYPE_CFG_DEFAULT_FALLBACK = ConvCfg()
 
 TYPE_CFG = {
     "attn":
