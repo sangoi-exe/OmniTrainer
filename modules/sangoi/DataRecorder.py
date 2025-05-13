@@ -47,6 +47,16 @@ class DataRecorder:
         if gd_std_ewma_var is not None:
             self.metrics_history[name]["gd_std_ewma_var"].append(gd_std_ewma_var)
 
+        # if self.debug and step >= 5 and step % 5 == 0: # Use a flag de debug do DataRecorder
+        #     debug_log_message = f"DataRecorder for '{name}': "
+        #     if gd is not None: debug_log_message += f"GD={gd:.2e} "
+        #     if snr is not None: debug_log_message += f"SNR={snr:.2f} "
+        #     if gns_t is not None: debug_log_message += f"GNS_T={gns_t:.2f} "
+        #     if d_pdgy is not None: debug_log_message += f"dPDGY={d_pdgy:.2e} "
+        #     if gd_ewma is not None: debug_log_message += f"GD_EWMA={gd_ewma:.2e} "
+        #     if gd_std_ewma_var is not None: debug_log_message += f"GD_EWMA_VAR={gd_std_ewma_var:.2e} "
+        #     # Adicione outras métricas que você passa para log_metrics_step
+        #     logFun(debug_log_message, lvl="RECORDER_DEBUG") # Use um lvl específico se quiser
 
         # Alternativa: sempre adicionar algo para cada métrica para manter o comprimento das listas igual
         # self.metrics_history[name]["gd"].append(gd if gd is not None else float('nan'))

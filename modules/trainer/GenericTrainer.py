@@ -940,7 +940,6 @@ class GenericTrainer(BaseTrainer):
         scheduler_step_counter = 0
 
         # Determine target device and dtype from a model parameter if available
-
         def wrap_scheduler_step(orig_step):
 
             def wrapped(*args, **kwargs):
@@ -1142,11 +1141,12 @@ class GenericTrainer(BaseTrainer):
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
-
                         has_gradient = True
-
+                        # print("--- Parâmetros Tau registrados na UNet ---")
+                        # for param_name, param in self.model.unet.tau_procs.named_parameters():
+                        #     if "log_tau" in param_name:
+                        #         print(f"  Encontrado: {param_name}, Requer Grad: {param.requires_grad}, Device: {param.device}, Dtype: {param.dtype}") 
                         accumulated_loss += loss.item()
-
                         if self.__is_update_step(train_progress):
                             if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
                                     self.config.optimizer.fused_back_pass):
@@ -1165,63 +1165,93 @@ class GenericTrainer(BaseTrainer):
 
                             try:
                                 # FIRST LOOP
-                                current_stats_list_from_optimizer = self.model.optimizer.pop_stats()
-                                if current_stats_list_from_optimizer:
-                                    if self.converge_control:
-                                        global_step = self.model.train_progress.global_step
-                                        current_epoch_cc = self.model.train_progress.epoch
-                                        self.converge_control.set_current_time(current_epoch_cc, global_step)
+                                # --- PASSO 1: Processar estatísticas do otimizador, atualizar CC e gravar dados ---
+                                current_stats_list_from_optimizer = self.model.optimizer.pop_stats() # Pop aqui!
 
-                                    processed_modules_for_cc = set()
+                                if self.converge_control: # Atualizar tempo do CC uma vez por step
+                                    global_step_cc = self.model.train_progress.global_step
+                                    current_epoch_cc = self.model.train_progress.epoch
+                                    self.converge_control.set_current_time(current_epoch_cc, global_step_cc)
 
-                                    if hasattr(self.model, "param_group_mapping"):
-                                        for stat_data in current_stats_list_from_optimizer:
-                                            group_idx = stat_data.get("group_idx")
-                                            if group_idx is None or not (0 <= group_idx < len(self.model.param_group_mapping)):
+                                if current_stats_list_from_optimizer and hasattr(self.model, "param_group_mapping"):
+                                    for stat_data in current_stats_list_from_optimizer:
+                                        group_idx = stat_data.get("group_idx")
+                                        # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
+                                        name = stat_data.get("name") 
+                                        
+                                        if name is None: # Sanity check
+                                            # Se 'name' não está em stat_data, mas group_idx está, podemos usar o mapeamento
+                                            if group_idx is not None and (0 <= group_idx < len(self.model.param_group_mapping)):
+                                                name = self.model.param_group_mapping[group_idx]
+                                            else:
+                                                logFun(f"Skipping stat_data due to missing name and invalid group_idx: {stat_data}", lvl="warning")
                                                 continue
-                                            name = self.model.param_group_mapping[group_idx]
-                                            if name and self.converge_control:
-                                                peft_mod = None
-                                                if hasattr(self.model, "unet_lora") and hasattr(self.model.unet_lora, "get_module_for_stats"):
-                                                    peft_mod = self.model.unet_lora.get_module_for_stats(name)
-                                                if peft_mod:
-                                                    self.converge_control.update_step_metrics(name, peft_mod)
-                                                    processed_modules_for_cc.add(name)
-                                                else:
-                                                    if getattr(self.config, "debug", False):
-                                                        logFun(f"Módulo LoRA não encontrado para '{name}'", lvl="LOOP_DEBUG")
-                                    else:
-                                        if self.converge_control and hasattr(self.model, "get_all_lora_modules_with_names"):
-                                            for name, peft_mod in self.model.get_all_lora_modules_with_names().items():
-                                                if name not in self.converge_control.get_frozen_set():
-                                                    self.converge_control.update_step_metrics(name, peft_mod)
-                                                    processed_modules_for_cc.add(name)
+                                        
+                                        # Obter o d_max (que é o 'd' do Prodigy que queremos)
+                                        d_prodigy_val_from_stats = stat_data.get("d_max") # CORRIGIDO para d_max
 
-                                        if self.recorder and name in self.converge_control._deques_initialized_for_module: # Garante que o módulo é monitorado pelo CC
-                                            cc_gd = self.converge_control.gradient_disparity_hist[name][-1] if self.converge_control.gradient_disparity_hist.get(name) else None
-                                            cc_snr = self.converge_control.snr_hist[name][-1] if self.converge_control.snr_hist.get(name) else None
-                                            cc_gns_t = self.converge_control.gns_temporal_hist[name][-1] if self.converge_control.gns_temporal_hist.get(name) else None
-                                            cc_gd_ewma = self.converge_control.gd_ewma.get(name, None)
-                                            cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name, None) # Esta é a EWMA da variância
+                                        # Atualizar ConvergeControl
+                                        if self.converge_control and name not in self.converge_control.get_frozen_set():
+                                            peft_mod = None
+                                            if hasattr(self.model, "unet_lora") and hasattr(self.model.unet_lora, "get_module_for_stats"):
+                                                peft_mod = self.model.unet_lora.get_module_for_stats(name)
                                             
-                                            # Pegar o d_pdgy do otimizador para este grupo/módulo, se disponível
-                                            d_pdgy_val = None
-                                            for group in self.model.optimizer.param_groups:
-                                                if group.get("name") == name:
-                                                    d_pdgy_val_raw = group.get('d')
-                                                    if d_pdgy_val_raw is not None:
-                                                        d_pdgy_val = float(d_pdgy_val_raw.item() if isinstance(d_pdgy_val_raw, torch.Tensor) else d_pdgy_val_raw)
-                                                    break
+                                            if peft_mod:
+                                                self.converge_control.update_step_metrics(name, peft_mod)
+                                            # else: logFun(f"Módulo PEFT não encontrado para '{name}' para CC update", lvl="LOOP_DEBUG")
+
+                                        # Registrar dados com DataRecorder
+                                        if self.recorder and self.converge_control and \
+                                            name in self.converge_control._deques_initialized_for_module:
                                             
+                                            # Coletar métricas do ConvergeControl
+                                            cc_gd_hist = self.converge_control.gradient_disparity_hist.get(name)
+                                            cc_gd = cc_gd_hist[-1] if cc_gd_hist else None
+                                            
+                                            cc_snr_hist = self.converge_control.snr_hist.get(name)
+                                            cc_snr = cc_snr_hist[-1] if cc_snr_hist else None
+                                            
+                                            cc_gns_t_hist = self.converge_control.gns_temporal_hist.get(name)
+                                            cc_gns_t = cc_gns_t_hist[-1] if cc_gns_t_hist else None
+                                            
+                                            cc_gd_ewma = self.converge_control.gd_ewma.get(name)
+                                            cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name)
+
+                                            # Usar o d_prodigy_val_from_stats (que é o d_max)
+                                            d_pdgy_to_record = None
+                                            if d_prodigy_val_from_stats is not None:
+                                                d_pdgy_to_record = float(d_prodigy_val_from_stats.item() if isinstance(d_prodigy_val_from_stats, torch.Tensor) else d_prodigy_val_from_stats)
+
                                             self.recorder.log_metrics_step(
                                                 name=name,
                                                 gd=cc_gd,
                                                 snr=cc_snr,
                                                 gns_t=cc_gns_t,
-                                                d_pdgy=d_pdgy_val,
+                                                d_pdgy=d_pdgy_to_record, # Usando o valor corrigido
                                                 gd_ewma=cc_gd_ewma,
                                                 gd_std_ewma_var=cc_gd_std_ewma_var
                                             )
+                                            # if train_progress.global_step >= 96 and train_progress.global_step % 100 == 0:
+                                            #     from datetime import datetime
+
+                                            #     # 1) Timestamp seguro para o nome do arquivo: YYYYMMDDThhmmss
+                                            #     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+
+                                            #     # 2) Nome do arquivo
+                                            #     filename = f"datarecorder_log_{timestamp}.txt"
+
+                                            #     # 3) Linha de log com timestamp completo ISO
+                                            #     log_line = (
+                                            #         f"DataRecorder logged for '{name}': "
+                                            #         f"GD={cc_gd}, SNR={cc_snr}, GNS_T={cc_gns_t}, "
+                                            #         f"d_max(Prodigy)={d_pdgy_to_record}\n"
+                                            #     )
+
+                                            #     # 4) Escreve (append) no arquivo
+                                            #     with open(filename, "w") as f:
+                                            #         f.write(log_line)
+
+                                            #     logFun(f"CRIEI O DATARECORDER LOG em {filename}", lvl="success")
                             except Exception as e:
                                 logFun(f"Deu merda no first loop: {e}", lvl="error")
                                 traceback.print_exc()
@@ -1391,8 +1421,7 @@ class GenericTrainer(BaseTrainer):
                         module_names_in_optimizer = [
                             pg['name'] for pg in self.model.optimizer.param_groups if 'name' in pg]
                         if not module_names_in_optimizer:
-                            logFun("[AdaptiveDCoef] Nenhum grupo de parâmetros nomeado encontrado no otimizador.",
-                                   lvl="warning")
+                            logFun("[AdaptiveDCoef] Nenhum grupo de parâmetros nomeado encontrado no otimizador.", lvl="warning")
 
                         # Calcular dcoef individualmente e aplicar se necessário
                         updated_count = 0
@@ -1463,6 +1492,11 @@ class GenericTrainer(BaseTrainer):
             f"[bold blue]Treinamento completo! Tempo total: {format_time_delta(total_training_duration)}[/bold blue]")
 
     def end(self):
+        save_path = os.path.join(
+            self.config.workspace_dir,
+            "save",
+            f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{self.model.train_progress.filename_string()}{self.config.output_model_format.file_extension()}",
+        )        
         if self.is_paused:
             logFun("Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.",
                    lvl="warning")

@@ -138,6 +138,17 @@ class StableDiffusionXLLoRASetup(
                             learning_rate=config.unet.learning_rate,
                         )
                     )
+            if hasattr(model.unet, "tau_procs"):                    
+                tau_params = [p.log_tau for p in model.unet.tau_procs.values()]               
+                if tau_params:                       # deve haver ~140
+                    parameter_group_collection.add_group(
+                        NamedParameterGroup(
+                            unique_name="tau",                     
+                            display_name="tau",                     
+                            parameters=tau_params,
+                            learning_rate=config.unet.learning_rate
+                    )
+                )
 
         if config.train_any_embedding() or config.train_any_output_embedding():
             if config.text_encoder.train_embedding:
@@ -202,64 +213,44 @@ class StableDiffusionXLLoRASetup(
         self._setup_embeddings_requires_grad(model, config)
         model.text_encoder_1.requires_grad_(False)
         model.text_encoder_2.requires_grad_(False)
-        # --- UNet Base ---
-        # print("\n>>> APLICANDO: model.unet.requires_grad_(False)")
-        model.unet.requires_grad_(False)
-        # // GEMINI-CODE {timestamp} - Log DEPOIS de congelar model.unet
-        # log_tau_requires_grad_status(model.unet, "model.unet", "Após model.unet.requires_grad_(False)")
-        
+        model.unet.requires_grad_(False)        
         model.vae.requires_grad_(False)
 
-        # --- LoRA para Text Encoders (se existirem) ---
         if model.text_encoder_1_lora is not None:
             train_text_encoder_1 = config.text_encoder.train and not self.stop_text_encoder_training_elapsed(
                 config, model.train_progress
             )
-            # print(f">>> APLICANDO: model.text_encoder_1_lora.requires_grad_({train_text_encoder_1})")
             model.text_encoder_1_lora.requires_grad_(train_text_encoder_1)
-            # log_tau_requires_grad_status(model.text_encoder_1_lora, "model.text_encoder_1_lora", "Após setup de text_encoder_1_lora")
 
 
         if model.text_encoder_2_lora is not None:
             train_text_encoder_2 = config.text_encoder_2.train and not self.stop_text_encoder_2_training_elapsed(
                 config, model.train_progress
             )
-            # print(f">>> APLICANDO: model.text_encoder_2_lora.requires_grad_({train_text_encoder_2})")
             model.text_encoder_2_lora.requires_grad_(train_text_encoder_2)
-            # log_tau_requires_grad_status(model.text_encoder_2_lora, "model.text_encoder_2_lora", "Após setup de text_encoder_2_lora")
 
 
-        # --- LoRA para UNet (se existir) ---
         if model.unet_lora is not None:
             train_unet = config.unet.train and not self.stop_unet_training_elapsed(config, model.train_progress)
-            # print(f"\n>>> APLICANDO: model.unet_lora.requires_grad_({train_unet})")
             model.unet_lora.requires_grad_(train_unet)
-            # // GEMINI-CODE {timestamp} - Log DEPOIS de configurar model.unet_lora
-            # log_tau_requires_grad_status(model.unet_lora, "model.unet_lora", "Após model.unet_lora.requires_grad_()")
         
-        # // GEMINI-CODE {timestamp} - Descongela os parâmetros Tau especificamente
-        # print("\n>>> CHAMANDO: self.__ensure_tau_params_trainable(model) para reativar 'log_tau'")
         self.__ensure_tau_params_trainable(model) # Passa o objeto model completo
 
-        # // GEMINI-CODE {timestamp} - Log FINAL para model.unet (para ver o estado combinado)
-        # log_tau_requires_grad_status(model.unet, "model.unet", "Fim de __setup_requires_grad (após descongelamento específico do Tau)")
-
-    # // GEMINI-CODE {timestamp} - Mantenha esta função para ser chamada APÓS __setup_requires_grad
     def __ensure_tau_params_trainable(self, model: StableDiffusionXLModel):
-        if hasattr(model, 'unet') and hasattr(model.unet, 'registered_learnable_tau_processors'):
+        if hasattr(model, 'unet') and hasattr(model.unet, 'tau_procs'):
             print("\n--- Trainer: Garantindo que parâmetros 'log_tau' são treináveis (pós-setup global) ---")
             made_trainable_count = 0
             total_log_tau_params = 0
-            for module_name, module_instance in model.unet.registered_learnable_tau_processors.items():
+            for module_name, module_instance in model.unet.tau_procs.items():
                 for param_name, param in module_instance.named_parameters(recurse=False):
                     if "log_tau" in param_name:
                         total_log_tau_params +=1
                         if not param.requires_grad:
                             param.requires_grad_(True)
-                            # print(f"  DESCONGELADO (via __ensure_tau_params_trainable): model.unet.registered_learnable_tau_processors.{module_name}.{param_name}")
+                            # print(f"  DESCONGELADO (via __ensure_tau_params_trainable): model.unet.tau_procs.{module_name}.{param_name}")
                             made_trainable_count +=1
                         # else:
-                        #    print(f"  JÁ TREINÁVEL: model.unet.registered_learnable_tau_processors.{module_name}.{param_name}")
+                        #    print(f"  JÁ TREINÁVEL: model.unet.tau_procs.{module_name}.{param_name}")
             
             if total_log_tau_params > 0:
                 if made_trainable_count > 0:
@@ -267,10 +258,10 @@ class StableDiffusionXLLoRASetup(
                 else:
                     print(f"  Todos os {total_log_tau_params} parâmetros 'log_tau' encontrados já estavam treináveis ou não foram encontrados para descongelar.")
             else:
-                print("  Nenhum parâmetro 'log_tau' encontrado em 'registered_learnable_tau_processors' para verificar/descongelar.")
+                print("  Nenhum parâmetro 'log_tau' encontrado em 'tau_procs' para verificar/descongelar.")
 
         else:
-            print("--- Trainer: Nenhum 'registered_learnable_tau_processors' encontrado na UNet para a verificação final do Tau.")
+            print("--- Trainer: Nenhum 'tau_procs' encontrado na UNet para a verificação final do Tau.")
 
     def setup_model(
         self, model: StableDiffusionXLModel, config: TrainConfig, tensorboard: Optional[TensorBoardManager] = None

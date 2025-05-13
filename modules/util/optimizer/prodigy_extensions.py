@@ -22,7 +22,7 @@ def step_prodigy(self, closure=None):
     loss = None
     if closure is not None:
         loss = closure()
-        
+
     if not hasattr(self, "_stats_buffer"):
 
         self._stats_buffer = ProdigyStatsBuffer()
@@ -161,8 +161,9 @@ def step_prodigy(self, closure=None):
 
         self._stats_buffer.push(
             group_idx = group_idx,
-            step      = group["k"],               
-            d_max     = d_max,                    
+            name = group["name"],
+            step = group["k"],
+            d_max = group["d_max"],
         )
 
         # recompute dlr with the updated d (for this group)
@@ -223,12 +224,12 @@ def patch_prodigy(optimizer: Prodigy, stochastic_rounding: bool):
     substituindo o método step pelo nosso step_prodigy.
     """
     try:
-      optimizer.stochastic_rounding = stochastic_rounding
-      optimizer.step = step_prodigy.__get__(optimizer, Prodigy)
-      optimizer.pop_stats = _pop_prodigy_stats.__get__(optimizer, Prodigy)
+        optimizer.stochastic_rounding = stochastic_rounding
+        optimizer.step = step_prodigy.__get__(optimizer, Prodigy)
+        optimizer.pop_stats = _pop_prodigy_stats.__get__(optimizer, Prodigy)
     except Exception as e:
-      print(f"Failed to set options in patch_prodigy: {e}")
-      traceback.print_exc()
+        print(f"Failed to set options in patch_prodigy: {e}")
+        traceback.print_exc()
 
 def _pop_prodigy_stats(self):
     """
@@ -249,5 +250,3 @@ class ProdigyStatsBuffer(list):
         buf = list(self)
         self.clear()
         return buf
-
-

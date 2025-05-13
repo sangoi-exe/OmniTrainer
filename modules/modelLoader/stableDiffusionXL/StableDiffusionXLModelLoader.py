@@ -5,10 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F # Importado para referência, usado internamente por AttnProcessor2_0
 
-# Importar os processadores originais para referência e delegação
-from diffusers.models.attention_processor import AttnProcessor as OriginalAttnProcessor
-from diffusers.models.attention_processor import AttnProcessor2_0 as OriginalAttnProcessor2_0
-
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.SDConfigModelLoaderMixin import SDConfigModelLoaderMixin
@@ -26,124 +22,130 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+from diffusers.models.attention_processor import AttnProcessor2_0 as AP2
 
-
-# --- Definições dos Processadores Customizados ---
-
-class LearnableTauProcessor(nn.Module): # MODIFICADO: Herda de nn.Module
+class LearnableTauAttnProcessor(nn.Module):
     """
-    Processador de atenção "vanilla" com tau treinável.
-    Herda de nn.Module para que self.log_tau seja um parâmetro treinável reconhecido.
+    Custom AttnProcessor que replica o fluxo do AttnProcessor2_0, mas
+    passa um `scale` explícito ao SDPA contendo o tau treinável.
     """
+
     def __init__(self, init_tau: float = 1.0):
-        super().__init__() # ADICIONADO: Chama o construtor de nn.Module
+        super().__init__()
+        # tau > 0 via exp; armazenamos no log para estabilidade
         self.log_tau = nn.Parameter(torch.tensor(math.log(init_tau)))
 
-    def __call__(
-        self,
-        attn: nn.Module, # diffusers.models.attention.Attention
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
+    def __call__(self,
+                 attn: AP2.__class__,  # só p/ type hint
+                 hidden_states: torch.Tensor,
+                 encoder_hidden_states: torch.Tensor | None = None,
+                 attention_mask: torch.Tensor | None = None,
+                 temb: torch.Tensor | None = None,
+                 **kwargs) -> torch.Tensor:
 
+        # 1) Preparação de Residual + SpatialNorm
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        # 2) Flatten 4D → 3D
         input_ndim = hidden_states.ndim
         if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-            if encoder_hidden_states is not None and encoder_hidden_states.ndim == 4:
-                 encoder_hidden_states = encoder_hidden_states.view(batch_size, channel, height*width).transpose(1,2)
+            batch, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch, channel, height*width).transpose(1,2)
+        else:
+            batch, seq_len, _ = hidden_states.shape
 
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-        
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
-
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
-        
-        effective_scale = attn.scale * self.log_tau.exp() # self.log_tau é usado aqui
-
-        scores = torch.baddbmm(
-            torch.empty(query.shape[0], query.shape[1], key.shape[2], dtype=query.dtype, device=query.device),
-            query,
-            key.transpose(-1, -2),
-            beta=0,
-            alpha=effective_scale,
-        )
-
+        # 3) Máscara
+        processed_attention_mask = None
         if attention_mask is not None:
-            # A camada Attention deve preparar o attention_mask antes de chamar o processador.
-            # Ex: attention_mask = attn.prepare_attention_mask(...)
-            # Aqui, assumimos que attention_mask já está no formato correto para adição.
-            scores = scores + attention_mask
-
-        attention_probs = scores.softmax(dim=-1, dtype=value.dtype if value.dtype is not torch.float16 else torch.float32)
-        
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
-
-        hidden_states = attn.to_out[0](hidden_states)
-        if len(attn.to_out) > 1 and not isinstance(attn.to_out[1], nn.Identity):
-            hidden_states = attn.to_out[1](hidden_states)
-        
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-        
-        hidden_states = hidden_states / attn.rescale_output_factor
-        
-        return hidden_states
-
-
-class LearnableTauAttnProcessor2_0(nn.Module): # MODIFICADO: Herda de nn.Module
-    """
-    Processador de atenção que tenta manter otimizações (como SDPA de PyTorch 2.0+)
-    e introduz um tau treinável. Herda de nn.Module.
-    """
-    def __init__(self, init_tau: float = 1.0):
-        super().__init__() # ADICIONADO: Chama o construtor de nn.Module
-        self.log_tau = nn.Parameter(torch.tensor(math.log(init_tau)))
-        # Instanciamos o processador original para delegar a lógica de atenção otimizada.
-        self.original_processor_logic = OriginalAttnProcessor2_0()
-
-    def __call__(
-        self,
-        attn: nn.Module, # diffusers.models.attention.Attention
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        **kwargs, 
-    ) -> torch.Tensor:
-        
-        original_attn_scale_value = attn.scale 
-        new_effective_scale = original_attn_scale_value * self.log_tau.exp() # self.log_tau é usado aqui
-        
-        try:
-            attn.scale = new_effective_scale 
-            output = self.original_processor_logic(
-                attn, 
-                hidden_states, 
-                encoder_hidden_states=encoder_hidden_states, 
-                attention_mask=attention_mask, 
-                **kwargs
+            processed_attention_mask = attn.prepare_attention_mask(attention_mask, hidden_states.shape[1], batch)
+            processed_attention_mask = processed_attention_mask.view(
+                batch, attn.heads, -1, processed_attention_mask.shape[-1]
             )
-        finally:
-            attn.scale = original_attn_scale_value 
-            
-        return output
 
+        # 4) GroupNorm (se houver)
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1,2)).transpose(1,2)
+
+        # 5) Projeções Q/K/V
+        query = attn.to_q(hidden_states)
+        if encoder_hidden_states is None:
+            kv = hidden_states
+        elif attn.norm_cross:
+            kv = attn.norm_encoder_hidden_states(encoder_hidden_states)
+        else:
+            kv = encoder_hidden_states
+        key   = attn.to_k(kv)
+        value = attn.to_v(kv)
+
+        # 6) Rearrange para (batch, heads, seq, head_dim)
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+        query = query.view(batch, -1, attn.heads, head_dim).transpose(1,2)
+        key   = key.view(batch, -1, attn.heads, head_dim).transpose(1,2)
+        value = value.view(batch, -1, attn.heads, head_dim).transpose(1,2)
+
+        # 7) Normas pontuais (opcional)
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # 8) Calcula o tau e o aplica de forma diferenciável, garantindo device/dtype corretos
+
+        # self.log_tau é o nn.Parameter. Ele já deve estar no device correto (ex: 'cuda:0')
+        # e no dtype do modelo (ex: torch.bfloat16) se model.to(device, dtype) funcionou corretamente
+        # para todos os nn.Parameter registrados.
+
+        # Calcula tau a partir de log_tau. tau terá o mesmo device e dtype de self.log_tau.
+        tau_for_computation = torch.exp(self.log_tau)
+
+        # Agora aplique o tau. Escolha a formulação correta:
+        # Opção 1: tau como "temperatura" (maior tau = mais suave, menor tau = mais sharp)
+        # Para que a escala efetiva (original_scale / tau_temperatura) seja usada.
+        # Como SDPA usa scale_original = 1/sqrt(head_dim), e queremos (Q@K.T * scale_original) / tau_temperatura,
+        # isso é equivalente a (Q/sqrt(tau_temperatura) @ K.T/sqrt(tau_temperatura)) * scale_original.
+        # Então:
+        query_modified = query / torch.sqrt(tau_for_computation)
+        key_modified = key / torch.sqrt(tau_for_computation)
+        # Se init_tau = 1.0, log_tau = 0, tau_for_computation = 1.0. Nenhuma mudança inicial.
+        # Se o modelo aprender log_tau < 0 => tau_for_computation < 1 => sqrt(tau) < 1 => 1/sqrt(tau) > 1
+        # Isso AUMENTA a magnitude de Q e K, levando a scores mais "sharps" (focados).
+        # Isso parece alinhar com a intenção do Kohya de "aumentar o foco" para compensar sub-variância.
+
+        # Opção 2 (Alternativa): Se você quisesse que tau_for_computation > 1 aumentasse o foco
+        # (ou seja, tau_for_computation fosse um multiplicador direto da "força" da atenção)
+        # query_modified = query * torch.sqrt(tau_for_computation)
+        # key_modified = key * torch.sqrt(tau_for_computation)
+
+        # O print de debug que você tinha é ótimo para verificar o valor de log_tau
+        # print("τ-hit, log_tau:", self.log_tau.item(), "tau_for_comp:", tau_for_computation.item(), "query_dtype:", query.dtype, "tau_dtype:", tau_for_computation.dtype)
+
+        # 9) Chama SDPA **sem** o argumento `scale` explícito, para usar a escala padrão interna do SDPA
+        #    que será aplicada aos query_modified e key_modified.
+        out = F.scaled_dot_product_attention(
+            query_modified, # Usando o query modificado
+            key_modified,   # Usando o key modificado
+            value,
+            attn_mask=processed_attention_mask,
+            dropout_p=getattr(attn, "dropout", 0.0), # Pega o dropout do módulo Attention original
+            is_causal=getattr(attn, "is_causal", False) # Pega is_causal do módulo Attention original
+        )
+
+        # 10) Rearranja de volta e aplica saída linear + dropout
+        out = out.transpose(1,2).reshape(batch, -1, attn.heads * head_dim)
+        out = attn.to_out[0](out)
+        if len(attn.to_out) > 1 and not isinstance(attn.to_out[1], nn.Identity):
+            out = attn.to_out[1](out)
+
+        # 11) Reconstrói 4D se necessário + residual + rescale
+        if input_ndim == 4:
+            out = out.transpose(-1,-2).reshape(batch, channel, height, width)
+        if attn.residual_connection:
+            out = out + residual
+        out = out / attn.rescale_output_factor
+        return out
 
 class StableDiffusionXLModelLoader(
     SDConfigModelLoaderMixin,
@@ -164,75 +166,44 @@ class StableDiffusionXLModelLoader(
             case _:
                 return None
 
-    # // GEMINI-CODE {timestamp} - Modificação em __apply_learnable_tau_processors
     def __apply_learnable_tau_processors(self, unet: UNet2DConditionModel):
         if not hasattr(unet, 'attn_processors'):
             print("Aviso: UNet não possui 'attn_processors'. Tau customizado não aplicado.")
             return
 
-        # Dicionário para os processadores que serão passados para unet.set_attn_processor()
-        # Este conterá tanto os seus nn.Modules customizados quanto os processadores originais não modificados.
         final_processors_for_unet_usage = {}
-        
-        # Dicionário para o nn.ModuleDict, contendo APENAS seus nn.Modules customizados
-        # para registro de parâmetros. Os nomes das chaves precisam ser válidos para atributos.
-        learnable_tau_modules_for_param_registration = {}
-        
+        tau_procs = {}
         count_applied_tau_procs = 0
         
-        print("--- Analisando processadores de atenção originais na UNet ---")
+        print("--- Analisando e substituindo processadores de atenção originais na UNet ---")
         for name, proc_original_instance in unet.attn_processors.items():
-            # print(f"  Original {name}: {type(proc_original_instance)}") # Para depuração detalhada
-            init_tau_value = 1.0
+            init_tau_value = 1.0 # Ou pegue de uma config se quiser taus iniciais diferentes
             
-            # Tenta substituir pelo seu processador customizado
-            custom_processor_instance = None
-            if isinstance(proc_original_instance, OriginalAttnProcessor2_0):
-                custom_processor_instance = LearnableTauAttnProcessor2_0(init_tau=init_tau_value)
-                # print(f"    -> Substituindo {name} por LearnableTauAttnProcessor2_0.")
-            elif isinstance(proc_original_instance, OriginalAttnProcessor):
-                custom_processor_instance = LearnableTauProcessor(init_tau=init_tau_value)
-                # print(f"    -> Substituindo {name} por LearnableTauProcessor.")
-            
-            if custom_processor_instance:
+            if isinstance(proc_original_instance, AP2): # OriginalAttnProcessor2_0 é o AP2
+                custom_processor_instance = LearnableTauAttnProcessor(init_tau=init_tau_value) # Sua classe herdada
                 final_processors_for_unet_usage[name] = custom_processor_instance
-                # Nomes para ModuleDict não podem ter '.', então substituímos
-                module_dict_key = name.replace('.', '_').replace('-', '_')
-                learnable_tau_modules_for_param_registration[module_dict_key] = custom_processor_instance
+                
+                module_dict_key = name.replace('.', '_').replace('-', '_') # Para nome de atributo válido
+                tau_procs[module_dict_key] = custom_processor_instance
                 count_applied_tau_procs += 1
+                # print(f"    -> Substituindo {name} por TauAttnProcessor.")
             else:
-                # Mantém o processador original se não for um tipo conhecido ou se não quisermos modificar
+                # Mantém o processador original se não for AttnProcessor2_0
                 final_processors_for_unet_usage[name] = proc_original_instance
-                # print(f"    -> Mantendo {name} como {type(proc_original_instance).__name__} (não modificado).")
+                # print(f"    -> Mantendo {name} como {type(proc_original_instance).__name__}.")
 
-
-        # 1. Atribui os processadores (mistura de customizados e originais) à UNet para uso na lógica de atenção.
-        #    O unet.attn_processors continuará sendo um dict Python comum.
-        if final_processors_for_unet_usage: # Garante que o dict não está vazio
-             unet.set_attn_processor(final_processors_for_unet_usage)
-             print(f"Dicionário unet.attn_processors atualizado com {len(final_processors_for_unet_usage)} processadores ({count_applied_tau_procs} customizados com Tau).")
-        else:
-            print("Nenhum processador final para atribuir a unet.attn_processors.")
-
-
-        # 2. Se houver processadores customizados (que são nn.Module),
-        #    registra-os na UNet através de um nn.ModuleDict para que seus parâmetros sejam encontrados.
-        if learnable_tau_modules_for_param_registration:
-            # Este atributo é novo e serve APENAS para o PyTorch encontrar os parâmetros.
-            # A UNet NÃO usará este atributo para sua lógica de atenção, ela usa unet.attn_processors.
-            unet.registered_learnable_tau_processors = nn.ModuleDict(learnable_tau_modules_for_param_registration)
-            print(f"nn.ModuleDict 'registered_learnable_tau_processors' com {len(learnable_tau_modules_for_param_registration)} módulos Tau adicionado à UNet para registro de parâmetros.")
+        if count_applied_tau_procs > 0:
+            unet.set_attn_processor(final_processors_for_unet_usage)
+            unet.tau_procs = nn.ModuleDict(tau_procs)
+            print(f"UNet atualizada com {count_applied_tau_procs} instâncias de TauAttnProcessor.")
             
-            # DEBUG: Verificar se os parâmetros agora são visíveis através do ModuleDict
-            # print("--- Parâmetros dentro de unet.registered_learnable_tau_processors ---")
-            # for param_name, param in unet.registered_learnable_tau_processors.named_parameters():
-            #     if "log_tau" in param_name:
-            #         print(f"  Encontrado no ModuleDict: {param_name}, Valor: {param.item():.4f}, Requer Grad: {param.requires_grad}")
-
-        elif count_applied_tau_procs > 0:
-             print("AVISO: Processadores Tau foram contados, mas o ModuleDict para registro de parâmetros está vazio. Isso não deveria acontecer.")
-        else:
-            print("Nenhum processador Tau customizado foi aplicado, então nenhum ModuleDict para parâmetros foi criado.")
+        #     # Debug para verificar parâmetros (opcional, mas útil uma vez)
+        #     print("--- Parâmetros Tau registrados na UNet ---")
+        #     for param_name, param in unet.tau_procs.named_parameters():
+        #         if "log_tau" in param_name:
+        #             print(f"  Encontrado: {param_name}, Requer Grad: {param.requires_grad}, Device: {param.device}, Dtype: {param.dtype}")
+        # else:
+        #     print("Nenhum processador AttnProcessor2_0 encontrado para substituir por TauAttnProcessor.")
 
 
     def __load_internal(
@@ -270,7 +241,7 @@ class StableDiffusionXLModelLoader(
         
         unet = self._load_diffusers_sub_module(UNet2DConditionModel, weight_dtypes.unet, weight_dtypes.train_dtype, base_model_name, "unet")
         
-        self.__apply_learnable_tau_processors(unet)
+        self.__apply_learnable_tau_processors(unet, weight_dtypes)
 
         model.model_type = model_type
         model.tokenizer_1 = tokenizer_1
@@ -302,6 +273,7 @@ class StableDiffusionXLModelLoader(
         unet = pipeline.unet.to(dtype=weight_dtypes.unet.torch_dtype())
 
         self.__apply_learnable_tau_processors(unet)
+        unet.to(dtype=weight_dtypes.unet.torch_dtype())
 
         model.model_type = model_type
         model.tokenizer_1 = pipeline.tokenizer
