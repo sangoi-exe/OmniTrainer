@@ -1187,8 +1187,9 @@ class GenericTrainer(BaseTrainer):
                                                 logFun(f"Skipping stat_data due to missing name and invalid group_idx: {stat_data}", lvl="warning")
                                                 continue
                                         
-                                        # Obter o d_max (que é o 'd' do Prodigy que queremos)
-                                        d_prodigy_val_from_stats = stat_data.get("d_max") # CORRIGIDO para d_max
+                                        # Obter o d_hat (que é o 'd' do Prodigy que queremos)
+                                        d_num_pdgy_raw = stat_data.get("d_num")
+                                        d_den_pdgy_raw = stat_data.get("d_den")
 
                                         # Atualizar ConvergeControl
                                         if self.converge_control and name not in self.converge_control.get_frozen_set():
@@ -1217,19 +1218,25 @@ class GenericTrainer(BaseTrainer):
                                             cc_gd_ewma = self.converge_control.gd_ewma.get(name)
                                             cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name)
 
-                                            # Usar o d_prodigy_val_from_stats (que é o d_max)
-                                            d_pdgy_to_record = None
-                                            if d_prodigy_val_from_stats is not None:
-                                                d_pdgy_to_record = float(d_prodigy_val_from_stats.item() if isinstance(d_prodigy_val_from_stats, torch.Tensor) else d_prodigy_val_from_stats)
+                                            d_num_pdgy = None
+                                            if d_num_pdgy_raw is not None:
+                                                d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
+                                            # logFun(f"d_num_pdgy={d_num_pdgy}", lvl="error")
+                                                
+                                            d_den_pdgy = None
+                                            if d_num_pdgy_raw is not None:
+                                                d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)
+                                            # logFun(f"d_den_pdgy={d_den_pdgy}", lvl="error")
 
                                             self.recorder.log_metrics_step(
                                                 name=name,
-                                                gd=cc_gd,
-                                                snr=cc_snr,
-                                                gns_t=cc_gns_t,
-                                                d_pdgy=d_pdgy_to_record, # Usando o valor corrigido
-                                                gd_ewma=cc_gd_ewma,
-                                                gd_std_ewma_var=cc_gd_std_ewma_var
+                                                d_num_pdgy=d_num_pdgy,
+                                                d_den_pdgy=d_den_pdgy,
+                                                # gd=cc_gd,
+                                                # snr=cc_snr,
+                                                # gns_t=cc_gns_t,
+                                                # gd_ewma=cc_gd_ewma,
+                                                # gd_std_ewma_var=cc_gd_std_ewma_var
                                             )
                                             # if train_progress.global_step >= 96 and train_progress.global_step % 100 == 0:
                                             #     from datetime import datetime
@@ -1244,7 +1251,7 @@ class GenericTrainer(BaseTrainer):
                                             #     log_line = (
                                             #         f"DataRecorder logged for '{name}': "
                                             #         f"GD={cc_gd}, SNR={cc_snr}, GNS_T={cc_gns_t}, "
-                                            #         f"d_max(Prodigy)={d_pdgy_to_record}\n"
+                                            #         f"d_hat(Prodigy)={d_pdgy_to_record}\n"
                                             #     )
 
                                             #     # 4) Escreve (append) no arquivo
@@ -1588,7 +1595,7 @@ class GenericTrainer(BaseTrainer):
                 logFun(f"[DataRecorder] Salvando perfil (Run {self.run_number}) em: {profile_save_path}", lvl="info")
 
                 # DataRecorder's dump method now only takes the path
-                # It saves d_max_final and d_coef_base internally collected.
+                # It saves d_hat_final and d_coef_base internally collected.
                 self.recorder.dump(profile_save_path)
 
             except Exception as e:

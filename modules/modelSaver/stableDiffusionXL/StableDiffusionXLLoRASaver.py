@@ -56,7 +56,7 @@ class StableDiffusionXLLoRASaver(
             for proc_key, proc_module in model.unet.tau_procs.items():
                 state_dict_key_for_tau = f"unet.tau_procs.{proc_key}.log_tau"
                 state_dict[state_dict_key_for_tau] = proc_module.log_tau.data 
-                logFun(f"[LoRA Saver]   Coletado tau para '{proc_key}' como '{state_dict_key_for_tau}'. Valor: {proc_module.log_tau.data.item():.4f}", lvl="DEBUG_SAVER")
+                # logFun(f"[LoRA Saver]   Coletado tau para '{proc_key}' como '{state_dict_key_for_tau}'. Valor: {proc_module.log_tau.data.item():.4f}", lvl="DEBUG_SAVER")
                 taus_collected_count += 1
             logFun(f"[LoRA Saver] Total de {taus_collected_count} parâmetros 'log_tau' coletados da UNet.", lvl="DEBUG_SAVER")
         else:
@@ -81,7 +81,6 @@ class StableDiffusionXLLoRASaver(
                 if embedding.text_encoder_2_embedding.vector is not None:
                     state_dict[f"bundle_emb.{placeholder}.clip_g"] = embedding.text_encoder_2_embedding.vector
                     emb_count+=1
-                # ... (outros vetores de embedding se houver) ...
             logFun(f"[LoRA Saver] Coletado {emb_count} tensores de embeddings adicionais.", lvl="DEBUG_SAVER")
         else:
             logFun("[LoRA Saver] Sem embeddings adicionais para coletar ou bundle_additional_embeddings=False.", lvl="DEBUG_SAVER")

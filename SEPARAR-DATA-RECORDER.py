@@ -117,7 +117,7 @@ def extract_metrics_per_module_base(
     print(f"  Total de arquivos JSON de módulo gerados: {num_files_generated} em '{output_module_jsons_dir}'.")
 
 # --- Configuração ---
-large_json_file = "caminho/para/seu/dump_de_155_milhoes.json.gz" # MUDE AQUI
+large_json_file = "F:\OT\data_recorder\Aracy.Cyb7.noDelta.003_Profile_Run1_20250513_135453.json.gz" # MUDE AQUI
 keys_file = "unetKeysByBlock_20250512_215319.txt" 
 output_per_module_dir = "lora_module_metric_history_jsons" # Novo nome de diretórioimport json
 import gzip

@@ -163,7 +163,8 @@ def step_prodigy(self, closure=None):
             group_idx = group_idx,
             name = group["name"],
             step = group["k"],
-            d_max = group["d_max"],
+            d_num = group["d_numerator"],
+            d_den = group["d_denom"],
         )
 
         # recompute dlr with the updated d (for this group)
