@@ -1,5 +1,5 @@
 /venv
-
+/.vscode
 .idea
 *.bak
 *.pyc
@@ -26,7 +26,6 @@ extPt.py
 fixLora.py
 fixPt.py
 limpaLayer.py
-*.txt
 
 # environments
 /.venv*
