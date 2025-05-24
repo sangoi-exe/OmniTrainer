@@ -3,7 +3,7 @@
 /tools
 
 /venv
-
+/.vscode
 .idea
 *.bak
 *.pyc
