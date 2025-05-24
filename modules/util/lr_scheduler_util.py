@@ -134,6 +134,36 @@ def lr_lambda_rex(
     return lr_lambda
 
 
+def lr_lambda_parabolic(
+    scheduler_steps: int,
+    num_cycles: float = 1.0,
+    min_factor: float = 1.0,
+):
+    """
+    Scheduler parabólico cíclico:
+      -  f(0) = 1
+      -  f(scheduler_steps/(2*num_cycles)) = min_factor
+      -  f(scheduler_steps/num_cycles) = 1
+      -  repete isso num_cycles vezes
+    """
+    def lr_lambda(current_step: int):
+        # Depois de scheduler_steps, mantém 1
+        if current_step >= scheduler_steps:
+            return 1.0
+
+        # Comprimento de cada ciclo (pode ser float)
+        cycle_length = scheduler_steps / num_cycles
+
+        # Progresso dentro do ciclo atual, de [0, 1)
+        cycle_progress = (current_step % cycle_length) / cycle_length
+
+        # Fórmula da parábola: f(x) = 4*(1-min)*(x-0.5)^2 + min
+        factor = 4 * (1.0 - min_factor) * (cycle_progress - 0.5) ** 2 + min_factor
+        return factor
+
+    return lr_lambda
+
+
 def apply_min_factor(value: float, min_factor: float) -> float:
     #logFun(f"[DEBUG LAMBDA COSINE] value {value}")
     #logFun(f"[DEBUG LAMBDA COSINE] min_factor {min_factor}")

@@ -66,24 +66,6 @@ class StableDiffusionXLSampler(BaseModelSampler):
             vae = self.pipeline.vae
             vae_scale_factor = self.pipeline.vae_scale_factor
 
-            # --- DEBUG TAU CHECK ---
-            if hasattr(unet, 'tau_procs') and unet.tau_procs:
-                print(f"[SAMPLER DEBUG] UNet ({id(unet)}) possui 'tau_procs' com {len(unet.tau_procs)} processadores.")
-                # Listar alguns valores de log_tau para confirmação
-                count = 0
-                for proc_key, proc_module in unet.tau_procs.items():
-                    if hasattr(proc_module, 'log_tau'):
-                        print(f"[SAMPLER DEBUG]   Tau for '{proc_key}': log_tau = {proc_module.log_tau.item():.4f}, device={proc_module.log_tau.device}")
-                        count += 1
-                        if count >= 5: # Mostra os 5 primeiros para não poluir muito
-                            print(f"[SAMPLER DEBUG]   ... e mais {len(unet.tau_procs) - count} processadores tau.")
-                            break
-                if count == 0 and len(unet.tau_procs) > 0:
-                    print(f"[SAMPLER DEBUG]   AVISO: 'tau_procs' existe, mas nenhum módulo dentro dele parece ter 'log_tau'.")
-            else:
-                print(f"[SAMPLER DEBUG] AVISO: UNet ({id(unet)}) NÃO possui 'tau_procs' ou está vazio. Taus NÃO serão aplicados na amostragem.")
-            # --- FIM DEBUG TAU CHECK ---
-
             # prepare prompt
             self.model.text_encoder_to(self.train_device)
 

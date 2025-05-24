@@ -112,22 +112,19 @@ class LoraTab:
             components.label(master, 2, 3, "Use Norm Espilon (DoRA Only)",
                              tooltip="Add an epsilon to the norm divison calculation in DoRA. Can aid in training stability, and also acts as regularization.")
             components.switch(master, 2, 4, self.ui_state, "lora_decompose_norm_epsilon")
+            components.label(master, 3, 3, "Apply on output axis (DoRA Only)",
+                             tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
+            components.switch(master, 3, 4, self.ui_state, "lora_decompose_output_axis")
 
-        # Movido para linha 3 para acomodar os novos campos relacionados ao Delta Pattern
+        # lora rank
         components.label(master, 2, 0, f"{name} alpha",
-                         tooltip=f"The alpha parameter used when creating a new {name}")
+                         tooltip="The alpha parameter used when creating a new f{name}")
         components.entry(master, 2, 1, self.ui_state, "lora_alpha")
 
         # Dropout Percentage
-        # Movido para linha 3
         components.label(master, 3, 0, "Dropout Probability",
-                         tooltip="Dropout probability. Helps with overfitting. 0 disables, 1 maximum.")
+                         tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.")
         components.entry(master, 3, 1, self.ui_state, "dropout_probability")
-
-        # Use Delta Pattern (Novo) - Inserido na linha 3, colunas 3 e 4
-        components.label(master, 3, 3, "Use Delta Pattern",
-                         tooltip="Apply a pre-defined delta pattern during training.")
-        components.switch(master, 3, 4, self.ui_state, "train_gps_use_it")
 
         # lora weight dtype
         components.label(master, 4, 0, f"{name} Weight Data Type",
@@ -138,24 +135,12 @@ class LoraTab:
         ], self.ui_state, "lora_weight_dtype")
 
         # For use with additional embeddings.
-        # Save Delta Pattern (Novo) - Inserido na linha 4, colunas 3 e 4
-        components.label(master, 4, 3, "Save Delta Pattern",
-                         tooltip="Save the calculated delta pattern after training.")
-        components.switch(master, 4, 4, self.ui_state, "train_gps_save_it")
-
-        # Movido para linha 5
         components.label(master, 5, 0, "Bundle Embeddings",
-                         tooltip=f"Bundles any additional embeddings into the {name} output file")
+                         tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
         components.switch(master, 5, 1, self.ui_state, "bundle_additional_embeddings")
 
-        # Movido para linha 6
-        # Delta Pattern Weight (Novo) - Inserido na linha 5, colunas 3 e 4
-        components.label(master, 5, 3, "Delta Pattern Weight",
-                         tooltip="Weight multiplier for the delta pattern application.")
-        components.entry(master, 5, 4, self.ui_state, "train_gps_weight")
-
         components.label(master, 6, 0, "Layer Preset",
-                         tooltip="Select a preset defining which layers to train, or select 'Custom'")
+                         tooltip="Select a preset defining which layers to train, or select 'Custom' to define your own")
         self.layer_selector = components.options(
             master, 6, 1, self.presets_list, self.ui_state, "lora_layer_preset",
             command=self.__preset_set_layer_choice
@@ -167,48 +152,6 @@ class LoraTab:
         )
         self.prior_custom = self.train_config.lora_layers or ""
         self.layer_entry.grid(row=6, column=2, columnspan=3, sticky="ew")
-
-        # Layer Blacklist (Novo) - Inserido na linha 7
-        components.label(master, 7, 0, "Layer Blacklist",
-                         tooltip="Comma-separated list of layers to exclude from training (blacklist).")
-        blacklist_entry = components.entry(
-            master, 7, 1, self.ui_state, "lora_layers_blacklist",
-            tooltip="Comma-separated list of layers to exclude from training. Example: 'down_blocks.0,mid_block'"
-        )
-        # Ocupa colunas 1 a 4 para consistência com outros campos de texto longos.
-        blacklist_entry.grid(row=7, column=1, columnspan=4, sticky="ew")
-
-        # Gradient Checkpointing Layers (Novo) - Inserido na linha 8
-        components.label(master, 8, 0, "Grad Ckpt Layers", # Label abreviada para espaço
-                         tooltip="Comma-separated list of layer patterns to apply gradient checkpointing to. Leave empty for default behavior (usually ON for specific blocks).")
-        gradient_ckpt_entry = components.entry(
-            master, 8, 1, self.ui_state, "gradient_checkpointing_layers",
-            tooltip="Define specific layers for gradient checkpointing. Example: 'mid_block,up_blocks.1'"
-        )
-        # Ocupa colunas 1 a 4.
-        gradient_ckpt_entry.grid(row=8, column=1, columnspan=4, sticky="ew")
-
-        # Delta Pattern Path - Movido para linha 9
-        components.label(master, 9, 0, "Delta Pattern Path",
-                         tooltip="Path to the delta pattern file (.pt, .safetensors). Leave empty if not using.")
-        delta_path_entry = components.file_entry(
-            master, 9, 1, self.ui_state, "train_gps_path"
-        )
-        delta_path_entry.grid(row=9, column=1, columnspan=4, sticky="ew")
-
-        # Switch para usar DCoef Pattern
-        components.label(master, 10, 0, "Use DCoef Pattern",
-                         tooltip="Apply a pre-defined dcoef pattern per module.")
-        components.switch(master, 10, 1, self.ui_state, "adpt_dcoef_use_it")
-
-        # Campo para path do DCoef Pattern
-        components.label(master, 11, 0, "DCoef Pattern Path",
-                         tooltip="Path to the dcoef pattern profile (.json.gz). Leave empty if not using.")
-        dcoef_path_entry = components.file_entry(
-            master, 11, 1, self.ui_state, "adpt_dcoef_path"
-        )
-        dcoef_path_entry.grid(row=11, column=1, columnspan=4, sticky="ew")
-				
         # Some configs will come with the lora_layer_preset unset or wrong for
         # the new model, so let's set it now to a reasonable default so it hits
         # the UI correctly.

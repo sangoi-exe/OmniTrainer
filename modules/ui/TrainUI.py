@@ -36,6 +36,7 @@ import torch
 import customtkinter as ctk
 from customtkinter import AppearanceModeTracker
 
+from modules.sangoi.SangoiTab import SangoiTab # Adicionando import para SangoiTab
 
 class TrainUI(ctk.CTk):
     set_step_progress: Callable[[int, int], None]
@@ -61,6 +62,7 @@ class TrainUI(ctk.CTk):
     tabview: ctk.CTkTabview | None = None
     pause_switch_widget: ctk.CTkSwitch | None = None
     pause_switch_var: ctk.BooleanVar | None = None  # Nova variável
+    sangoi_tab_content: SangoiTab | None = None # Variável de instância para a SangoiTab
 
     def __init__(self):
         super().__init__()
@@ -167,7 +169,6 @@ class TrainUI(ctk.CTk):
         self.tabview = ctk.CTkTabview(frame, command=self._on_tab_change)  # Adiciona comando para lazy loading
         self.tabview.grid(row=0, column=0, sticky="nsew")
 
-        # START: Otimização - Adicionar apenas os nomes das abas
         self.tabview.add("general")
         self.tabview.add("model")
         self.tabview.add("data")
@@ -178,11 +179,11 @@ class TrainUI(ctk.CTk):
         self.tabview.add("tools")
         self.tabview.add("additional embeddings")
         self.tabview.add("cloud")
+        self.tabview.add("sangoi")
         # Abas condicionais (LoRA/Embedding) são adicionadas/removidas em change_training_method
 
         # Carrega o conteúdo da primeira aba visível ("general") imediatamente
         self._on_tab_change()
-        # END: Otimização - Adicionar apenas os nomes das abas
 
         # self.change_training_method(self.train_config.training_method) # Movido para o final de __init__
 
@@ -216,6 +217,7 @@ class TrainUI(ctk.CTk):
             "additional embeddings": ("additional_embeddings_tab", self.create_additional_embeddings_tab),
             "cloud": ("cloud_tab", self.create_cloud_tab),
             "LoRA": ("lora_tab_content", self.lora_tab),
+            "sangoi": ("sangoi_tab_content", self.create_sangoi_tab),
             "embedding": ("embedding_tab_content", self.embedding_tab),
         }
 
@@ -554,6 +556,13 @@ class TrainUI(ctk.CTk):
         lora_tab_instance = LoraTab(master, self.train_config, self.ui_state)
         # LoraTab provavelmente chama pack/grid internamente
         return lora_tab_instance  # Retorna a instância criada
+
+    def create_sangoi_tab(self, master) -> SangoiTab: # Novo método para criar a SangoiTab
+        # A classe SangoiTab já deve lidar com seu próprio 'master'
+        sangoi_tab_instance = SangoiTab(master, self.train_config, self.ui_state)
+        # SangoiTab provavelmente chama pack/grid internamente
+        return sangoi_tab_instance  # Retorna a instância criada
+
 
     def embedding_tab(self, master):  # Note: Renomeado de create_embedding_tab se necessário
         # Conteúdo original do método, garantindo usar 'master'

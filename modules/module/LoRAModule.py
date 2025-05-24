@@ -616,15 +616,15 @@ class DoRAModule(LoRAModule):
     # dora_num_dims is implicitly handled by norm calculation now
     dora_scale: Parameter | None  # Use Parameter for trainable scale
     norm_epsilon: bool
+    decompose_output_axis: bool
     train_device: torch.device  # Add train_device attribute
 
     def __init__(self, *args, **kwargs):
         # Pop DoRA specific kwargs before calling super().__init__
+        self.dora_scale = None
         self.norm_epsilon = kwargs.pop("norm_epsilon", 1e-6)  # Default epsilon
-        self.train_device = kwargs.pop(
-            "train_device", torch.device("cpu")
-        )  # Default device
-        self.dora_scale = None  # Initialize as None
+        self.train_device = kwargs.pop("train_device", torch.device("cpu"))  # Default device
+        self.decompose_output_axis = kwargs.pop('decompose_output_axis', False)
         # Call LoRAModule's __init__ with remaining args/kwargs
         super().__init__(*args, **kwargs)
         # Note: initialize_weights is called by super() if orig_module exists
@@ -640,14 +640,23 @@ class DoRAModule(LoRAModule):
         # wrangling that works for both Linear and Convolutional layers. If you
         # were just doing this for Linear, it would be substantially simpler.
         self.dora_num_dims = orig_weight.dim() - 1
-        self.dora_scale = nn.Parameter(
-            torch.norm(
-                orig_weight.reshape(orig_weight.shape[0], -1),
-                dim=1, keepdim=True)
-            .reshape(orig_weight.shape[0], *[1] * self.dora_num_dims)
-            .to(device=self.orig_module.weight.device)
-        )
-        del orig_weight
+        if self.decompose_output_axis:
+            self.dora_scale = nn.Parameter(
+                torch.norm(
+                    orig_weight.reshape(orig_weight.shape[0], -1),
+                    dim=1, keepdim=True)
+                .reshape(orig_weight.shape[0], *[1] * self.dora_num_dims)
+                .to(device=self.orig_module.weight.device)
+            )
+        else:
+            self.dora_scale = nn.Parameter(
+                torch.norm(
+                    orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
+                    dim=1, keepdim=True)
+                .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
+                .transpose(1, 0)
+                .to(device=self.orig_module.weight.device)
+            )
 
     def check_initialized(self):
         super().check_initialized()
@@ -660,9 +669,7 @@ class DoRAModule(LoRAModule):
 
         A = self.lora_down.weight
         B = self.lora_up.weight
-        orig_weight = get_unquantized_weight(
-            self.orig_module, A.dtype, self.train_device
-        )
+        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
         WP = orig_weight + (self.make_weight(A, B) * (self.alpha / self.rank))
         del orig_weight
         # A norm should never really end up zero at any point, but epsilon just
@@ -671,10 +678,20 @@ class DoRAModule(LoRAModule):
         # backpropagation in order to save VRAM (to do this, we detach it from
         # the gradient graph).
         eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        flat = WP.detach().view(WP.shape[0], -1)           # view evita realloc se contiguous
-        row_norm = flat.norm(dim=1, keepdim=True).add_(eps)
-        row_norm = row_norm.view(WP.shape[0], *[1]*self.dora_num_dims)
-        WP = self.dora_scale * (WP / row_norm)
+        if self.decompose_output_axis:
+            norm = WP.detach() \
+                    .reshape(WP.shape[0], -1) \
+                    .norm(dim=1) \
+                    .reshape(WP.shape[0], *[1] * self.dora_num_dims) \
+                    + eps
+        else:
+            norm = WP.detach() \
+                    .transpose(0, 1) \
+                    .reshape(WP.shape[1], -1) \
+                    .norm(dim=1, keepdim=True) \
+                    .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
+                    .transpose(0, 1) + eps
+        WP = self.dora_scale * (WP / norm)
         # In the DoRA codebase (and thus the paper results), they perform
         # dropout on the *input*, rather than between layers, so we duplicate
         # that here.
@@ -902,7 +919,8 @@ class LoRAModuleWrapper:
         # Cria módulos PEFT (agora usará as regras)
         self.lora_modules = self._initialize_peft_modules(orig_module)
         logFun(f"[LoRA] LoRAModuleWrapper '{self.prefix}' initialized with {len(self.lora_modules)} PEFT modules.", lvl="info")
-        self.generate_keys_by_block_file()
+        gen_keys = getattr(config, "gen_lora_keys", False)
+        if gen_keys: self.generate_keys_by_block_file()
 
     def _should_include_module(
         self, original_module_name: str, potential_peft_prefix_with_dot: str
@@ -1007,9 +1025,7 @@ class LoRAModuleWrapper:
                     rule_config = self.lora_layer_rules[matched_rule_pattern]
                     # Use .get() with fallback to global defaults
                     rank_to_use = rule_config.get("rank", self.default_rank)
-                    alpha_to_use = rule_config.get(
-                        "alpha", self.default_alpha
-                    )  # Already float
+                    alpha_to_use = rule_config.get("alpha", self.default_alpha)  # Already float
                     rule_applied = f"Rule ('{matched_rule_pattern}')"
 
                 # Prepara args/kwargs para o construtor do PEFT
@@ -1178,11 +1194,8 @@ class LoRAModuleWrapper:
                 rule_config = self.lora_layer_rules[matched_rule_pattern]
                 # Use .get() with fallback to global defaults
                 rank_to_use = rule_config.get("rank", self.default_rank)
-                alpha_to_use = rule_config.get(
-                    "alpha", self.default_alpha
-                )  # Already float
+                alpha_to_use = rule_config.get("alpha", self.default_alpha)  # Already float
                 rule_applied = f"Rule ('{matched_rule_pattern}')"
-            # END CHANGE
 
             # Args para o construtor do Dummy, usando rank/alpha determinados
             dummy_args = [peft_prefix, None, rank_to_use, alpha_to_use]

@@ -219,12 +219,30 @@ class BaseStableDiffusionXLSetup(
 				tokens_2=batch['tokens_2'],
 				text_encoder_1_layer_skip=config.text_encoder_layer_skip,
 				text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-				text_encoder_1_output=batch[
-					'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-				text_encoder_2_output=batch[
-					'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
-				pooled_text_encoder_2_output=batch[
-					'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+
+        # só busco hidden_states do batch se estivermos usando o pipeline normal (não long prompts)
+        text_encoder_1_output=(
+            batch['text_encoder_1_hidden_state']
+            if not config.train_text_encoder_or_embedding() and not config.enable_long_prompts
+            else None
+        ),
+        text_encoder_2_output=(
+            batch['text_encoder_2_hidden_state']
+            if not config.train_text_encoder_2_or_embedding() and not config.enable_long_prompts
+            else None
+        ),
+        pooled_text_encoder_2_output=(
+            batch['text_encoder_2_pooled_state']
+            if not config.train_text_encoder_2_or_embedding() and not config.enable_long_prompts
+            else None
+        ),
+        # e, para long prompts, passe o texto bruto em vez de tokens
+        text=(
+            batch['prompt']
+            if config.enable_long_prompts
+            else None
+        ),
+
 				text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
 				text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
 			))

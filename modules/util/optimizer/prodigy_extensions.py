@@ -165,7 +165,12 @@ def step_prodigy(self, closure=None):
             step = group["k"],
             d_num = group["d_numerator"],
             d_den = group["d_denom"],
+            dlr = d * lr * bias_correction,
         )
+        
+        # buceta = group["name"]
+        # if "dora" in buceta:
+        #     print(f"tem alpha na {buceta}")
 
         # recompute dlr with the updated d (for this group)
         dlr = d * lr * bias_correction

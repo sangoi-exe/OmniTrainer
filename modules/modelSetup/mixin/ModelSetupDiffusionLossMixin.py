@@ -41,7 +41,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.progress = None
         self.config = None
         self.loaded_pattern_deltas = None
-        self.loss_tracker = LossTracker(window_size=100, use_mad=False)
+        self.loss_tracker = LossTracker(window_size=100, use_mad=True)
         self.dynamic_loss_strengthing = DynamicLossControl()
 
     def __log_cosh_loss(

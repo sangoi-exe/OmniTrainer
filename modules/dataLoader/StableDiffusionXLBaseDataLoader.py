@@ -135,39 +135,33 @@ class StableDiffusionXLBaseDataLoader(
 
         image_aggregate_names = ['crop_resolution', 'image_path']
         
-        # START OneTrainer Long Prompt Mod
-        text_split_names = ['tokens_1', 'tokens_2'] # Always cache tokens
+        # // Sessão I by Gemini - CORREÇÃO: Definir text_split_names_for_cache corretamente e usá-la.
+        # Define text_split_names_for_cache based on long_prompts and training status
+        text_split_names_for_cache = ['tokens_1', 'tokens_2'] # Always cache tokens
         sort_base_names = ['prompt_1', 'prompt_2', 'concept'] # Base names needed for sorting/grouping
 
         # Conditionally add pre-computed embeddings to cache/sort if NOT using long prompts
         # and NOT training the respective encoder
         if not config.enable_long_prompts:
             if not config.train_text_encoder_or_embedding():
-                text_split_names.append('text_encoder_1_hidden_state')
+                text_split_names_for_cache.append('text_encoder_1_hidden_state')
                 sort_base_names.append('text_encoder_1_hidden_state')
             if not config.train_text_encoder_2_or_embedding():
-                text_split_names.append('text_encoder_2_hidden_state')
-                text_split_names.append('text_encoder_2_pooled_state')
+                text_split_names_for_cache.append('text_encoder_2_hidden_state')
+                text_split_names_for_cache.append('text_encoder_2_pooled_state')
                 sort_base_names.append('text_encoder_2_hidden_state')
                 sort_base_names.append('text_encoder_2_pooled_state')
-        # END OneTrainer Long Prompt Mod
 
-        text_split_names = []
+        # // Sessão I by Gemini - CORREÇÃO: Removida a re-inicialização e repopulação incorreta de text_split_names.
+        # text_split_names = [] # REMOVIDO - Esta linha zerava a lógica anterior.
 
-        sort_names = image_aggregate_names + image_split_names + [
-            'prompt_1', 'tokens_1', 'text_encoder_1_hidden_state',
-            'prompt_2', 'tokens_2', 'text_encoder_2_hidden_state', 'text_encoder_2_pooled_state',
-            'concept'
-        ]
-
-        if not config.train_text_encoder_or_embedding():
-            text_split_names.append('tokens_1')
-            text_split_names.append('text_encoder_1_hidden_state')
-
-        if not config.train_text_encoder_2_or_embedding():
-            text_split_names.append('tokens_2')
-            text_split_names.append('text_encoder_2_hidden_state')
-            text_split_names.append('text_encoder_2_pooled_state')
+        # A definição original de sort_names:
+        # sort_names = image_aggregate_names + image_split_names + [
+        # 'prompt_1', 'tokens_1', 'text_encoder_1_hidden_state',
+        # 'prompt_2', 'tokens_2', 'text_encoder_2_hidden_state', 'text_encoder_2_pooled_state',
+        # 'concept'
+        # ]
+        # A linha abaixo usa sort_base_names que foi corretamente definida no bloco "OneTrainer Long Prompt Mod" acima.
 
         sort_names = image_aggregate_names + image_split_names + sort_base_names
 
@@ -196,8 +190,8 @@ class StableDiffusionXLBaseDataLoader(
         # Use updated text_split_names
         image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
         
-        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
-        # END OneTrainer Long Prompt Mod
+        # // Sessão I by Gemini - CORREÇÃO: Usar text_split_names_for_cache que foi definida corretamente.
+        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names_for_cache, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
 
         modules = []
 
@@ -216,7 +210,7 @@ class StableDiffusionXLBaseDataLoader(
 
             if should_cache_text:
                  modules.append(text_disk_cache)
-                 sort_names = [x for x in sort_names if x not in text_split_names]
+                 sort_names = [x for x in sort_names if x not in text_split_names_for_cache]
             # END OneTrainer Long Prompt Mod
 
         if len(sort_names) > 0:
@@ -230,10 +224,11 @@ class StableDiffusionXLBaseDataLoader(
         # START OneTrainer Long Prompt Mod
         # Base output names, always include tokens and raw prompts
         output_names = [
-            'image_path', 'latent_image',
-            'prompt_1', 'prompt_2', # Raw prompts needed if encode_text uses them
-            'tokens_1', 'tokens_2', # Tokens needed if encode_text uses them (original path)
-            'original_resolution', 'crop_resolution', 'crop_offset',
+            'image_path', 'latent_image', 
+            'prompt', # // Sessão I by Gemini - CORREÇÃO: Adicionada a chave 'prompt' original para enable_long_prompts
+            'prompt_1', 'prompt_2', # Raw prompts needed if encode_text uses them 
+            'tokens_1', 'tokens_2', # Tokens needed if encode_text uses them (original path) 
+            'original_resolution', 'crop_resolution', 'crop_offset', 
         ]
         # END OneTrainer Long Prompt Mod
 

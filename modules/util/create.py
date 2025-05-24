@@ -113,6 +113,7 @@ from modules.util.lr_scheduler_util import (
     lr_lambda_cosine_with_hard_restarts,
     lr_lambda_cosine_with_restarts,
     lr_lambda_linear,
+    lr_lambda_parabolic,
     lr_lambda_rex,
     lr_lambda_warmup,
 )
@@ -406,6 +407,7 @@ def create_data_loader(
                 return StableDiffusionFineTuneVaeDataLoader(train_device, temp_device, config, model, train_progress, is_validation)
 
     return None
+
 
 
 def create_optimizer(
@@ -1108,6 +1110,13 @@ def create_lr_scheduler(
     match learning_rate_scheduler:
         case LearningRateScheduler.CONSTANT:
             lr_lambda = lr_lambda_constant()
+
+        case LearningRateScheduler.PARABOLIC:
+            lr_lambda = lr_lambda_parabolic(
+                scheduler_steps,
+                num_cycles,
+                min_factor
+            )
 
         case LearningRateScheduler.LINEAR:
             lr_lambda = lr_lambda_linear(

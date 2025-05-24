@@ -268,8 +268,39 @@ class TrainConfig(BaseConfig):
     enable_activation_offloading: bool
     layer_offload_fraction: float
     force_circular_padding: bool
+    
+		# sangoi settings
+    lora_layers_blacklist: list[str]
+    lora_modules_rank_rules: list[dict[str, int]] = []
+    lora_modules_alpha_rules: list[dict[str, int]] = []
+    gen_lora_keys: bool
+    
+    # text encoder long prompts
+    enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
+    long_prompt_max_chunks: int     
 
-    # data settings
+    # delta pattern settings
+    train_gps_save_it: bool
+    train_gps_use_it: bool
+    train_gps_path: str
+    train_gps_weight: float
+    delta_pattern_save_every: int = 0
+    delta_pattern_save_every_unit: TimeUnit = TimeUnit.EPOCH
+    
+    # dcoef pattern settings
+    adpt_dcoef_path: str
+    adpt_dcoef_use_it: bool
+    
+    # convctrl settings
+    convctrl_use_it: bool
+    
+		# dynrecorder settings
+    data_recorder: bool
+    
+		# which run
+    run_number: int = 1
+    
+		# data settings
     concept_file_name: str
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
@@ -347,10 +378,6 @@ class TrainConfig(BaseConfig):
     text_encoder_3: TrainModelPartConfig
     text_encoder_3_layer_skip: int
 
-    # text encoder long prompts
-    enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
-    long_prompt_max_chunks: int
-
     # vae
     vae: TrainModelPartConfig
 
@@ -386,15 +413,12 @@ class TrainConfig(BaseConfig):
     lora_alpha: float
     lora_decompose: bool
     lora_decompose_norm_epsilon: bool
+    lora_decompose_output_axis: bool
     lora_weight_dtype: DataType
     lora_layers: str  # comma-separated
     lora_layer_preset: str
     bundle_additional_embeddings: bool
     
-    lora_layers_blacklist: list[str]
-    lora_modules_rank_rules: list[dict[str, int]] = []
-    lora_modules_alpha_rules: list[dict[str, int]] = []
-
     # optimizer
     optimizer: TrainOptimizerConfig
     optimizer_defaults: dict[str, TrainOptimizerConfig]
@@ -428,27 +452,6 @@ class TrainConfig(BaseConfig):
 
     # secrets - not saved into config file
     secrets: SecretsConfig
-
-    # delta pattern settings
-    train_gps_save_it: bool
-    train_gps_use_it: bool
-    train_gps_path: str
-    train_gps_weight: float
-    delta_pattern_save_every: int = 0
-    delta_pattern_save_every_unit: TimeUnit = TimeUnit.EPOCH
-    
-    # dcoef pattern settings
-    adpt_dcoef_path: str
-    adpt_dcoef_use_it: bool
-    
-    # convctrl settings
-    convctrl_use_it: bool
-    
-		# dynrecorder settings
-    data_recorder: bool
-    
-		# which run
-    run_number: int = 1
     
 		# grad_sample
     add_grad_sample: bool = False
@@ -784,7 +787,25 @@ class TrainConfig(BaseConfig):
         data.append(("enable_activation_offloading", True, bool, False))
         data.append(("layer_offload_fraction", 0.0, float, False))
         data.append(("force_circular_padding", False, bool, False))
-
+        
+				# sangoi settings				
+        data.append(("lora_modules_rank_rules", [], list, False))
+        data.append(("lora_modules_alpha_rules", [], list, False))
+        data.append(("lora_layers_blacklist", [], list[str], False))
+        data.append(("gen_lora_keys", False, bool, False))
+        data.append(("train_gps_save_it", False, bool, False))
+        data.append(("train_gps_use_it", False, bool, False))
+        data.append(("train_gps_weight", 0.0, float, False))
+        data.append(("train_gps_path", "", str, False))
+        data.append(("adpt_dcoef_use_it", False, bool, False))
+        data.append(("adpt_dcoef_path", "", str, False))
+        data.append(("data_recorder", False, bool, False))
+        data.append(("convctrl_use_it", False, bool, False))
+        data.append(("run_number", 1, int, False))        
+        # text encoder long prompt
+        data.append(("enable_long_prompts", False, bool, False))
+        data.append(("long_prompt_max_chunks", 4, int, False)) 
+        
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concepts", None, list[ConceptConfig], True))
@@ -818,16 +839,7 @@ class TrainConfig(BaseConfig):
         data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
-        data.append(("train_gps_save_it", True, bool, False))
-        data.append(("train_gps_use_it", False, bool, False))
-        data.append(("train_gps_weight", 0.0, float, False))
-        data.append(("train_gps_path", "", str, False))
-        data.append(("adpt_dcoef_use_it", False, bool, False))
-        data.append(("adpt_dcoef_path", "", str, False))
-        data.append(("data_recorder", False, bool, False))
-        data.append(("convctrl_use_it", False, bool, False))
         data.append(("add_grad_sample", False, bool, False))
-        data.append(("run_number", 1, int, False))
         data.append(("log_cosh_strength", 0.0, float, False))
         data.append(("vb_loss_strength", 1.0, float, False))
         data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))
@@ -850,7 +862,6 @@ class TrainConfig(BaseConfig):
         data.append(("noising_bias", 0.0, float, False))
         data.append(("timestep_shift", 1.0, float, False))
         data.append(("dynamic_timestep_shifting", False, bool, False))
-
 
         # unet
         unet = TrainModelPartConfig.default_values()
@@ -898,10 +909,6 @@ class TrainConfig(BaseConfig):
         text_encoder_3.weight_dtype = DataType.NONE
         data.append(("text_encoder_3", text_encoder_3, TrainModelPartConfig, False))
         data.append(("text_encoder_3_layer_skip", 0, int, False))
-
-        # text encoder long prompt
-        data.append(("enable_long_prompts", False, bool, False))
-        data.append(("long_prompt_max_chunks", 3, int, False))    
 
         # vae
         vae = TrainModelPartConfig.default_values()
@@ -954,12 +961,10 @@ class TrainConfig(BaseConfig):
         data.append(("lora_alpha", 1.0, float, False))
         data.append(("lora_decompose", False, bool, False))
         data.append(("lora_decompose_norm_epsilon", True, bool, False))
+        data.append(("lora_decompose_output_axis", False, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("lora_layers", "", str, False))
         data.append(("lora_layer_preset", None, str, True))
-        data.append(("lora_modules_rank_rules", [], list, False))
-        data.append(("lora_modules_alpha_rules", [], list, False))
-        data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 
         # optimizer

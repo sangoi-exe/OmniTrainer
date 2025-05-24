@@ -237,7 +237,7 @@ class GenericTrainer(BaseTrainer):
         self._rich_layout = Layout(name="root")
         # // GEMINI-CODE 2024-08-29T11:00:00 - Layout ajustado para remover header e incluir área de progresso no footer
         self._rich_layout.split_column(Layout(name="main_content", size=3),
-                                       Layout(name="converge_control_status", ratio=5, visible=False),
+                                       Layout(name="converge_control_status", ratio=1, visible=False),
                                        Layout(name="footer_tqdm_area", size=2))
         # // GEMINI-CODE 2024-08-29T10:30:01 - Atualiza o main_content inicialmente e placeholder para novo footer
         self._rich_layout["main_content"].update(
@@ -587,8 +587,7 @@ class GenericTrainer(BaseTrainer):
             # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress para validação
             validation_task_id = None
             if self._rich_progress_footer:
-                validation_task_id = self._rich_progress_footer.add_task("Validação...",
-                                                                         total=current_epoch_length_validation)
+                validation_task_id = self._rich_progress_footer.add_task("Validação...", total=current_epoch_length_validation)
 
             try:
                 for validation_batch in self.validation_data_loader.get_data_loader():
@@ -1142,10 +1141,7 @@ class GenericTrainer(BaseTrainer):
                         else:
                             loss.backward()
                         has_gradient = True
-                        # print("--- Parâmetros Tau registrados na UNet ---")
-                        # for param_name, param in self.model.unet.tau_procs.named_parameters():
-                        #     if "log_tau" in param_name:
-                        #         print(f"  Encontrado: {param_name}, Requer Grad: {param.requires_grad}, Device: {param.device}, Dtype: {param.dtype}") 
+
                         accumulated_loss += loss.item()
                         if self.__is_update_step(train_progress):
                             if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
@@ -1202,21 +1198,20 @@ class GenericTrainer(BaseTrainer):
                                             # else: logFun(f"Módulo PEFT não encontrado para '{name}' para CC update", lvl="LOOP_DEBUG")
 
                                         # Registrar dados com DataRecorder
-                                        if self.recorder and self.converge_control and \
-                                            name in self.converge_control._deques_initialized_for_module:
-                                            
-                                            # Coletar métricas do ConvergeControl
-                                            cc_gd_hist = self.converge_control.gradient_disparity_hist.get(name)
-                                            cc_gd = cc_gd_hist[-1] if cc_gd_hist else None
-                                            
-                                            cc_snr_hist = self.converge_control.snr_hist.get(name)
-                                            cc_snr = cc_snr_hist[-1] if cc_snr_hist else None
-                                            
-                                            cc_gns_t_hist = self.converge_control.gns_temporal_hist.get(name)
-                                            cc_gns_t = cc_gns_t_hist[-1] if cc_gns_t_hist else None
-                                            
-                                            cc_gd_ewma = self.converge_control.gd_ewma.get(name)
-                                            cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name)
+                                        if self.recorder:
+                                            if self.converge_control and name in self.converge_control._deques_initialized_for_module:
+                                                # Coletar métricas do ConvergeControl
+                                                cc_gd_hist = self.converge_control.gradient_disparity_hist.get(name)
+                                                cc_gd = cc_gd_hist[-1] if cc_gd_hist else None
+                                                
+                                                cc_snr_hist = self.converge_control.snr_hist.get(name)
+                                                cc_snr = cc_snr_hist[-1] if cc_snr_hist else None
+                                                
+                                                cc_gns_t_hist = self.converge_control.gns_temporal_hist.get(name)
+                                                cc_gns_t = cc_gns_t_hist[-1] if cc_gns_t_hist else None
+                                                
+                                                cc_gd_ewma = self.converge_control.gd_ewma.get(name)
+                                                cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name)
 
                                             d_num_pdgy = None
                                             if d_num_pdgy_raw is not None:

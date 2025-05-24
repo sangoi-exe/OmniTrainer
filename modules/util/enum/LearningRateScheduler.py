@@ -10,6 +10,7 @@ class LearningRateScheduler(Enum):
     REX = 'REX'
     ADAFACTOR = 'ADAFACTOR'
     CUSTOM = 'CUSTOM'
+    PARABOLIC = 'PARABOLIC'
 
     def __str__(self):
         return self.value
