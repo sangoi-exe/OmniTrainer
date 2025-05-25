@@ -26,6 +26,18 @@ class LossTracker:
         self.mae_losses: deque = deque(maxlen=window_size)
         self.log_cosh_losses: deque = deque(maxlen=window_size)
 
+        self.sum, self.sum2, self.count = 0.0, 0.0, 0
+
+        def update_stats(self, x):
+            self.sum  += x
+            self.sum2 += x*x
+            self.count = min(self.count+1, self.window_size)
+
+        def mean_var(self):
+            mean = self.sum / max(self.count, 1)
+            var  = self.sum2 / max(self.count, 1) - mean*mean
+            return mean, max(var, 1e-16)**0.5
+
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
         """
         Updates the loss trackers with new loss values.
@@ -69,7 +81,6 @@ class LossTracker:
             
         arr = torch.cat(non_empty_processed_values)
 
-
         if arr.numel() == 0: # // Sessão VI by Gemini - CORREÇÃO: Checar numel após cat, caso non_empty_processed_values seja vazio (já coberto acima, mas dupla segurança)
             default_center = torch.tensor(0.0, dtype=torch.float32, device="cpu")
             default_scale = torch.tensor(1e-8, dtype=torch.float32, device="cpu")
@@ -106,42 +117,19 @@ class LossTracker:
             return median_val, torch.clamp(mad_val, min=1e-8)
 
     @torch.no_grad()
-    def compute_z_scores(
-        self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor]: # // Sessão V by Gemini - CORREÇÃO: Retorno é sempre Tensor
-        """
-        Computes z-scores for the given loss values.
+    def compute_z_scores(self, mse, mae, cosh):
+        losses   = torch.stack([mse, mae, cosh])                     # shape [3, …]
 
-        Args:
-            mse_loss (Tensor): The Mean Squared Error loss.
-            mae_loss (Tensor): The Mean Absolute Error loss.
-            log_cosh_loss (Tensor): The log-cosh loss.
+        centers  = torch.tensor([*self.compute_stats(self.mse_losses),
+                                *self.compute_stats(self.mae_losses),
+                                *self.compute_stats(self.log_cosh_losses)]
+                                , device=losses.device)              # [6] → reshape(3,2)
 
-        Returns:
-            Tuple[Tensor, Tensor, Tensor]:
-            The z-scores for MSE, MAE, and log-cosh losses.
-            Tensors (shape like input losses).
-        """
+        center, scale = centers.view(3, 2).unbind(dim=1)             # [3], [3]
+        scale  = torch.clamp(scale, min=1e-8).unsqueeze(1)           # broadcast
 
-        mse_center, mse_scale = self.compute_stats(list(self.mse_losses))
-        mae_center, mae_scale = self.compute_stats(list(self.mae_losses))
-        log_cosh_center, log_cosh_scale = self.compute_stats(list(self.log_cosh_losses))
-
-        # Os inputs (mse_loss, etc.) estão no device original (e.g., CUDA)
-        # Os centers/scales estão na CPU. Mover centers/scales para o device das losses.
-        device = mse_loss.device
-        mse_center_dev = mse_center.to(device)
-        mse_scale_dev = mse_scale.to(device)
-        mae_center_dev = mae_center.to(device)
-        mae_scale_dev = mae_scale.to(device)
-        log_cosh_center_dev = log_cosh_center.to(device)
-        log_cosh_scale_dev = log_cosh_scale.to(device)
-
-        mse_z = (mse_loss - mse_center_dev) / mse_scale_dev
-        mae_z = (mae_loss - mae_center_dev) / mae_scale_dev
-        log_cosh_z = (log_cosh_loss - log_cosh_center_dev) / log_cosh_scale_dev
-
-        return mse_z, mae_z, log_cosh_z
+        z = (losses - center.unsqueeze(1)) / scale                   # mesma shape de losses
+        return z[0], z[1], z[2]
 
 
 class DynamicLossControl:
@@ -195,137 +183,52 @@ class DynamicLossControl:
                     default_params[loss_type].update(schedule_params[loss_type])
         return default_params
 
+    # testando vetorização
     @torch.no_grad()
-    def adjust_weights(
-        self,
-        mse_z: Tensor, # // Sessão V by Gemini - CORREÇÃO: Z-scores são tensores
-        mae_z: Tensor, # // Sessão V by Gemini - CORREÇÃO: Z-scores são tensores
-        log_cosh_z: Tensor, # // Sessão V by Gemini - CORREÇÃO: Z-scores são tensores
-        config, # // Sessão V by Gemini - CORREÇÃO: Melhor tipar config se possível
-        progress, # // Sessão V by Gemini - CORREÇÃO: Melhor tipar progress se possível
-    ) -> Tuple[float, float, float]: # Retorna pesos escalares finais
-        _abs = torch.abs
-        _clamp_max = lambda t, val: torch.clamp(t, max=val)
-        # // Sessão V by Gemini - CORREÇÃO: _sum e _mean precisam lidar com dicionários de tensores
-        # e retornar tensores ou floats conforme o caso.
-        # A lógica abaixo já lida com isso caso a caso.
+    def adjust_weights(self, mse_z, mae_z, log_cosh_z, config, progress):
+        # ----- 1. empilha z-scores -----
+        z = torch.stack([mse_z, mae_z, log_cosh_z])                     # shape [3, …]
+        z = torch.clamp(z.abs(), max=self.outlier_threshold)
 
-        # Z-scores de entrada (mse_z, mae_z, log_cosh_z) são tensores.
-        # Todas as operações subsequentes (clamped_abs_z, inverted_z, base_weights)
-        # produzirão dicionários de tensores.
+        inv_z = (z.sum(dim=0, keepdim=True) + 1e-8 - z)                 # pesos inversos
+        w     = inv_z / (inv_z.sum(dim=0, keepdim=True) + 1e-8)         # base weights
 
-        clamped_abs_z = {
-            "mse": _clamp_max(_abs(mse_z), self.outlier_threshold),
-            "mae": _clamp_max(_abs(mae_z), self.outlier_threshold),
-            "log_cosh": _clamp_max(_abs(log_cosh_z), self.outlier_threshold),
-        }
-
-        # Soma dos z-scores clampados (será um tensor)
-        # torch.stack cria um novo tensor [3, batch_size (opcional)]
-        # .sum(dim=0) soma ao longo da dimensão dos tipos de loss, resultando em [batch_size (opcional)]
-        current_total_abs_z = torch.stack(list(clamped_abs_z.values())).sum(dim=0)
-        epsilon = 1e-8
-        current_total_abs_z_eps = current_total_abs_z + epsilon
-
-        inverted_z = {
-            loss: (current_total_abs_z_eps - z_val) / current_total_abs_z_eps 
-            for loss, z_val in clamped_abs_z.items()
-        }
-
-        sum_inv_z = torch.stack(list(inverted_z.values())).sum(dim=0) + epsilon
-        base_weights_tensor = { # Dicionário de tensores
-            loss: inv_z_val / sum_inv_z 
-            for loss, inv_z_val in inverted_z.items()
-        }
-
-        current_weights_to_process = base_weights_tensor
-
+        # ----- 2. EMA opcional -----
         if self.use_ema:
             if not self.initialized:
-                # self.ema_weights é Dict[str, Union[float, Tensor]]
-                # Inicializa com os tensores atuais
-                self.ema_weights = {loss: base_weights_tensor[loss].clone() for loss in base_weights_tensor}
+                self.ema_weights = w.clone()
                 self.initialized = True
             else:
-                alpha = self.ema_decay # // Sessão V by Gemini - CORREÇÃO: alpha = ema_decay, não 1-ema_decay se ema_decay é o fator de retenção do histórico
-                                       # Se ema_decay é o fator para o novo valor, então alpha = ema_decay.
-                                       # Padrão: new_ema = (1-decay)*old_ema + decay*new_value. Então alpha é decay.
-                                       # Seu código: (1-alpha)*old + alpha*new. Se ema_decay é o "decay" do histórico,
-                                       # então alpha (peso do novo valor) = 1 - ema_decay.
-                                       # Se ema_decay é o peso do NOVO valor, então alpha = ema_decay.
-                                       # Vou assumir que self.ema_decay é o "alpha" para o novo valor.
-                alpha_new_value = self.ema_decay # Ex: 0.1 para contribuição do novo valor
-                alpha_old_value = 1.0 - alpha_new_value
+                self.ema_weights = (1 - self.ema_decay) * self.ema_weights + self.ema_decay * w
+            w = self.ema_weights                                         # shape [3, …]
 
-                for loss_name in self.ema_weights:
-                    # Garantir que self.ema_weights[loss_name] e base_weights_tensor[loss_name]
-                    # estejam no mesmo dispositivo antes da operação.
-                    # base_weights_tensor[loss_name] está no device dos z-scores.
-                    # self.ema_weights[loss_name] pode estar na CPU se inicializado com float, ou device dos z-scores.
-                    
-                    # // Sessão V by Gemini - CORREÇÃO: Garantir que device e dtype sejam consistentes para EMA.
-                    # Os z_scores (e portanto base_weights_tensor) estão no device da loss (e.g. CUDA).
-                    # ema_weights deve ser movido para esse device se ainda não estiver.
-                    current_ema_val = self.ema_weights[loss_name]
-                    new_base_val = base_weights_tensor[loss_name]
-                    
-                    if isinstance(current_ema_val, float): # Primeira vez após inicialização com float
-                        current_ema_val = torch.tensor(current_ema_val, device=new_base_val.device, dtype=new_base_val.dtype)
-                    
-                    # Assegurar que current_ema_val está no mesmo device que new_base_val
-                    current_ema_val = current_ema_val.to(new_base_val.device)
+        # ----- 3. scheduler vetorizado -----
+        frac = 0.0 if config.epochs <= 1 else progress.epoch / (config.epochs - 1)
 
-                    self.ema_weights[loss_name] = alpha_old_value * current_ema_val + alpha_new_value * new_base_val
-            
-            sum_ema_tensor = torch.stack(list(self.ema_weights.values())).sum(dim=0) + epsilon
-            normalized_ema_weights_tensor = { # Dicionário de tensores
-                loss_name: w_val / sum_ema_tensor
-                for loss_name, w_val in self.ema_weights.items()
-            }
-            current_weights_to_process = normalized_ema_weights_tensor
-        
-        # Scheduler (opera com floats, fatores de agendamento são floats)
-        # config.epochs e progress.epoch são escalares
-        if config.epochs > 1: # // Sessão V by Gemini - CORREÇÃO: Acessar epochs de config
-            frac = progress.epoch / float(config.epochs - 1) # // Sessão V by Gemini - CORREÇÃO: Acessar epoch de progress
-        else:
-            frac = 0.0
-        frac = max(0.0, min(frac, 1.0))
+        sched_start = torch.tensor([                                   # [mse, mae, cosh]
+            self.schedule_params["mse"     ]["start"],
+            self.schedule_params["mae"     ]["start"],
+            self.schedule_params["log_cosh"]["start"],
+        ], device=w.device)
 
-        scheduled_factors_float = {} # Dicionário de floats
-        for loss, params in self.schedule_params.items():
-            scheduled_factors_float[loss] = (
-                params["start"] * (1 - frac) + params["end"] * frac
-            )
+        sched_end = torch.tensor([
+            self.schedule_params["mse"     ]["end"],
+            self.schedule_params["mae"     ]["end"],
+            self.schedule_params["log_cosh"]["end"],
+        ], device=w.device)
 
-        # Multiplica cada tensor de peso pelo fator float do scheduler (broadcasting)
-        weighted_weights_tensor = { # Dicionário de tensores
-            loss_name: current_weights_to_process[loss_name] * scheduled_factors_float[loss_name]
-            for loss_name in current_weights_to_process
-        }
+        sched = sched_start + frac * (sched_end - sched_start)          # shape [3]
 
-        sum_weighted_tensor = torch.stack(list(weighted_weights_tensor.values())).sum(dim=0) + epsilon
-        final_weights_tensor = { # Dicionário de tensores
-            loss_name: w_val / sum_weighted_tensor
-            for loss_name, w_val in weighted_weights_tensor.items()
-        }
+        # ----- 4. aplica scheduler, normaliza e devolve floats -----
+        w = w * sched[:, None]                                          # broadcasting
+        w = w / (w.sum(dim=0, keepdim=True) + 1e-8)
 
-        # Redução para escalar: pegar a média dos pesos no batch (se os z-scores eram por batch)
-        # ou o valor escalar se os z-scores já eram escalares.
-        # Como z-scores são agora sempre tensores, os final_weights_tensor são tensores.
-        final_weights_scalar = { # Dicionário de floats
-            loss_name: float(w_val.mean()) # .mean() em tensor 0-dim é ele mesmo, .mean() em 1D+ é a média
-            for loss_name, w_val in final_weights_tensor.items()
-        }
+        w_mse, w_mae, w_cosh = w.mean(dim=list(range(1, w.ndim))).tolist()
+        return w_mse, w_mae, w_cosh
+    # ========= fim =========
 
-        return (
-            final_weights_scalar["mse"],
-            final_weights_scalar["mae"],
-            final_weights_scalar["log_cosh"],
-        )
 
     def maybe_log_deltas(self, tensorboard, delta_regularizer, progress):
-        # // Sessão V by Gemini - CORREÇÃO: Checar se self.progress foi setado
         if not hasattr(self, "progress") or self.progress is None : 
             # Se self.progress não foi setado externamente, usar o 'progress' do argumento.
             # No entanto, o 'progress' da classe é usado para last_logged_delta_epoch.
@@ -347,9 +250,10 @@ class DynamicLossControl:
         current_norm, reference_norm = delta_regularizer.get_delta_norms()
         
         # // Sessão V by Gemini - CORREÇÃO: tensorboard pode ser None, checar antes de usar
-        if tensorboard is not None:
-            tensorboard.add_scalar("Deltas/Current_Norm", current_norm, current_progress_obj.epoch)
-            tensorboard.add_scalar("Deltas/Reference_Norm", reference_norm, current_progress_obj.epoch)
+        if tensorboard:
+            tensorboard.add_scalars("Deltas",
+                {"Current": current_norm, "Reference": reference_norm},
+                global_step=progress.epoch)
 
 
         print(

@@ -244,8 +244,7 @@ class GenericTrainer(BaseTrainer):
             Text("Aguardando início do treinamento...\n(Ctrl+C para parar)", justify="center", style="dim"))
         self._rich_layout["footer_tqdm_area"].update(
             self._rich_progress_footer)  # Área do rodapé agora usa o objeto Progress
-
-    # // GEMINI-CODE {timestamp} - NOVA FUNÇÃO PARA ATUALIZAR O HEADER
+    
     def _generate_main_content_text(self,
                                     current_loss: Optional[float] = None,
                                     current_ema_loss: Optional[float] = None) -> Text:

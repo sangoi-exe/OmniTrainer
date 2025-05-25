@@ -299,7 +299,12 @@ class StableDiffusionXLModel(BaseModel):
                 max_seq_len_1_actual = 0
                 max_seq_len_2_actual = 0
 
-                for single_prompt_text in text_list:
+                # // Sessão DBG - Depuração de chunking
+                if self.train_config.debugoi:
+                    print(f"// Sessão DBG - encode_text (long_prompts): Processando {len(text_list)} prompts.")
+                # // Sessão DBG - Fim da depuração de chunking
+
+                for idx, single_prompt_text in enumerate(text_list):
                     # Se single_prompt_text for None ou string vazia, _chunk_tokenizer deve lidar com isso
                     # retornando chunks vazios, e a lógica subsequente criará tensores (1, 0, H).
                     processed_text_1 = self.add_text_encoder_1_embeddings_to_prompt(single_prompt_text or "") # // Sessão III by Gemini - CORREÇÃO: Passar "" se None
@@ -310,15 +315,26 @@ class StableDiffusionXLModel(BaseModel):
 
                     token_chunks_1 = token_chunks_1[:max_chunks]
                     token_chunks_2 = token_chunks_2[:max_chunks]
-                    
+
+                    # <<< CHATGPT ADD – pré-carrega todos os chunks no device *uma* vez >>> 
+                    token_chunks_1_gpu = [tc.to(self.text_encoder_1.device, non_blocking=True)
+                                          for tc in token_chunks_1]
+                    token_chunks_2_gpu = [tc.to(self.text_encoder_2.device, non_blocking=True)
+                                          for tc in token_chunks_2]
+
                     num_chunks_1 = len(token_chunks_1)
                     num_chunks_2 = len(token_chunks_2)
+
+                    # // Sessão DBG - Depuração de chunking por prompt
+                    if self.train_config.debugoi:
+                        print(f"// Sessão DBG - encode_text (prompt {idx}): Chunks TE1: {num_chunks_1}, Chunks TE2: {num_chunks_2}")
+                    # // Sessão DBG - Fim da depuração de chunking por prompt                    
 
                     chunk_embeddings_1: List[Tensor] = []
                     current_pooled_output_2_for_prompt: Tensor = None 
 
-                    for i in range(num_chunks_1):
-                        tokens_1_chunk = token_chunks_1[i].unsqueeze(0).to(self.text_encoder_1.device)
+                    for i, tokens_1_chunk in enumerate(token_chunks_1_gpu):
+                        tokens_1_chunk = tokens_1_chunk.unsqueeze(0) 
                         chunk_output_1, _ = encode_clip(
                             text_encoder=self.text_encoder_1, tokens=tokens_1_chunk, default_layer=-2,
                             layer_skip=text_encoder_1_layer_skip, add_pooled_output=False,
@@ -340,8 +356,8 @@ class StableDiffusionXLModel(BaseModel):
                     max_seq_len_1_actual = max(max_seq_len_1_actual, prompt_output_1.shape[1])
 
                     chunk_embeddings_2: List[Tensor] = []
-                    for i in range(num_chunks_2):
-                        tokens_2_chunk = token_chunks_2[i].unsqueeze(0).to(self.text_encoder_2.device)
+                    for i, tokens_2_chunk in enumerate(token_chunks_2_gpu):
+                        tokens_2_chunk = tokens_2_chunk.unsqueeze(0)  
                         chunk_output_2, pooled_out_2_chunk = encode_clip(
                             text_encoder=self.text_encoder_2, tokens=tokens_2_chunk, default_layer=-2,
                             layer_skip=text_encoder_2_layer_skip, add_pooled_output=True,
@@ -437,12 +453,12 @@ class StableDiffusionXLModel(BaseModel):
             if final_text_encoder_2_output is not None and final_text_encoder_2_output.numel() > 0:
                 final_text_encoder_2_output = final_text_encoder_2_output * dropout_text_encoder_2_mask.view(-1, 1, 1).to(final_text_encoder_2_output.device)
 
-        if final_text_encoder_1_output is not None:
-            final_text_encoder_1_output = final_text_encoder_1_output.to(train_device)
-        if final_text_encoder_2_output is not None:
-            final_text_encoder_2_output = final_text_encoder_2_output.to(train_device)
-        if final_pooled_text_encoder_2_output is not None:
-            final_pooled_text_encoder_2_output = final_pooled_text_encoder_2_output.to(train_device)
+        # // Sessão DBG - Antes de retornar de encode_text
+        if self.train_config.debugoi:
+            print(f"// Sessão DBG - encode_text: Final TE1 output.shape: {final_text_encoder_1_output.shape}, .device: {final_text_encoder_1_output.device}")
+            print(f"// Sessão DBG - encode_text: Final TE2 output.shape: {final_text_encoder_2_output.shape}, .device: {final_text_encoder_2_output.device}")
+            print(f"// Sessão DBG - encode_text: Final Pooled TE2 output.shape: {final_pooled_text_encoder_2_output.shape}, .device: {final_pooled_text_encoder_2_output.device}")
+        # // Sessão DBG - Fim da depuração
 
         return final_text_encoder_1_output, final_text_encoder_2_output, final_pooled_text_encoder_2_output
 
@@ -452,6 +468,12 @@ class StableDiffusionXLModel(BaseModel):
             text_encoder_2_output: Tensor,
             pooled_text_encoder_2_output: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        if self.train_config.debugoi:
+            print(f"// Sessão DBG - combine_text_encoder_output: Inputs:")
+            print(f"// Sessão DBG - combine_text_encoder_output: TE1 input shape: {text_encoder_1_output.shape}, device: {text_encoder_1_output.device}")
+            print(f"// Sessão DBG - combine_text_encoder_output: TE2 input shape: {text_encoder_2_output.shape}, device: {text_encoder_2_output.device}")
+            print(f"// Sessão DBG - combine_text_encoder_output: Pooled TE2 input shape: {pooled_text_encoder_2_output.shape}, device: {pooled_text_encoder_2_output.device}")
+        # // Sessão DBG - Fim da depuração        
         # // Sessão II by Gemini - CORREÇÃO: Simplificar e garantir consistência de device/dtype
         # Assume-se que text_encoder_1_output e text_encoder_2_output já estão padronizados
         # para o mesmo comprimento de sequência se vierem da lógica de long_prompts refatorada.
@@ -484,9 +506,14 @@ class StableDiffusionXLModel(BaseModel):
         target_device = pooled_text_encoder_2_output.device
         target_dtype = pooled_text_encoder_2_output.dtype 
 
-        # // Sessão III by Gemini - CORREÇÃO: Garantir que tensores não sejam None antes de .to()
-        te1_output_c = text_encoder_1_output.to(device=target_device, dtype=target_dtype) if text_encoder_1_output is not None else None
-        te2_output_c = text_encoder_2_output.to(device=target_device, dtype=target_dtype) if text_encoder_2_output is not None else None
+        def _safe_to(t: torch.Tensor | None):
+            # <<< CHATGPT ADD – só converte se realmente mudar device ou dtype >>>
+            if t is None or (t.device == target_device and t.dtype == target_dtype):
+                return t
+            return t.to(device=target_device, dtype=target_dtype, non_blocking=True)
+        
+        te1_output_c = _safe_to(text_encoder_1_output)
+        te2_output_c = _safe_to(text_encoder_2_output)
         pooled_output_c = pooled_text_encoder_2_output # Já está no device/dtype correto ou é None
 
         # // Sessão III by Gemini - CORREÇÃO: Lidar com te1_output_c ou te2_output_c sendo None
@@ -535,6 +562,13 @@ class StableDiffusionXLModel(BaseModel):
                 combined_hidden_size = max(hs1, hs2) # Não ideal, mas melhor que 0 se um for 0
             
             text_encoder_output = torch.zeros((current_bs, 0, combined_hidden_size), device=target_device, dtype=target_dtype)
+
+        # // Sessão DBG - Antes de retornar de combine_text_encoder_output
+        if self.train_config.debug_mode:
+            print(f"// Sessão DBG - combine_text_encoder_output: Outputs:")
+            print(f"// Sessão DBG - combine_text_encoder_output: Combined TE output shape: {text_encoder_output.shape}, device: {text_encoder_output.device}")
+            print(f"// Sessão DBG - combine_text_encoder_output: Pooled TE2 output shape: {pooled_output_c.shape}, device: {pooled_output_c.device}")
+        # // Sessão DBG - Fim da depuração            
 
         elif te1_output_c is not None and te2_output_c is not None and te1_output_c.shape[1] != te2_output_c.shape[1]:
             print(f"[WARN] Mismatched sequence lengths in combine_text_encoder_output: TE1={te1_output_c.shape[1]}, TE2={te2_output_c.shape[1]}. Concatenating with shortest length.")

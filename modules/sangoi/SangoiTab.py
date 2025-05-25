@@ -55,7 +55,11 @@ class SangoiTab:
         components.label(self.main_frame, row_index, 2, "Use Long Prompts",
                          tooltip="Process more than 77 tokens")
         components.switch(self.main_frame, row_index, 3, self.ui_state, "enable_long_prompts")
+
         # Slot 3 (cols 4, 5) fica em branco
+        components.label(self.main_frame, row_index, 4, "Sangoi Debug",
+                         tooltip="Debug pros meus badalhos")
+        components.switch(self.main_frame, row_index, 5, self.ui_state, "debugoi")
         row_index += 1
         
         # --- Row 2: Use Delta Pattern & Save Delta Pattern ---

@@ -274,6 +274,7 @@ class TrainConfig(BaseConfig):
     lora_modules_rank_rules: list[dict[str, int]] = []
     lora_modules_alpha_rules: list[dict[str, int]] = []
     gen_lora_keys: bool
+    debugoi: bool
     
     # text encoder long prompts
     enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
@@ -793,6 +794,7 @@ class TrainConfig(BaseConfig):
         data.append(("lora_modules_alpha_rules", [], list, False))
         data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("gen_lora_keys", False, bool, False))
+        data.append(("debugoi", False, bool, False))
         data.append(("train_gps_save_it", False, bool, False))
         data.append(("train_gps_use_it", False, bool, False))
         data.append(("train_gps_weight", 0.0, float, False))

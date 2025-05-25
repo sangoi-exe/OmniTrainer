@@ -1,5 +1,6 @@
 from abc import ABCMeta
 from collections.abc import Callable
+import math
 import traceback
 
 from modules.module.AestheticScoreModel import AestheticScoreModel
@@ -67,47 +68,36 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         progress = self.progress
         losses = 0
 
-        mse_loss = torch.tensor(0.0, device=data["predicted"].device)
-        mae_loss = torch.tensor(0.0, device=data["predicted"].device)
-        log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
+				# teste de vetorização
+        diff = data["predicted"] - data["target"]           # ← cálculo único
 
-        # MSE/L2 Loss
+        mse_loss = mae_loss = log_cosh_loss = torch.tensor(0., device=diff.device)
+
         if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
             mse_loss = masked_losses(
-                losses=F.mse_loss(
-                    data["predicted"],
-                    data["target"],
-                    reduction="none",
-                ),
+                losses=diff.pow(2),                         # MSE sem 2ª subtração
                 mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
             ).mean([1, 2, 3])
 
-        # MAE/L1 Loss
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
             mae_loss = masked_losses(
-                losses=F.l1_loss(
-                    data["predicted"],
-                    data["target"],
-                    reduction="none",
-                ),
+                losses=diff.abs(),                          # MAE idem
                 mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
             ).mean([1, 2, 3])
 
-        # log-cosh Loss
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
+            log_cosh_tensor = diff + torch.nn.functional.softplus(-2.0 * diff) - math.log(2.0)
             log_cosh_loss = masked_losses(
-                losses=self.__log_cosh_loss(
-                    data["predicted"],
-                    data["target"],
-                ),
+                losses=log_cosh_tensor,                     # log-cosh reaproveitando diff
                 mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
             ).mean([1, 2, 3])
+
 
         match config.loss_mode_fn:
             case config.loss_mode_fn.ORIGINAL:
