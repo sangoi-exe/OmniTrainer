@@ -28,15 +28,32 @@ class LossTracker:
 
         self.sum, self.sum2, self.count = 0.0, 0.0, 0
 
-        def update_stats(self, x):
-            self.sum  += x
-            self.sum2 += x*x
-            self.count = min(self.count+1, self.window_size)
+    def update_stats(self, x):
+        self.sum  += x
+        self.sum2 += x*x
+        self.count = min(self.count+1, self.window_size)
 
-        def mean_var(self):
-            mean = self.sum / max(self.count, 1)
-            var  = self.sum2 / max(self.count, 1) - mean*mean
-            return mean, max(var, 1e-16)**0.5
+    def mean_var(self):
+        mean = self.sum / max(self.count, 1)
+        var  = self.sum2 / max(self.count, 1) - mean*mean
+        return mean, max(var, 1e-16)**0.5
+
+    def _get_defaults(self) -> Tuple[Tensor, Tensor]:
+        """Retorna valores padrão quando não há dados suficientes"""
+        return torch.tensor(0.0), torch.tensor(1.0)
+
+    def _compute_robust_stats(self, arr: Tensor) -> Tuple[Tensor, Tensor]:
+        """Computa estatísticas robustas (mediana/MAD ou média/std)"""
+        if self.use_mad:
+            # Mediana e MAD (Median Absolute Deviation)
+            median = torch.median(arr)
+            mad = torch.median(torch.abs(arr - median))
+            return median, torch.clamp(mad * 1.4826, min=1e-8)  # Fator de escala para MAD
+        else:
+            # Média e desvio padrão
+            mean = torch.mean(arr)
+            std = torch.std(arr, unbiased=False)
+            return mean, torch.clamp(std, min=1e-8)
 
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
         """
@@ -51,70 +68,31 @@ class LossTracker:
         self.mae_losses.append(mae_loss.detach().cpu())
         self.log_cosh_losses.append(log_cosh_loss.detach().cpu())
 
-    def compute_stats(
-        self, values_list: List[Union[float, Tensor]]
-    ) -> Tuple[Tensor, Tensor]: 
-        if not values_list: 
-            default_center = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-            default_scale = torch.tensor(1e-8, dtype=torch.float32, device="cpu")
-            return default_center, default_scale
-
-        processed_values = []
+    def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[Tensor, Tensor]:
+        """Computa estatísticas de uma lista de valores"""
+        if not values_list:
+            return self._get_defaults()
+        
+        # Conversão mais robusta
+        tensors = []
         for v in values_list:
-            if isinstance(v, Tensor):
-                processed_values.append(v.reshape(-1)) 
-            else: 
-                processed_values.append(torch.tensor(v, dtype=torch.float32, device="cpu").reshape(-1)) # // Sessão VI by Gemini - CORREÇÃO: Garantir que float convertido para tensor também seja achatado
+            try:
+                if isinstance(v, Tensor):
+                    if v.numel() > 0:
+                        tensors.append(v.flatten().float())
+                else:
+                    tensors.append(torch.tensor(float(v)).flatten())
+            except (ValueError, RuntimeError):
+                continue  # Pula valores inválidos
         
-        if not processed_values: 
-             default_center = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-             default_scale = torch.tensor(1e-8, dtype=torch.float32, device="cpu")
-             return default_center, default_scale
+        if not tensors:
+            return self._get_defaults()
         
-        # // Sessão VI by Gemini - CORREÇÃO: Verificar se processed_values contém tensores não vazios antes de torch.cat
-        non_empty_processed_values = [pv for pv in processed_values if pv.numel() > 0]
-        if not non_empty_processed_values:
-            # Se todos os tensores em values_list eram vazios
-            default_center = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-            default_scale = torch.tensor(1e-8, dtype=torch.float32, device="cpu")
-            return default_center, default_scale
-            
-        arr = torch.cat(non_empty_processed_values)
-
-        if arr.numel() == 0: # // Sessão VI by Gemini - CORREÇÃO: Checar numel após cat, caso non_empty_processed_values seja vazio (já coberto acima, mas dupla segurança)
-            default_center = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-            default_scale = torch.tensor(1e-8, dtype=torch.float32, device="cpu")
-            return default_center, default_scale
+        arr = torch.cat(tensors)
+        if arr.numel() == 0:
+            return self._get_defaults()
         
-        if arr.numel() == 1: # // Sessão VI by Gemini - CORREÇÃO: Tratar explicitamente o caso de 1 elemento
-            center_val = arr.clone() # ou arr[0] se quiser garantir que é 0-dim, mas arr já é 0-dim ou 1-dim com 1 elemento
-            if center_val.ndim > 0 : # Se for 1D com 1 elemento, pegar o elemento
-                center_val = center_val[0]
-            scale_val = torch.tensor(1e-8, dtype=torch.float32, device="cpu")
-            return center_val, scale_val
-
-
-        if not self.use_mad:
-            mean_val = arr.mean() 
-            std_val = arr.std(unbiased=False) 
-            return mean_val, torch.clamp(std_val, min=1e-8)
-        else:
-            # // Sessão VI by Gemini - CORREÇÃO: Lidar com torch.median retornando tensor ou tupla
-            median_result = torch.median(arr)
-            if isinstance(median_result, tuple):
-                median_val = median_result[0]
-            else: # É um tensor 0-dim
-                median_val = median_result
-            
-            abs_dev = torch.abs(arr - median_val) 
-            
-            mad_result = torch.median(abs_dev)
-            if isinstance(mad_result, tuple):
-                mad_val = mad_result[0]
-            else: # É um tensor 0-dim
-                mad_val = mad_result
-            
-            return median_val, torch.clamp(mad_val, min=1e-8)
+        return self._compute_robust_stats(arr)
 
     @torch.no_grad()
     def compute_z_scores(self, mse, mae, cosh):
@@ -158,8 +136,11 @@ class DynamicLossControl:
         self.use_ema: bool = use_ema
         self.ema_decay: float = ema_decay
         self.outlier_threshold: float = outlier_threshold
-        self.progress = None # // Sessão V by Gemini - CORREÇÃO: Inicializar progress, será setado externamente
-        self.last_logged_delta_epoch = -1 # // Sessão V by Gemini - CORREÇÃO: Inicializar last_logged_delta_epoch
+        self.progress = None
+        self.last_logged_delta_epoch = -1
+        self.progress = None
+        self.last_logged_delta_epoch = -1
+        self._sched_tensors_cached = False
 
         self.schedule_params: Dict[str, Dict[str, float]] = (
             self._initialize_schedule_params(schedule_params)
@@ -183,17 +164,37 @@ class DynamicLossControl:
                     default_params[loss_type].update(schedule_params[loss_type])
         return default_params
 
+    def _cache_schedule_tensors(self, device):
+        self._sched_start = torch.tensor([
+            self.schedule_params["mse"]["start"],
+            self.schedule_params["mae"]["start"], 
+            self.schedule_params["log_cosh"]["start"]
+        ], device=device)
+        
+        self._sched_end = torch.tensor([
+            self.schedule_params["mse"]["end"],
+            self.schedule_params["mae"]["end"],
+            self.schedule_params["log_cosh"]["end"]
+        ], device=device)
+        
+        self._sched_tensors_cached = True
+
     # testando vetorização
     @torch.no_grad()
     def adjust_weights(self, mse_z, mae_z, log_cosh_z, config, progress):
-        # ----- 1. empilha z-scores -----
-        z = torch.stack([mse_z, mae_z, log_cosh_z])                     # shape [3, …]
-        z = torch.clamp(z.abs(), max=self.outlier_threshold)
+        device = mse_z.device
+        
+        # Cache de tensores constantes
+        if not hasattr(self, '_sched_tensors_cached') or not self._sched_tensors_cached:
+            self._cache_schedule_tensors(device)
 
-        inv_z = (z.sum(dim=0, keepdim=True) + 1e-8 - z)                 # pesos inversos
-        w     = inv_z / (inv_z.sum(dim=0, keepdim=True) + 1e-8)         # base weights
+        z = torch.stack([mse_z, mae_z, log_cosh_z])
+        z_clamped = torch.clamp(z.abs(), max=self.outlier_threshold)
+        
+        z_sum = z_clamped.sum(dim=0, keepdim=True)
+        inv_z = z_sum - z_clamped + 1e-8
+        w = inv_z / (inv_z.sum(dim=0, keepdim=True) + 1e-8)    # base weights
 
-        # ----- 2. EMA opcional -----
         if self.use_ema:
             if not self.initialized:
                 self.ema_weights = w.clone()
@@ -202,7 +203,6 @@ class DynamicLossControl:
                 self.ema_weights = (1 - self.ema_decay) * self.ema_weights + self.ema_decay * w
             w = self.ema_weights                                         # shape [3, …]
 
-        # ----- 3. scheduler vetorizado -----
         frac = 0.0 if config.epochs <= 1 else progress.epoch / (config.epochs - 1)
 
         sched_start = torch.tensor([                                   # [mse, mae, cosh]
@@ -219,43 +219,32 @@ class DynamicLossControl:
 
         sched = sched_start + frac * (sched_end - sched_start)          # shape [3]
 
-        # ----- 4. aplica scheduler, normaliza e devolve floats -----
+
         w = w * sched[:, None]                                          # broadcasting
         w = w / (w.sum(dim=0, keepdim=True) + 1e-8)
-
         w_mse, w_mae, w_cosh = w.mean(dim=list(range(1, w.ndim))).tolist()
+
+        self.progress = progress
         return w_mse, w_mae, w_cosh
-    # ========= fim =========
 
 
     def maybe_log_deltas(self, tensorboard, delta_regularizer, progress):
-        if not hasattr(self, "progress") or self.progress is None : 
-            # Se self.progress não foi setado externamente, usar o 'progress' do argumento.
-            # No entanto, o 'progress' da classe é usado para last_logged_delta_epoch.
-            # Idealmente, self.progress deve ser o mesmo objeto 'progress' passado.
-            # Para esta função, vamos usar o 'progress' do argumento para consistência.
-            current_progress_obj = progress
-        else:
-            current_progress_obj = self.progress
-
-
-        if current_progress_obj.epoch_step != 0: # // Sessão V by Gemini - CORREÇÃO: Acessar epoch_step de progress
+        """Log dos deltas no tensorboard se necessário"""
+        # Verificação simplificada
+        if (progress.epoch_step != 0 or 
+            self.last_logged_delta_epoch == progress.epoch):
             return
+        
+        self.last_logged_delta_epoch = progress.epoch
 
-        if self.last_logged_delta_epoch == current_progress_obj.epoch: # // Sessão V by Gemini - CORREÇÃO: Acessar epoch de progress
+        # Verifica se delta_regularizer existe e tem o método
+        if not hasattr(delta_regularizer, 'get_delta_norms'):
             return
-
-        self.last_logged_delta_epoch = current_progress_obj.epoch # // Sessão V by Gemini - CORREÇÃO: Acessar epoch de progress
-
+        
         current_norm, reference_norm = delta_regularizer.get_delta_norms()
         
-        # // Sessão V by Gemini - CORREÇÃO: tensorboard pode ser None, checar antes de usar
+        # Verifica se tensorboard existe antes de usar
         if tensorboard:
             tensorboard.add_scalars("Deltas",
                 {"Current": current_norm, "Reference": reference_norm},
                 global_step=progress.epoch)
-
-
-        print(
-            f"[TrainGPS] Epoch {current_progress_obj.epoch} | Current Δ: {current_norm:.4f} | Ref Δ: {reference_norm:.4f}"
-        )

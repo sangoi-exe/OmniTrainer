@@ -43,19 +43,21 @@ from modules.util.TensorBoardManager import TensorBoardManager
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, TaskProgressColumn, SpinnerColumn
 from requests.exceptions import ConnectionError
 
 from modules.sangoi.ConvergeControl import ConvergeControl
 from modules.sangoi.AdaptiveDCoef import AdaptiveDCoef
 from modules.sangoi.DataRecorder import DataRecorder
 from modules.sangoi.TrainGPS import TrainGPS
-from modules.sangoi.logFun import logFun, set_logfun_console
-
-from rich.console import Console as RichConsole
-from rich.live import Live
-from rich.layout import Layout
+# IMPORTANTE: Remova a importação de Progress e Layout se não forem mais usados diretamente
+from rich.console import Console as RichConsole, Group # Adicione Group
 from rich.text import Text
+from rich.live import Live
+from rich.panel import Panel
+from rich.columns import Columns
+from rich.table import Table
+# As importações do logFun já estão OK
+from modules.sangoi.logFun import logFun, set_logfun_console, init_global_progress, cleanup_global_progress, ProgressContext
 
 
 def format_time_delta(seconds: float) -> str:
@@ -108,8 +110,10 @@ class GenericTrainer(BaseTrainer):
     pause_request_locked: bool  # Para travar o switch da UI
     pause_requested_at_epoch_end: bool
 
-    _rich_layout: Optional[Layout] = None  # Para o Live display
-    _rich_progress_footer: Optional[Progress] = None  # Para as barras no rodapé
+    from rich.progress import Progress
+
+    _training_live: Optional[Live] = None # A única instância Live para todo o display
+    _global_progress_instance: Optional['Progress'] = None # Referência ao objeto Progress global do logFun
 
     _current_step_duration_s: float = 0.0
     _epoch_time_elapsed_s: float = 0.0
@@ -155,27 +159,13 @@ class GenericTrainer(BaseTrainer):
         self.adaptive_dcoef_modulation_strength = getattr(config, "adaptive_dcoef_modulation_strength", 0.4)
         self.adaptive_dcoef_min_global_target = getattr(config, "adaptive_dcoef_min_global_target", 0.5)
         self.adaptive_dcoef_max_global_target = getattr(config, "adaptive_dcoef_max_global_target", 2.0)
-        self.adaptive_dcoef_convergence_threshold_low = getattr(config, "adaptive_dcoef_convergence_threshold_low",
-                                                                0.33)
-        self.adaptive_dcoef_convergence_threshold_high = getattr(config, "adaptive_dcoef_convergence_threshold_high",
-                                                                 0.66)
+        self.adaptive_dcoef_convergence_threshold_low = getattr(config, "adaptive_dcoef_convergence_threshold_low", 0.33)
+        self.adaptive_dcoef_convergence_threshold_high = getattr(config, "adaptive_dcoef_convergence_threshold_high", 0.66)
         self.data_recorder_run1_path = getattr(config, "adpt_dcoef_path", None)
 
         self.console = RichConsole()
-        # // GEMINI-CODE 2024-08-29T11:00:00 - Inicializa o objeto Progress para o rodapé
-        self._rich_progress_footer = Progress(
-            SpinnerColumn(),
-            "[progress.description]{task.description}",
-            BarColumn(),
-            TaskProgressColumn(),  # Mostra X/Y ou porcentagem
-            TextColumn("•"),
-            TimeRemainingColumn(),
-            TextColumn("• {task.speed:.2f} it/s"),
-            console=self.console,
-            transient=True,  # Limpa a barra quando concluída
-            refresh_per_second=4  # Taxa de atualização para as barras no rodapé
-        )
-        self._setup_rich_layout()
+        set_logfun_console(self.console)  # Configurar o console para logFun
+
         self._num_total_epochs = config.epochs
 
         # Component initialization flags (from config, with defaults)
@@ -232,22 +222,11 @@ class GenericTrainer(BaseTrainer):
         else:
             logFun("[AdaptiveDCoef] Desativado (flag adpt_dcoef_use_it=False).", lvl="debug")
 
-    def _setup_rich_layout(self):
-        """Configura o layout base para o Rich Live display."""
-        self._rich_layout = Layout(name="root")
-        # // GEMINI-CODE 2024-08-29T11:00:00 - Layout ajustado para remover header e incluir área de progresso no footer
-        self._rich_layout.split_column(Layout(name="main_content", size=3),
-                                       Layout(name="converge_control_status", ratio=1, visible=False),
-                                       Layout(name="footer_tqdm_area", size=2))
-        # // GEMINI-CODE 2024-08-29T10:30:01 - Atualiza o main_content inicialmente e placeholder para novo footer
-        self._rich_layout["main_content"].update(
-            Text("Aguardando início do treinamento...\n(Ctrl+C para parar)", justify="center", style="dim"))
-        self._rich_layout["footer_tqdm_area"].update(
-            self._rich_progress_footer)  # Área do rodapé agora usa o objeto Progress
-    
-    def _generate_main_content_text(self,
-                                    current_loss: Optional[float] = None,
-                                    current_ema_loss: Optional[float] = None) -> Text:
+
+    def _create_training_display_content(self,
+                                        current_loss: Optional[float] = None,
+                                        current_ema_loss: Optional[float] = None) -> Panel:
+        """Cria o conteúdo do painel principal de treinamento com dados atualizados."""
         tp = self.model.train_progress if self.model and hasattr(self.model, 'train_progress') else None
 
         # Linha 1: Progresso Epoch/Step
@@ -275,12 +254,9 @@ class GenericTrainer(BaseTrainer):
         eta_epoch_disp = "ETAEpoch: Calc..."
         if tp and self._steps_per_epoch > 0 and effective_avg_step_time > 0:
             remaining_steps = self._steps_per_epoch - (tp.epoch_step + 1)
-            if remaining_steps >= 0:  # >=0 para incluir o caso do último step
+            if remaining_steps >= 0:
                 eta_s = remaining_steps * effective_avg_step_time
                 eta_epoch_disp = f"ETAEpoch: {format_time_delta(eta_s)}"
-            # Se remaining_steps < 0, algo está errado ou a epoch acabou
-            # elif tp.epoch_step + 1 >= self._steps_per_epoch:
-            # eta_epoch_disp = "ETAEpoch: Done!"
 
         total_time_str = ""
         if self._total_training_time_start_s is not None:
@@ -291,12 +267,86 @@ class GenericTrainer(BaseTrainer):
                               (epoch_elapsed_disp, "magenta"), " | ", (eta_epoch_disp, "magenta"),
                               (" | " + total_time_str if total_time_str else "", "dim white"))
 
+        # Linha 4: Status de Componentes (Opcional, se houver espaço e quiser exibir)
+        components_status = []
+        if self.converge_control:
+            # CORREÇÃO AQUI: Usar Text.from_markup() para que as tags sejam interpretadas
+            components_status.append(Text.from_markup("CC: [green]Ativo[/green]"))
+        if self.adaptive_dcoef:
+            # CORREÇÃO AQUI: Usar Text.from_markup()
+            components_status.append(Text.from_markup("ADC: [blue]Ativo[/blue]"))
+        if self.recorder:
+            # CORREÇÃO AQUI: Usar Text.from_markup()
+            components_status.append(Text.from_markup("DR: [yellow]Ativo[/yellow]"))
+        
+        line4 = Text.assemble("Componentes: ", Text(" | ").join(components_status)) if components_status else Text("")
+
         # Combina as linhas com quebras de linha, centralizadas
-        final_text = Text("\n", justify="center").join([line1, line2, line3])
-        return final_text
+        lines_to_join = [line1, line2, line3]
+        if components_status: # Adiciona a linha 4 apenas se houver componentes
+            lines_to_join.append(line4)
+
+        final_text = Text("\n", justify="center").join(lines_to_join)
+        
+        return Panel(final_text, title="[bold cyan]OneTrainer - Status do Treinamento[/bold cyan]", border_style="cyan")
+
+    def _get_combined_display_renderable(self, current_loss: Optional[float] = None, current_ema_loss: Optional[float] = None) -> Group:
+        """
+        Combina o painel de status principal de treinamento e o objeto Progress global
+        em um único renderable Group.
+        """
+        # Garante que o objeto _global_progress_instance esteja inicializado
+        if self._global_progress_instance is None:
+            self._global_progress_instance = init_global_progress() # Isso agora *apenas cria* o objeto Progress
+
+        status_panel_content = self._create_training_display_content(current_loss, current_ema_loss)
+
+        # Cria um Group contendo o painel de status e a barra de progresso global
+        # A ordem aqui define a exibição vertical: status_panel em cima, barra de progresso abaixo
+        combined_display = Group(
+            status_panel_content,
+            self._global_progress_instance # Este é o objeto Progress do logFun
+        )
+        return combined_display
+
+    def _setup_training_display(self):
+        """Configura o sistema de display de treinamento com Live, exibindo painel e progress bars."""
+        if self._training_live is None:
+            # Obtém o conteúdo combinado inicial para o Live display
+            initial_content = self._get_combined_display_renderable()
+
+            self._training_live = Live(
+                initial_content,
+                console=self.console,
+                refresh_per_second=2,
+                screen=False,  # Não toma a tela toda
+                transient=False  # Não limpa ao parar
+            )
+            # Inicia o display Live uma vez
+            self._training_live.start()
+            logFun("Sistema de display Rich Live iniciado", lvl="INFO")
+
+    def _update_training_display(self, current_loss: Optional[float] = None, current_ema_loss: Optional[float] = None):
+        """Atualiza o display de treinamento."""
+        if self._training_live and self._training_live.is_started:
+            # Atualiza a instância Live com o novo conteúdo combinado
+            updated_content = self._get_combined_display_renderable(current_loss, current_ema_loss)
+            self._training_live.update(updated_content)
+
+    def _stop_training_display(self):
+        """Para o display de treinamento."""
+        if self._training_live and self._training_live.is_started:
+            self._training_live.stop()
+            self._training_live = None
+            self._global_progress_instance = None # Reseta a referência ao objeto Progress
+            logFun("Sistema de display Rich Live finalizado", lvl="INFO")
 
     def start(self):
         set_logfun_console(self.console)
+        # REMOVIDO: init_global_progress() não é mais chamado aqui.
+        # Ele será chamado por _get_combined_display_renderable quando o display for configurado.
+        # init_global_progress() 
+        # REMOVIDO: self._setup_training_display() não é chamado aqui, pois train() o fará.
 
         self.__save_config_to_workspace()
 
@@ -379,15 +429,10 @@ class GenericTrainer(BaseTrainer):
                 data_recorder=self.recorder)
 
             self.converge_control = converge_control_instance
-            logFun(f"[ConvergeControl] Inicializado com sucesso para Run {self.run_number} (usando padrões internos).",
-                   lvl="debug")
-            if self._rich_layout:
-                self._rich_layout["converge_control_status"].visible = True
+            logFun(f"[ConvergeControl] Inicializado com sucesso para Run {self.run_number} (usando padrões internos).", lvl="debug")
         else:
             self.converge_control = None
             logFun("[ConvergeControl] Desativado (flag convctrl_use_it=False).", lvl="debug")
-            if self._rich_layout:
-                self._rich_layout["converge_control_status"].visible = False
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -397,21 +442,30 @@ class GenericTrainer(BaseTrainer):
             json.dump(self.config.to_pack_dict(secrets=False), f, indent=4)
 
     def __clear_cache(self):
-        print(f"Clearing cache directory {self.config.cache_dir}!"
-              f"You can disable this if you want to continue using the same cache.")
+        logFun(f"Limpando diretório de cache {self.config.cache_dir}!", lvl="INFO")
         if os.path.isdir(self.config.cache_dir):
-            # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress
-            files_to_delete = [
-                f for f in os.listdir(self.config.cache_dir)
-                if os.path.isdir(os.path.join(self.config.cache_dir, f)) and
-                (f.startswith("epoch-") or f in ["image", "text"])]
-            if files_to_delete and self._rich_progress_footer:
-                task_id = self._rich_progress_footer.add_task("Limpando cache...", total=len(files_to_delete))
-                for filename in files_to_delete:
-                    path = os.path.join(self.config.cache_dir, filename)
-                    shutil.rmtree(path)
-                    self._rich_progress_footer.update(task_id, advance=1)
-                self._rich_progress_footer.remove_task(task_id)
+            # ProgressContext já usa o sistema global de progresso
+            with ProgressContext("Limpando cache", len(os.listdir(self.config.cache_dir))) as progress: # Estimar total
+                files_to_delete = [
+                    f for f in os.listdir(self.config.cache_dir)
+                    if os.path.isdir(os.path.join(self.config.cache_dir, f)) and
+                    (f.startswith("epoch-") or f in ["image", "text"])
+                ]
+                
+                # A iteração para delete deve ser sobre os arquivos_to_delete
+                # O total para ProgressContext também deve ser files_to_delete
+                if files_to_delete:
+                    # Recria o ProgressContext com o total correto para a lista filtrada
+                    # Não é ideal ter duas instâncias, mas a primeira é um placeholder.
+                    # Poderíamos filtrar antes de criar o ProgressContext.
+                    progress.total = len(files_to_delete) # Atualiza o total
+                    for filename in files_to_delete:
+                        path = os.path.join(self.config.cache_dir, filename)
+                        shutil.rmtree(path)
+                        progress.update(1)
+                else:
+                    logFun("Nenhum diretório de cache para limpar.", lvl="INFO")
+
 
     def __prune_backups(self, backups_to_keep: int):
         backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
@@ -583,12 +637,8 @@ class GenericTrainer(BaseTrainer):
             mapping_seed_to_label = {}
             mapping_label_to_seed = {}
 
-            # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress para validação
-            validation_task_id = None
-            if self._rich_progress_footer:
-                validation_task_id = self._rich_progress_footer.add_task("Validação...", total=current_epoch_length_validation)
-
-            try:
+            # O uso de ProgressContext substitui _rich_progress_footer
+            with ProgressContext("Validação", current_epoch_length_validation) as progress:
                 for validation_batch in self.validation_data_loader.get_data_loader():
                     if self.__needs_gc(train_progress):
                         torch_gc()
@@ -627,11 +677,7 @@ class GenericTrainer(BaseTrainer):
                     accumulated_loss_per_concept[concept_seed] = (accumulated_loss_per_concept.get(concept_seed, 0) +
                                                                   loss)
                     concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
-                    if validation_task_id is not None and self._rich_progress_footer:
-                        self._rich_progress_footer.update(validation_task_id, advance=1)
-            finally:
-                if validation_task_id is not None and self._rich_progress_footer:
-                    self._rich_progress_footer.remove_task(validation_task_id)
+                    progress.update(1) # Atualiza a barra de progresso da validação
 
             for concept_seed, total_loss in accumulated_loss_per_concept.items():
                 average_loss = total_loss / concept_counts[concept_seed]
@@ -936,58 +982,49 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         scheduler_step_counter = 0
+        train_device = torch.device(self.config.train_device)
+        train_progress = self.model.train_progress
 
         # Determine target device and dtype from a model parameter if available
         def wrap_scheduler_step(orig_step):
-
             def wrapped(*args, **kwargs):
                 nonlocal scheduler_step_counter
                 scheduler_step_counter += 1
-                print(f"[DEBUG] scheduler.step() chamado {scheduler_step_counter} vezes")
-                print(f"[DEBUG] scheduler.last_epoch = {lr_scheduler.last_epoch}")
+                logFun(f"[DEBUG] scheduler.step() chamado {scheduler_step_counter} vezes", lvl="DEBUG")
+                logFun(f"[DEBUG] scheduler.last_epoch = {lr_scheduler.last_epoch}", lvl="DEBUG")
                 return orig_step(*args, **kwargs)
-
             return wrapped
-
-        train_device = torch.device(self.config.train_device)
-
-        train_progress = self.model.train_progress
+        
+        # Verificar se é só cache (mantém como está)
+        if self.config.only_cache:
+            self._handle_cache_only_mode()
+            return
 
         if self.config.only_cache:
             self.callbacks.on_update_status("caching")
-            # // GEMINI-CODE 2024-08-29T11:00:00 - Substitui tqdm por rich.progress para caching
-            if self._rich_progress_footer:
-                cache_task_id = self._rich_progress_footer.add_task("Caching latents...", total=self.config.epochs - train_progress.epoch)
+            
+            with ProgressContext("Caching latents", self.config.epochs - train_progress.epoch) as progress:
                 for _epoch in range(train_progress.epoch, self.config.epochs, 1):
                     self.data_loader.get_data_set().start_next_epoch()
-                    self._rich_progress_footer.update(cache_task_id, advance=1)
-                self._rich_progress_footer.remove_task(cache_task_id)
-            return # Retorna após o caching
+                    progress.update(1)
+            return
 
         scaler = (create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None)
-
         self.__apply_fused_back_pass(scaler)
 
         # False if the model gradients are all None, True otherwise
         # This is used to schedule sampling only when the gradients don't take up any space
         has_gradient = False
-
         accumulated_loss = 0.0
         ema_loss = 0.0
-
         lr_scheduler = None
+        
+        # Inicia o sistema de display principal (que agora gerencia o Live para tudo)
+        self._setup_training_display()
         self._total_training_time_start_s = time.monotonic()
-        # Envolver o loop de treinamento com Live
-        with Live(self._rich_layout,
-                  console=self.console,
-                  refresh_per_second=2,
-                  vertical_overflow="ellipsis",
-                  screen=False,
-                  transient=False) as live:
-            # `screen=False` e `transient=False` para que o logFun funcione normalmente
-            # Se quiser tela cheia, use screen=True, transient=True, mas logFun pode ser sobrescrito.
 
-            # // GEMINI-CODE 2024-08-29T11:00:00 - tqdm removido do loop de épocas (já estava disable=True)
+
+        try:
             for _epoch in range(train_progress.epoch, self.config.epochs, 1):
 
                 self._epoch_start_time_s = time.monotonic()
@@ -995,14 +1032,11 @@ class GenericTrainer(BaseTrainer):
                 )  # Pega o total de steps para a epoch atual
 
                 if self.is_paused:
-                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...",
-                           lvl="info")
+                    logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info")
                     self._handle_pause_logic()
                     if self.commands.get_stop_command():  # Se o stop foi dado durante a pausa inicial
                         logFun("Comando STOP ativo após pausa inicial. Encerrando.", lvl="warning")
                         break  # Sai do loop de épocas
-
-                # // GEMINI-CODE 2024-08-29T10:30:01 - Remoção da atualização do layout "header", pois foi removido. A info da época já está no main_content.
 
                 self.callbacks.on_update_status(f"training")
 
@@ -1084,35 +1118,6 @@ class GenericTrainer(BaseTrainer):
                         if transferred_to_temp_device:
                             self.model_setup.setup_train_device(self.model, self.config)
 
-                    # def _end_epoch_cleanup(self):
-                    #     """
-                    #     Limpa tudo que não precisa atravessar épocas:
-                    #     - snapshots de ConvergeControl
-                    #     - históricos temporários
-                    #     - libera cache da GPU
-                    #     """
-                    #     # 1) Se estiver usando ConvergeControl
-                    #     if hasattr(self, "converge_control"):
-                    #         logFun("[ConvergeControl]: Limpando essa merda..")
-                    #         self.converge_control.prev_W.clear()
-                    #         self.converge_control.g_hist.clear()
-                    #         self.converge_control.rur_hist.clear()
-                    # with TorchMemoryRecorder(enabled=False):
-                    #     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                    #     loss = self.model_setup.calculate_loss(
-                    #         self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
-                    #     )
-                    """
-                    implementação de teste - remover os gradientes fora da mask
-                    teoricamente isso impede que pesos fora da mask sejam atualizados
-                    então a rede pode aloprar o quanto quiser ali, não vai mudar nada
-                    """
-                    # with torch.profiler.profile(
-                    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                    #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
-                    #     record_shapes=True, profile_memory=True, with_stack=True
-                    # ) as prof:
                     with TorchMemoryRecorder(enabled=False):
                         model_output_data = self.model_setup.predict(
                             self.model,
@@ -1198,61 +1203,38 @@ class GenericTrainer(BaseTrainer):
 
                                         # Registrar dados com DataRecorder
                                         if self.recorder:
-                                            if self.converge_control and name in self.converge_control._deques_initialized_for_module:
-                                                # Coletar métricas do ConvergeControl
-                                                cc_gd_hist = self.converge_control.gradient_disparity_hist.get(name)
-                                                cc_gd = cc_gd_hist[-1] if cc_gd_hist else None
+                                            # if self.converge_control and name in self.converge_control._deques_initialized_for_module:
+                                            #     # Coletar métricas do ConvergeControl
+                                            #     cc_gd_hist = self.converge_control.gradient_disparity_hist.get(name)
+                                            #     cc_gd = cc_gd_hist[-1] if cc_gd_hist else None
                                                 
-                                                cc_snr_hist = self.converge_control.snr_hist.get(name)
-                                                cc_snr = cc_snr_hist[-1] if cc_snr_hist else None
+                                            #     cc_snr_hist = self.converge_control.snr_hist.get(name)
+                                            #     cc_snr = cc_snr_hist[-1] if cc_snr_hist else None
                                                 
-                                                cc_gns_t_hist = self.converge_control.gns_temporal_hist.get(name)
-                                                cc_gns_t = cc_gns_t_hist[-1] if cc_gns_t_hist else None
+                                            #     cc_gns_t_hist = self.converge_control.gns_temporal_hist.get(name)
+                                            #     cc_gns_t = cc_gns_t_hist[-1] if cc_gns_t_hist else None
                                                 
-                                                cc_gd_ewma = self.converge_control.gd_ewma.get(name)
-                                                cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name)
+                                            #     cc_gd_ewma = self.converge_control.gd_ewma.get(name)
+                                            #     cc_gd_std_ewma_var = self.converge_control.gd_std_ewma.get(name)
 
                                             d_num_pdgy = None
                                             if d_num_pdgy_raw is not None:
                                                 d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
-                                            # logFun(f"d_num_pdgy={d_num_pdgy}", lvl="error")
                                                 
                                             d_den_pdgy = None
-                                            if d_num_pdgy_raw is not None:
+                                            if d_den_pdgy_raw is not None:
                                                 d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)
-                                            # logFun(f"d_den_pdgy={d_den_pdgy}", lvl="error")
-
+                                            
                                             self.recorder.log_metrics_step(
                                                 name=name,
                                                 d_num_pdgy=d_num_pdgy,
                                                 d_den_pdgy=d_den_pdgy,
-                                                # gd=cc_gd,
-                                                # snr=cc_snr,
-                                                # gns_t=cc_gns_t,
-                                                # gd_ewma=cc_gd_ewma,
-                                                # gd_std_ewma_var=cc_gd_std_ewma_var
+                                                # gd=cc_gd, # Descomentar se precisar
+                                                # snr=cc_snr, # Descomentar se precisar
+                                                # gns_t=cc_gns_t, # Descomentar se precisar
+                                                # gd_ewma=cc_gd_ewma, # Descomentar se precisar
+                                                # gd_std_ewma_var=cc_gd_std_ewma_var # Descomentar se precisar
                                             )
-                                            # if train_progress.global_step >= 96 and train_progress.global_step % 100 == 0:
-                                            #     from datetime import datetime
-
-                                            #     # 1) Timestamp seguro para o nome do arquivo: YYYYMMDDThhmmss
-                                            #     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-
-                                            #     # 2) Nome do arquivo
-                                            #     filename = f"datarecorder_log_{timestamp}.txt"
-
-                                            #     # 3) Linha de log com timestamp completo ISO
-                                            #     log_line = (
-                                            #         f"DataRecorder logged for '{name}': "
-                                            #         f"GD={cc_gd}, SNR={cc_snr}, GNS_T={cc_gns_t}, "
-                                            #         f"d_hat(Prodigy)={d_pdgy_to_record}\n"
-                                            #     )
-
-                                            #     # 4) Escreve (append) no arquivo
-                                            #     with open(filename, "w") as f:
-                                            #         f.write(log_line)
-
-                                            #     logFun(f"CRIEI O DATARECORDER LOG em {filename}", lvl="success")
                             except Exception as e:
                                 logFun(f"Deu merda no first loop: {e}", lvl="error")
                                 traceback.print_exc()
@@ -1270,7 +1252,7 @@ class GenericTrainer(BaseTrainer):
                                 self._ema_step_time_s = self._current_step_duration_s
                             else:
                                 self._ema_step_time_s = (self._ema_alpha * self._current_step_duration_s +
-                                                         (1 - self._ema_alpha) * self._ema_step_time_s)
+                                                          (1 - self._ema_alpha) * self._ema_step_time_s)
 
                             self._epoch_time_elapsed_s = time.monotonic() - self._epoch_start_time_s
 
@@ -1282,12 +1264,10 @@ class GenericTrainer(BaseTrainer):
                                 self._avg_step_time_epoch_s = self._ema_step_time_s  # Usar EMA para o display de AvgStep
 
                             # Atualiza o display do Rich
-                            self._rich_layout["main_content"].update(
-                                self._generate_main_content_text(
-                                    current_loss=accumulated_loss,  # Passe a loss do step
-                                    current_ema_loss=ema_loss  # Passe a EMA da loss
-                                ))
-                            # prof.step()
+                            self._update_training_display(
+                                current_loss=accumulated_loss,
+                                current_ema_loss=ema_loss
+                            )
 
                             self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler)
 
@@ -1305,9 +1285,6 @@ class GenericTrainer(BaseTrainer):
                             )
 
                             accumulated_loss = 0.0
-                            # self.model_setup.after_optimizer_step(
-                            #     self.model, self.config, train_progress
-                            # )
                             if self.model.ema:
                                 update_step = (train_progress.global_step, self.config.gradient_accumulation_steps)
                                 self.tensorboard.add_scalar(
@@ -1324,25 +1301,11 @@ class GenericTrainer(BaseTrainer):
                     train_progress.next_step(self.config.batch_size)
                     self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
-                    # ATUALIZAÇÃO DO DISPLAY DO ConvergeControl em intervalos
-                    if self.converge_control and (train_progress.global_step % 10 == 0 or
-                                                  train_progress.global_step == 1):
-                        cc_renderable = self.converge_control.generate_status_renderable()
-                        # Supondo que self._rich_layout["converge_control_status"] ainda existe
-                        if self._rich_layout:
-                            self._rich_layout["converge_control_status"].update(cc_renderable)
-                        else:  # Fallback se o layout específico não existir, atualiza o header ou um log
-                            self._rich_layout["converge_control_status"].update(cc_renderable)
-                    # ATUALIZAÇÃO DO DISPLAY DO CONVERGE CONTROL AO FINAL DA ÉPOCA
-                    if self.converge_control:
-                        # self.converge_control.snapshot_epoch_weights() # REMOVIDO - Não existe mais
-                        cc_renderable = self.converge_control.generate_status_renderable()
-                        # self._rich_layout["header"].update(header_text) # header_text não definido aqui, talvez atualize o status
-                        self._rich_layout["converge_control_status"].update(cc_renderable)
-
-                train_progress.next_epoch()
-                self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
-                # Log de final de epoch no console Rich, se desejar (o header já foi atualizado)
+                # Fim do loop de batches (fim da época)
+                train_progress.next_epoch() # Avança a epoch para a próxima iteração do loop externo
+                # Não é necessário chamar on_update_train_progress aqui novamente se já foi chamado no final do loop de batches
+                
+                # Log de final de epoch no console Rich
                 final_epoch_duration = time.monotonic() - self._epoch_start_time_s
                 avg_step_final_epoch = self._avg_step_time_epoch_s  # Usa o valor final calculado
                 self.console.log(
@@ -1350,15 +1313,14 @@ class GenericTrainer(BaseTrainer):
                     f"(Avg step: {avg_step_final_epoch:.3f}s/it)[/bold green]")
 
                 if self.commands.get_and_reset_pause_request():
-                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.",
-                           lvl="info")
+                    logFun(f"Requisição de PAUSA recebida. Será executada ao final da Epoch {train_progress.epoch -1}.", lvl="info")
                     self.pause_requested_at_epoch_end = True
                     self.pause_request_locked = True  # Trava a UI
                     # Notificar a UI que a requisição foi aceita e o switch está travado
                     if hasattr(self.callbacks, 'on_pause_request_accepted'):
                         self.callbacks.on_pause_request_accepted()
 
-                # 2. Executar a pausa se foi agendada
+                    # 2. Executar a pausa se foi agendada
                 if self.pause_requested_at_epoch_end and not self.is_paused:
                     self.is_paused = True  # Marca como pausado
                     self.pause_requested_at_epoch_end = False  # Limpa a flag de agendamento
@@ -1379,8 +1341,7 @@ class GenericTrainer(BaseTrainer):
                             epoch_idx = train_progress.epoch - 1
                             gps_instance.log_group_deltas(epoch_idx)
                         except Exception as e:
-                            logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}",
-                                   lvl="error")
+                            logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
                             traceback.print_exc()
 
                 if self.run_number == 2 and self.adaptive_dcoef and gps_instance:
@@ -1452,7 +1413,7 @@ class GenericTrainer(BaseTrainer):
                                         lvl="info")
                         if updated_count > 0 and (self.adaptive_dcoef.verbose or self.adaptive_dcoef.debug):
                             logFun(f"[AdaptiveDCoef] d_coef atualizado para {updated_count} grupos de parâmetros.",
-                                   lvl="info")
+                                  lvl="info")
 
                     except Exception as e:
                         logFun(
@@ -1478,19 +1439,24 @@ class GenericTrainer(BaseTrainer):
                                     f"(Run {self.run_number})",
                                     lvl="info",
                                     _console=self.console)
+                                # TODO: APLICAR CONGELAMENTO NO OPTIMIZER PARAMETER GROUP TAMBÉM SE NECESSÁRIO
+                                # A função `set_requires_grad` do `ParameterGroup` em `modules.model.ParameterGroup`
+                                # já deve lidar com isso ou é o ponto de controle central.
+                                # Se `set_requires_grad` está apenas no ParameterGroup e não afeta o optimizer,
+                                # talvez precise de um `optimizer.set_param_group_enabled(name, should_be_enabled)`.
+                                # Isso dependerá da implementação do otimizador e do BaseModel.
                             param_group_obj.set_requires_grad(should_be_enabled)
 
                 if self.commands.get_stop_command():
                     return
-            if self.converge_control:
-                cc_renderable = self.converge_control.generate_status_renderable()
-                self._rich_layout["converge_control_status"].update(cc_renderable)
-        total_training_duration = time.monotonic(
-        ) - self._total_training_time_start_s if self._total_training_time_start_s else 0
-        if self._rich_layout:  # Garante que o layout ainda existe
-            self._rich_layout["main_content"].update(self._generate_main_content_text())
-        self.console.log(
-            f"[bold blue]Treinamento completo! Tempo total: {format_time_delta(total_training_duration)}[/bold blue]")
+        finally:
+            # === LIMPEZA ===
+            self._stop_training_display() # Para o Live display principal
+            cleanup_global_progress() # Limpa o objeto Progress global (do logFun)
+
+        # Exibir summary final
+        total_training_duration = time.monotonic() - self._total_training_time_start_s if self._total_training_time_start_s else 0
+        logFun(f"Treinamento completo! Tempo total: {format_time_delta(total_training_duration)}", lvl="SUCCESS")
 
     def end(self):
         save_path = os.path.join(
@@ -1499,8 +1465,7 @@ class GenericTrainer(BaseTrainer):
             f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{self.model.train_progress.filename_string()}{self.config.output_model_format.file_extension()}",
         )        
         if self.is_paused:
-            logFun("Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.",
-                   lvl="warning")
+            logFun("Finalizando treinamento enquanto estava pausado. Tentando retomar brevemente para salvar.", lvl="warning")
             # Força a saída da pausa (sem esperar comando) e tenta mover para GPU para salvar
             self.is_paused = False
             self.pause_request_locked = False
@@ -1513,7 +1478,7 @@ class GenericTrainer(BaseTrainer):
                 logFun(
                     f"Falha ao mover modelo para GPU no final (estava pausado): {e}. Salvando do CPU ({self.temp_device}).",
                     lvl="error",
-                    console=self.console)
+                    _console=self.console) # Usar _console aqui
                 # O modelo já está no self.temp_device, o save deve funcionar
                 pass  # Continua para salvar do CPU
 
@@ -1541,7 +1506,7 @@ class GenericTrainer(BaseTrainer):
                 )
             else:
                 save_path = self.config.output_model_destination
-            print("Saving " + save_path)
+            logFun("Saving " + save_path, lvl="LOOP") # Usar logFun aqui
 
             self.model_saver.save(
                 model=self.model,

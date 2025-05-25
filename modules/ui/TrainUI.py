@@ -79,7 +79,7 @@ class TrainUI(ctk.CTk):
         except Exception as e:
             print(f"Warn: Could not load icon photo: {e}")  # Melhor log
 
-        self.geometry("1100x740")
+        self.geometry("1300x900")
 
         ctk.set_appearance_mode("Light" if AppearanceModeTracker.detect_appearance_mode() == 0 else "Dark")
         ctk.set_default_color_theme("blue")

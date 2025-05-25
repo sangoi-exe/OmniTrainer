@@ -1,4 +1,5 @@
 import inspect
+import torch.nn.functional as F
 from collections.abc import Callable
 
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
@@ -69,37 +70,30 @@ class StableDiffusionXLSampler(BaseModelSampler):
             # prepare prompt
             self.model.text_encoder_to(self.train_device)
 
-            prompt_embedding, pooled_text_encoder_2_output = self.model.combine_text_encoder_output(*self.model.encode_text(
+            # CORRIGIDO: Use a nova lógica de encoding
+            p_te1_out, p_te2_out, p_pooled = self.model.encode_text(
                 text=prompt,
                 train_device=self.train_device,
+                batch_size=1,
                 text_encoder_1_layer_skip=text_encoder_1_layer_skip,
                 text_encoder_2_layer_skip=text_encoder_2_layer_skip,
-            ))
+            )
+            prompt_embedding, pooled_positive = self.model.combine_text_encoder_output(
+                p_te1_out, p_te2_out, p_pooled
+            )
 
-            negative_prompt_embedding, negative_pooled_text_encoder_2_output = self.model.combine_text_encoder_output(*self.model.encode_text(
-                text=negative_prompt,
-                train_device=self.train_device,
-                text_encoder_1_layer_skip=text_encoder_1_layer_skip,
-                text_encoder_2_layer_skip=text_encoder_2_layer_skip,
-            ))
+            # CORRIGIDO: Negative prompt com método otimizado
+            n_te1_out, n_te2_out, n_pooled = self._encode_negative_prompt_optimized(negative_prompt)
+            negative_prompt_embedding, pooled_negative = self.model.combine_text_encoder_output(
+                n_te1_out, n_te2_out, n_pooled
+            )
 
-            combined_prompt_embedding = torch.cat([negative_prompt_embedding, prompt_embedding]) \
-                .to(dtype=self.model.train_dtype.torch_dtype())
+            # CORRIGIDO: Padding correto
+            combined_prompt_embedding = self._smart_combine_embeddings(
+                prompt_embedding, negative_prompt_embedding
+            ).to(dtype=self.model.train_dtype.torch_dtype())
 
-            self.model.text_encoder_to(self.temp_device)
-            torch_gc()
-
-            # prepare timesteps
-            noise_scheduler.set_timesteps(diffusion_steps, device=self.train_device)
-            timesteps = noise_scheduler.timesteps
-
-            if force_last_timestep:
-                last_timestep = torch.ones(1, device=self.train_device, dtype=torch.int64) \
-                                * (noise_scheduler.config.num_train_timesteps - 1)
-
-                # add the final timestep to force predicting with zero snr
-                timesteps = torch.cat([last_timestep, timesteps])
-
+            # CORRIGIDO: Time IDs
             original_height = height
             original_width = width
             crops_coords_top = 0
@@ -114,11 +108,12 @@ class StableDiffusionXLSampler(BaseModelSampler):
                 crops_coords_left,
                 target_height,
                 target_width
-            ]).unsqueeze(dim=0)
+            ]).unsqueeze(dim=0).to(device=self.train_device)
 
-            add_time_ids = add_time_ids.to(
-                device=self.train_device,
-            )
+            repeated_add_time_ids = add_time_ids.repeat(2, 1)
+
+            combined_pooled_output = torch.cat([pooled_negative, pooled_positive], dim=0) \
+                .to(dtype=self.model.train_dtype.torch_dtype())
 
             # prepare latent image
             num_channels_latents = unet.config.in_channels
@@ -130,9 +125,21 @@ class StableDiffusionXLSampler(BaseModelSampler):
             ) * noise_scheduler.init_noise_sigma
 
             added_cond_kwargs = {
-                "text_embeds": torch.concat([pooled_text_encoder_2_output, negative_pooled_text_encoder_2_output], dim=0),
-                "time_ids": torch.concat([add_time_ids] * 2, dim=0),
+                "text_embeds": combined_pooled_output,
+                "time_ids": repeated_add_time_ids,
             }
+            
+            self.model.text_encoder_to(self.temp_device)
+            torch_gc()
+
+            # prepare timesteps
+            noise_scheduler.set_timesteps(diffusion_steps, device=self.train_device)
+            timesteps = noise_scheduler.timesteps
+
+            if force_last_timestep:
+                last_timestep = torch.ones(1, device=self.train_device, dtype=torch.int64) \
+                                * (noise_scheduler.config.num_train_timesteps - 1)
+                timesteps = torch.cat([last_timestep, timesteps])
 
             # denoising loop
             extra_step_kwargs = {}
@@ -193,6 +200,49 @@ class StableDiffusionXLSampler(BaseModelSampler):
                 file_type=FileType.IMAGE,
                 data=image[0],
             )
+
+    def _encode_negative_prompt_optimized(self, negative_prompt):
+        """Método específico para negative prompts sem long prompts"""
+        # Force tokenization direta para negative prompts
+        if len(negative_prompt.split()) <= 75:
+            tokens_1 = self.model.tokenizer_1(
+                negative_prompt, padding="max_length", 
+                max_length=self.model.tokenizer_1.model_max_length,
+                truncation=True, return_tensors="pt"
+            ).input_ids.to(self.model.text_encoder_1.device)
+            
+            tokens_2 = self.model.tokenizer_2(
+                negative_prompt, padding="max_length",
+                max_length=self.model.tokenizer_2.model_max_length,
+                truncation=True, return_tensors="pt"
+            ).input_ids.to(self.model.text_encoder_2.device)
+            
+            return self.model.encode_text(
+                tokens_1=tokens_1, tokens_2=tokens_2,
+                train_device=self.train_device, batch_size=1,
+                text=None  # Force non-long-prompt path
+            )
+        else:
+            # Para negative prompts muito longos, usar long prompts mesmo assim
+            return self.model.encode_text(
+                text=negative_prompt, train_device=self.train_device, batch_size=1
+            )
+
+    def _smart_combine_embeddings(self, pos_emb, neg_emb):
+        """Combina embeddings de forma eficiente"""
+        max_len = max(pos_emb.shape[1], neg_emb.shape[1])
+        
+        # Se já têm o mesmo tamanho, só concatena
+        if pos_emb.shape[1] == neg_emb.shape[1]:
+            return torch.cat([neg_emb, pos_emb], dim=0)
+        
+        # Padding otimizado
+        pos_padded = F.pad(pos_emb, (0, 0, 0, max_len - pos_emb.shape[1])) \
+                    if pos_emb.shape[1] < max_len else pos_emb
+        neg_padded = F.pad(neg_emb, (0, 0, 0, max_len - neg_emb.shape[1])) \
+                    if neg_emb.shape[1] < max_len else neg_emb
+        
+        return torch.cat([neg_padded, pos_padded], dim=0)
 
     def __create_erode_kernel(self, device):
         kernel_radius = 2
@@ -309,6 +359,7 @@ class StableDiffusionXLSampler(BaseModelSampler):
                 *self.model.encode_text(
                     text=prompt,
                     train_device=self.train_device,
+                    batch_size=1,
                     text_encoder_1_layer_skip=text_encoder_1_layer_skip,
                     text_encoder_2_layer_skip=text_encoder_2_layer_skip,
                 ))
@@ -317,9 +368,23 @@ class StableDiffusionXLSampler(BaseModelSampler):
                 *self.model.encode_text(
                     text=negative_prompt,
                     train_device=self.train_device,
+                    batch_size=1,
                     text_encoder_1_layer_skip=text_encoder_1_layer_skip,
                     text_encoder_2_layer_skip=text_encoder_2_layer_skip,
                 ))
+
+            max_seq_len_hidden = max(prompt_embedding_te.shape[1], negative_prompt_embedding_te.shape[1])
+
+            # Pad embeddings if necessary to match sequence length
+            if prompt_embedding_te.shape[1] < max_seq_len_hidden:
+                padding_needed = max_seq_len_hidden - prompt_embedding_te.shape[1]
+                # pad(tensor, (pad_left, pad_right, pad_top, pad_bottom, pad_front, pad_back))
+                # Para a dimensão 1 (sequence length), padding (0, padding_needed)
+                prompt_embedding_te = torch.nn.functional.pad(prompt_embedding_te, (0, 0, 0, padding_needed), mode='constant', value=0)
+
+            if negative_prompt_embedding_te.shape[1] < max_seq_len_hidden:
+                padding_needed = max_seq_len_hidden - negative_prompt_embedding_te.shape[1]
+                negative_prompt_embedding_te = torch.nn.functional.pad(negative_prompt_embedding_te, (0, 0, 0, padding_needed), mode='constant', value=0)
 
             combined_prompt_embedding = torch.cat([negative_prompt_embedding, prompt_embedding]) \
                 .to(dtype=self.model.train_dtype.torch_dtype())

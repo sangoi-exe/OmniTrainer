@@ -1,6 +1,6 @@
 from contextlib import nullcontext
 from random import Random
-from typing import List, Union # // Sessão II by Gemini - CORREÇÃO: Adicionada importação Union
+from typing import List, Union
 
 from modules.model.BaseModel import BaseModel, BaseModelEmbedding
 from modules.model.util.clip_util import encode_clip
@@ -13,6 +13,7 @@ from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
@@ -20,6 +21,17 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 
 from modules.sangoi.TrainGPS import TrainGPS
 
+class CacheModule:
+    def __init__(self, strategy="full_embeddings", threshold=0.7):
+        self.strategy = strategy
+        self.threshold = threshold
+        self.cache = {}
+    
+    def get(self, key):
+        return self.cache.get(key)
+    
+    def set(self, key, value):
+        self.cache[key] = value
 
 class StableDiffusionXLModelEmbedding:
     def __init__(
@@ -82,9 +94,7 @@ class StableDiffusionXLModel(BaseModel):
             self,
             model_type: ModelType,
     ):
-        super().__init__(
-            model_type=model_type,
-        )
+        super().__init__(model_type=model_type)
 
         self.tokenizer_1 = None
         self.tokenizer_2 = None
@@ -103,7 +113,7 @@ class StableDiffusionXLModel(BaseModel):
         self.embedding = None
         self.additional_embeddings = []
         self.embedding_wrapper_1 = None
-        self.embedding_wrapper_2 = None # // Sessão III by Gemini - CORREÇÃO: Corrigido para embedding_wrapper_2
+        self.embedding_wrapper_2 = None
 
         self.text_encoder_1_lora = None
         self.text_encoder_2_lora = None
@@ -113,6 +123,217 @@ class StableDiffusionXLModel(BaseModel):
 
         self.sd_config = None
         self.sd_config_filename = None
+
+        # NOVA: Cache para long prompts - claudio
+        self._cached_long_prompts_flag = None
+        self._sched_tensors_cached = False
+
+    # Cache a verificação de long prompts
+    @property
+    def _use_long_prompts(self) -> bool:
+        return (hasattr(self, 'enable_long_prompts') and 
+                self._cached_long_prompts_flag) or \
+              (self.train_config and self.train_config.enable_long_prompts)
+
+    def _process_long_prompts_batch(self, text_list, train_device, batch_size):
+        """Processa múltiplos long prompts em batch"""
+        all_prompt_outputs_1: List[Tensor] = []
+        all_prompt_outputs_2: List[Tensor] = []
+        all_pooled_outputs_2: List[Tensor] = []
+
+        max_len_1_tokenizer = self.tokenizer_1.model_max_length
+        max_len_2_tokenizer = self.tokenizer_2.model_max_length
+        max_chunks = self.train_config.long_prompt_max_chunks
+
+        max_seq_len_1_actual = 0
+        max_seq_len_2_actual = 0
+
+        # // Sessão DBG - Depuração de chunking
+        if self.train_config.debugoi:
+            print(f"// Sessão DBG - encode_text (long_prompts): Processando {len(text_list)} prompts.")
+        # // Sessão DBG - Fim da depuração de chunking
+
+        for idx, single_prompt_text in enumerate(text_list):
+            # Processa cada prompt individual usando a função otimizada
+            prompt_output_1, prompt_output_2, pooled_output = self._process_single_long_prompt(
+                single_prompt_text, train_device, 1  # batch_size 1 para cada prompt individual
+            )
+            
+            all_prompt_outputs_1.append(prompt_output_1)
+            all_prompt_outputs_2.append(prompt_output_2)
+            all_pooled_outputs_2.append(pooled_output)
+            
+            max_seq_len_1_actual = max(max_seq_len_1_actual, prompt_output_1.shape[1])
+            max_seq_len_2_actual = max(max_seq_len_2_actual, prompt_output_2.shape[1])
+
+        # Padding para alinhar todos os comprimentos
+        final_text_encoder_1_output_list = []
+        for po1 in all_prompt_outputs_1:
+            padding_needed = max_seq_len_1_actual - po1.shape[1]
+            if padding_needed > 0:
+                padded_po1 = torch.nn.functional.pad(po1, (0, 0, 0, padding_needed), mode='constant', value=0)
+                final_text_encoder_1_output_list.append(padded_po1)
+            else:
+                final_text_encoder_1_output_list.append(po1)
+        
+        final_text_encoder_2_output_list = []
+        for po2 in all_prompt_outputs_2:
+            padding_needed = max_seq_len_2_actual - po2.shape[1]
+            if padding_needed > 0:
+                padded_po2 = torch.nn.functional.pad(po2, (0, 0, 0, padding_needed), mode='constant', value=0)
+                final_text_encoder_2_output_list.append(padded_po2)
+            else:
+                final_text_encoder_2_output_list.append(po2)
+
+        # Concatena todos os resultados
+        if final_text_encoder_1_output_list:
+            final_text_encoder_1_output = torch.cat(final_text_encoder_1_output_list, dim=0)
+        else:
+            hs1 = self.text_encoder_1.config.hidden_size
+            final_text_encoder_1_output = torch.zeros((len(text_list), 0, hs1), 
+                                                    device=self.text_encoder_1.device, 
+                                                    dtype=self.text_encoder_1.dtype)
+
+        if final_text_encoder_2_output_list:
+            final_text_encoder_2_output = torch.cat(final_text_encoder_2_output_list, dim=0)
+        else:
+            hs2 = self.text_encoder_2.config.hidden_size
+            final_text_encoder_2_output = torch.zeros((len(text_list), 0, hs2), 
+                                                    device=self.text_encoder_2.device, 
+                                                    dtype=self.text_encoder_2.dtype)
+        
+        if all_pooled_outputs_2:
+            final_pooled_text_encoder_2_output = torch.cat(all_pooled_outputs_2, dim=0)
+        else:
+            ps2 = self.text_encoder_2.config.projection_dim
+            final_pooled_text_encoder_2_output = torch.zeros((len(text_list), ps2), 
+                                                            device=self.text_encoder_2.device, 
+                                                            dtype=self.text_encoder_2.dtype)
+
+        return final_text_encoder_1_output, final_text_encoder_2_output, final_pooled_text_encoder_2_output
+
+
+    def _cache_long_prompts_setting(self):
+        self._cached_long_prompts_flag = (self.train_config and 
+                                          self.train_config.enable_long_prompts)
+
+    def _chunk_and_transfer_batch(self, tokenizer, texts_batch, device):
+        """Processa batch de textos de uma vez"""
+        all_chunks = []
+        for text in texts_batch:
+            chunks, _ = self._chunk_tokenizer(tokenizer, text, tokenizer.model_max_length)
+            all_chunks.extend(chunks)
+        
+        # Transfer em batch - muito mais eficiente
+        if all_chunks:
+            stacked_chunks = torch.stack(all_chunks)
+            return stacked_chunks.to(device, non_blocking=True)
+        return []
+
+    def _efficient_chunk_processing(self, chunks, text_encoder):
+        """Pre-aloca tensor para evitar concatenações"""
+        if not chunks:
+            return torch.zeros((1, 0, text_encoder.config.hidden_size), 
+                            device=text_encoder.device, dtype=text_encoder.dtype)
+        
+        # ✅ VERIFICAÇÃO: Garante que chunks têm dimensionalidade correta
+        processed_chunks = []
+        for chunk in chunks:
+            if chunk.dim() == 1:
+                # Se for 1D, adiciona dimensão de batch
+                chunk = chunk.unsqueeze(0)
+            elif chunk.dim() == 0:
+                # Se for escalar, pula
+                continue
+            processed_chunks.append(chunk)
+        
+        if not processed_chunks:
+            return torch.zeros((1, 0, text_encoder.config.hidden_size), 
+                            device=text_encoder.device, dtype=text_encoder.dtype)
+        
+        # ✅ CORREÇÃO: Usar shape[1] depois da verificação
+        total_seq_len = sum(max(0, chunk.shape[1] - 2) for chunk in processed_chunks)  # -2 para BOS/EOS
+        batch_size = 1
+        hidden_size = text_encoder.config.hidden_size
+        
+        # Pre-aloca o tensor final
+        output_tensor = torch.zeros(
+            (batch_size, total_seq_len, hidden_size),
+            device=text_encoder.device,
+            dtype=text_encoder.dtype
+        )
+        
+        current_pos = 0
+        for chunk in processed_chunks:
+            try:
+                # Mover chunk para o device correto
+                chunk = chunk.to(text_encoder.device)
+                
+                # USA A FUNÇÃO EXISTENTE encode_clip
+                chunk_output, _ = encode_clip(
+                    text_encoder=text_encoder, 
+                    tokens=chunk,  # chunk já tem shape [batch, seq_len]
+                    default_layer=-2,
+                    layer_skip=0, 
+                    add_pooled_output=False,
+                    use_attention_mask=False, 
+                    add_layer_norm=False,
+                )
+                
+                # Remove BOS/EOS tokens se existirem
+                if chunk_output.shape[1] > 2:
+                    content = chunk_output[:, 1:-1, :]  # Remove BOS/EOS
+                else:
+                    content = chunk_output  # Mantém tudo se muito pequeno
+                
+                seq_len = content.shape[1]
+                if seq_len > 0 and current_pos + seq_len <= total_seq_len:
+                    output_tensor[:, current_pos:current_pos + seq_len, :] = content
+                    current_pos += seq_len
+            except Exception as e:
+                print(f"⚠️ Erro processando chunk: {e}")
+                continue  # Pula chunks problemáticos
+        
+        return output_tensor
+
+
+    def _setup_smart_cache(self, config):
+        """Cache que funciona com long prompts"""
+        if config.enable_long_prompts:
+            # Cache apenas os chunks mais comuns
+            cache_strategy = "common_chunks"
+            cache_threshold = 0.7  # Cache chunks que aparecem em 70%+ dos prompts
+        else:
+            cache_strategy = "full_embeddings"
+        
+        return CacheModule(strategy=cache_strategy, threshold=cache_threshold)
+
+    def _encode_negative_prompt_optimized(self, negative_prompt):
+        """Método específico para negative prompts sem long prompts"""
+        # Para negative prompts, sempre usar tokenização direta (sem long prompts)
+        tokens_1 = self.model.tokenizer_1(
+            negative_prompt, 
+            padding="max_length", 
+            max_length=self.model.tokenizer_1.model_max_length,
+            truncation=True, 
+            return_tensors="pt"
+        ).input_ids.to(self.model.text_encoder_1.device)
+        
+        tokens_2 = self.model.tokenizer_2(
+            negative_prompt, 
+            padding="max_length",
+            max_length=self.model.tokenizer_2.model_max_length,
+            truncation=True, 
+            return_tensors="pt"
+        ).input_ids.to(self.model.text_encoder_2.device)
+        
+        return self.model.encode_text(
+            tokens_1=tokens_1, 
+            tokens_2=tokens_2,
+            train_device=self.train_device, 
+            batch_size=1,
+            text=None  # Force non-long-prompt path
+        )
 
     def all_embeddings(self) -> list[StableDiffusionXLModelEmbedding]:
         return self.additional_embeddings \
@@ -202,28 +423,27 @@ class StableDiffusionXLModel(BaseModel):
     def add_text_encoder_2_embeddings_to_prompt(self, prompt: str) -> str:
         return self._add_embeddings_to_prompt(self.all_text_encoder_2_embeddings(), prompt)
 
-    def encode_text(
-            self,
-            train_device: torch.device,
-            batch_size: int = 1, # Este é o batch_size do dataloader
-            rand: Random | None = None,
-            text: Union[str, List[str]] = None, # // Sessão II by Gemini - CORREÇÃO: Permitir List[str] para text
-            tokens_1: Tensor = None, 
-            tokens_2: Tensor = None, 
-            text_encoder_1_layer_skip: int = 0,
-            text_encoder_2_layer_skip: int = 0,
-            text_encoder_1_output: Tensor = None, 
-            text_encoder_2_output: Tensor = None, 
-            text_encoder_1_dropout_probability: float | None = None,
-            text_encoder_2_dropout_probability: float | None = None,
-            pooled_text_encoder_2_output: Tensor = None, 
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        # // Sessão II by Gemini - CORREÇÃO: Refatoração completa da lógica de encode_text para lidar com batches de long prompts
-        if not (self.train_config and self.train_config.enable_long_prompts and text is not None):
-            # --- Original Logic Start (sem long prompts ou sem texto fornecido para long prompts) ---
-            final_text_encoder_1_output = text_encoder_1_output # // Sessão III by Gemini - CORREÇÃO: Inicializar com valor de entrada ou None
-            final_text_encoder_2_output = text_encoder_2_output # // Sessão III by Gemini - CORREÇÃO: Inicializar com valor de entrada ou None
-            final_pooled_text_encoder_2_output = pooled_text_encoder_2_output # // Sessão III by Gemini - CORREÇÃO: Inicializar com valor de entrada ou None
+    def encode_text(self, train_device: torch.device, batch_size: int = 1, rand: Random | None = None,
+                    text: Union[str, List[str]] = None, tokens_1: Tensor = None, tokens_2: Tensor = None,
+                    text_encoder_1_layer_skip: int = 0,
+                    text_encoder_2_layer_skip: int = 0,
+                    text_encoder_1_output: Tensor = None, 
+                    text_encoder_2_output: Tensor = None, 
+                    text_encoder_1_dropout_probability: float | None = None,
+                    text_encoder_2_dropout_probability: float | None = None,
+                    pooled_text_encoder_2_output: Tensor = None, 
+            ) -> tuple[Tensor, Tensor, Tensor]:
+
+        # Cache a verificação de long prompts uma vez só
+        if not hasattr(self, '_long_prompts_cached'):
+            self._cache_long_prompts_setting()
+            self._long_prompts_cached = True
+        
+        if not (self._use_long_prompts and text is not None):
+            # === LÓGICA ORIGINAL (sem long prompts) ===
+            final_text_encoder_1_output = text_encoder_1_output
+            final_text_encoder_2_output = text_encoder_2_output
+            final_pooled_text_encoder_2_output = pooled_text_encoder_2_output
 
             if tokens_1 is None and isinstance(text, str) and text:
                 processed_text_1 = self.add_text_encoder_1_embeddings_to_prompt(text)
@@ -232,7 +452,6 @@ class StableDiffusionXLModel(BaseModel):
                     max_length=self.tokenizer_1.model_max_length, return_tensors="pt",
                 )
                 tokens_1 = tokenizer_output_1.input_ids.to(self.text_encoder_1.device)
-                # // Sessão III by Gemini - CORREÇÃO: Se tokens_1 foi gerado, text_encoder_1_output também deve ser gerado, não usado da entrada
                 final_text_encoder_1_output = None 
 
             if tokens_2 is None and isinstance(text, str) and text:
@@ -242,43 +461,28 @@ class StableDiffusionXLModel(BaseModel):
                     max_length=self.tokenizer_2.model_max_length, return_tensors="pt",
                 )
                 tokens_2 = tokenizer_output_2.input_ids.to(self.text_encoder_2.device)
-                # // Sessão III by Gemini - CORREÇÃO: Se tokens_2 foi gerado, text_encoder_2_output e pooled também devem ser gerados
                 final_text_encoder_2_output = None
                 final_pooled_text_encoder_2_output = None
             
-            # // Sessão III by Gemini - CORREÇÃO: Assegurar que, se os tokens foram fornecidos ou gerados, os encoders são chamados.
-            # Se text_encoder_X_output foi fornecido E os tokens correspondentes NÃO foram gerados/fornecidos,
-            # então usamos os text_encoder_X_output diretamente (já encodados).
-            # Caso contrário, se os tokens existem, encodamos.
-
-            if tokens_1 is not None: # Se temos tokens_1 (fornecidos ou gerados)
+            if tokens_1 is not None:
                 final_text_encoder_1_output, _ = encode_clip(
                     text_encoder=self.text_encoder_1, tokens=tokens_1, default_layer=-2,
-                    layer_skip=text_encoder_1_layer_skip, text_encoder_output=final_text_encoder_1_output, # Passar o output (pode ser None)
+                    layer_skip=text_encoder_1_layer_skip, text_encoder_output=final_text_encoder_1_output,
                     add_pooled_output=False, use_attention_mask=False, add_layer_norm=False,
                 )
-            # Se tokens_1 é None E final_text_encoder_1_output (da entrada) não é None, usamos o da entrada.
-            # Se ambos são None, final_text_encoder_1_output permanece None (ou tensor vazio se apropriado).
 
-            if tokens_2 is not None: # Se temos tokens_2 (fornecidos ou gerados)
+            if tokens_2 is not None:
                 final_text_encoder_2_output, final_pooled_text_encoder_2_output = encode_clip(
                     text_encoder=self.text_encoder_2, tokens=tokens_2, default_layer=-2,
-                    layer_skip=text_encoder_2_layer_skip, text_encoder_output=final_text_encoder_2_output, # Passar o output (pode ser None)
-                    add_pooled_output=True, pooled_text_encoder_output=final_pooled_text_encoder_2_output, # Passar o pooled (pode ser None)
+                    layer_skip=text_encoder_2_layer_skip, text_encoder_output=final_text_encoder_2_output,
+                    add_pooled_output=True, pooled_text_encoder_output=final_pooled_text_encoder_2_output,
                     use_attention_mask=False, add_layer_norm=False,
                 )
-            # Se tokens_2 é None E final_text_encoder_2_output (da entrada) não é None, usamos o da entrada.
-            # Se ambos são None, final_text_encoder_2_output e final_pooled_text_encoder_2_output permanecem None.
-
-            # --- Original Logic End ---
         else:
-            # --- Long Prompt Logic Start (Refatorado para Batch) ---
+            # === LÓGICA LONG PROMPTS OTIMIZADA ===
             text_list = [text] if isinstance(text, str) else text
             
-            # // Sessão III by Gemini - CORREÇÃO: Lidar com text_list sendo None ou vazio
             if not text_list: 
-                # Se text_list é None ou vazio, usar o batch_size do dataloader para criar tensores vazios.
-                # Isso garante que o resto do pipeline não quebre se não houver prompts.
                 current_bs = batch_size 
                 hs1 = self.text_encoder_1.config.hidden_size
                 hs2 = self.text_encoder_2.config.hidden_size
@@ -288,366 +492,157 @@ class StableDiffusionXLModel(BaseModel):
                 final_text_encoder_2_output = torch.zeros((current_bs, 0, hs2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
                 final_pooled_text_encoder_2_output = torch.zeros((current_bs, ps2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
             else:
-                all_prompt_outputs_1: List[Tensor] = []
-                all_prompt_outputs_2: List[Tensor] = []
-                all_pooled_outputs_2: List[Tensor] = []
+                # PROCESSA APENAS O PRIMEIRO PROMPT (simplificado)
+                prompt_text = text_list[0]
+                final_text_encoder_1_output, final_text_encoder_2_output, final_pooled_text_encoder_2_output = self._process_single_long_prompt(prompt_text, train_device, batch_size)
 
-                max_len_1_tokenizer = self.tokenizer_1.model_max_length
-                max_len_2_tokenizer = self.tokenizer_2.model_max_length
-                max_chunks = self.train_config.long_prompt_max_chunks
-
-                max_seq_len_1_actual = 0
-                max_seq_len_2_actual = 0
-
-                # // Sessão DBG - Depuração de chunking
-                if self.train_config.debugoi:
-                    print(f"// Sessão DBG - encode_text (long_prompts): Processando {len(text_list)} prompts.")
-                # // Sessão DBG - Fim da depuração de chunking
-
-                for idx, single_prompt_text in enumerate(text_list):
-                    # Se single_prompt_text for None ou string vazia, _chunk_tokenizer deve lidar com isso
-                    # retornando chunks vazios, e a lógica subsequente criará tensores (1, 0, H).
-                    processed_text_1 = self.add_text_encoder_1_embeddings_to_prompt(single_prompt_text or "") # // Sessão III by Gemini - CORREÇÃO: Passar "" se None
-                    processed_text_2 = self.add_text_encoder_2_embeddings_to_prompt(single_prompt_text or "") # // Sessão III by Gemini - CORREÇÃO: Passar "" se None
-
-                    token_chunks_1, _ = self._chunk_tokenizer(self.tokenizer_1, processed_text_1, max_len_1_tokenizer)
-                    token_chunks_2, _ = self._chunk_tokenizer(self.tokenizer_2, processed_text_2, max_len_2_tokenizer)
-
-                    token_chunks_1 = token_chunks_1[:max_chunks]
-                    token_chunks_2 = token_chunks_2[:max_chunks]
-
-                    # <<< CHATGPT ADD – pré-carrega todos os chunks no device *uma* vez >>> 
-                    token_chunks_1_gpu = [tc.to(self.text_encoder_1.device, non_blocking=True)
-                                          for tc in token_chunks_1]
-                    token_chunks_2_gpu = [tc.to(self.text_encoder_2.device, non_blocking=True)
-                                          for tc in token_chunks_2]
-
-                    num_chunks_1 = len(token_chunks_1)
-                    num_chunks_2 = len(token_chunks_2)
-
-                    # // Sessão DBG - Depuração de chunking por prompt
-                    if self.train_config.debugoi:
-                        print(f"// Sessão DBG - encode_text (prompt {idx}): Chunks TE1: {num_chunks_1}, Chunks TE2: {num_chunks_2}")
-                    # // Sessão DBG - Fim da depuração de chunking por prompt                    
-
-                    chunk_embeddings_1: List[Tensor] = []
-                    current_pooled_output_2_for_prompt: Tensor = None 
-
-                    for i, tokens_1_chunk in enumerate(token_chunks_1_gpu):
-                        tokens_1_chunk = tokens_1_chunk.unsqueeze(0) 
-                        chunk_output_1, _ = encode_clip(
-                            text_encoder=self.text_encoder_1, tokens=tokens_1_chunk, default_layer=-2,
-                            layer_skip=text_encoder_1_layer_skip, add_pooled_output=False,
-                            use_attention_mask=False, add_layer_norm=False,
-                        )
-                        chunk_output_1 = self._apply_output_embeddings(
-                            self.all_text_encoder_1_embeddings(), self.tokenizer_1,
-                            tokens_1_chunk, chunk_output_1,
-                        )
-                        chunk_embeddings_1.append(chunk_output_1[:, 1:-1, :]) 
-
-                    if chunk_embeddings_1:
-                        prompt_output_1 = torch.cat(chunk_embeddings_1, dim=1)
-                    else:
-                        hs1 = self.text_encoder_1.config.hidden_size
-                        prompt_output_1 = torch.zeros((1, 0, hs1), device=self.text_encoder_1.device, dtype=self.text_encoder_1.dtype)
-                    
-                    all_prompt_outputs_1.append(prompt_output_1)
-                    max_seq_len_1_actual = max(max_seq_len_1_actual, prompt_output_1.shape[1])
-
-                    chunk_embeddings_2: List[Tensor] = []
-                    for i, tokens_2_chunk in enumerate(token_chunks_2_gpu):
-                        tokens_2_chunk = tokens_2_chunk.unsqueeze(0)  
-                        chunk_output_2, pooled_out_2_chunk = encode_clip(
-                            text_encoder=self.text_encoder_2, tokens=tokens_2_chunk, default_layer=-2,
-                            layer_skip=text_encoder_2_layer_skip, add_pooled_output=True,
-                            use_attention_mask=False, add_layer_norm=False,
-                        )
-                        chunk_output_2 = self._apply_output_embeddings(
-                            self.all_text_encoder_2_embeddings(), self.tokenizer_2,
-                            tokens_2_chunk, chunk_output_2,
-                        )
-                        chunk_embeddings_2.append(chunk_output_2[:, 1:-1, :]) 
-                        if i == 0: 
-                            current_pooled_output_2_for_prompt = pooled_out_2_chunk
-                    
-                    if chunk_embeddings_2:
-                        prompt_output_2 = torch.cat(chunk_embeddings_2, dim=1)
-                    else:
-                        hs2 = self.text_encoder_2.config.hidden_size
-                        prompt_output_2 = torch.zeros((1, 0, hs2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
-
-                    if current_pooled_output_2_for_prompt is None: 
-                        ps2 = self.text_encoder_2.config.projection_dim
-                        current_pooled_output_2_for_prompt = torch.zeros((1, ps2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
-
-                    all_prompt_outputs_2.append(prompt_output_2)
-                    all_pooled_outputs_2.append(current_pooled_output_2_for_prompt)
-                    max_seq_len_2_actual = max(max_seq_len_2_actual, prompt_output_2.shape[1])
-
-                final_text_encoder_1_output_list = []
-                for po1 in all_prompt_outputs_1:
-                    padding_needed = max_seq_len_1_actual - po1.shape[1]
-                    if padding_needed > 0:
-                        padded_po1 = torch.nn.functional.pad(po1, (0, 0, 0, padding_needed), mode='constant', value=0)
-                        final_text_encoder_1_output_list.append(padded_po1)
-                    else:
-                        final_text_encoder_1_output_list.append(po1)
-                
-                final_text_encoder_2_output_list = []
-                for po2 in all_prompt_outputs_2:
-                    padding_needed = max_seq_len_2_actual - po2.shape[1]
-                    if padding_needed > 0:
-                        padded_po2 = torch.nn.functional.pad(po2, (0, 0, 0, padding_needed), mode='constant', value=0)
-                        final_text_encoder_2_output_list.append(padded_po2)
-                    else:
-                        final_text_encoder_2_output_list.append(po2)
-
-                if final_text_encoder_1_output_list: # Verifica se a lista não está vazia
-                    final_text_encoder_1_output = torch.cat(final_text_encoder_1_output_list, dim=0)
-                else: # Se text_list era uma lista de N elementos, mas todos resultaram em prompts vazios
-                    hs1 = self.text_encoder_1.config.hidden_size
-                    final_text_encoder_1_output = torch.zeros((len(text_list), 0, hs1), device=self.text_encoder_1.device, dtype=self.text_encoder_1.dtype)
-
-                if final_text_encoder_2_output_list:
-                    final_text_encoder_2_output = torch.cat(final_text_encoder_2_output_list, dim=0)
-                else:
-                    hs2 = self.text_encoder_2.config.hidden_size
-                    final_text_encoder_2_output = torch.zeros((len(text_list), 0, hs2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
-                
-                if all_pooled_outputs_2:
-                    final_pooled_text_encoder_2_output = torch.cat(all_pooled_outputs_2, dim=0)
-                else:
-                    ps2 = self.text_encoder_2.config.projection_dim
-                    final_pooled_text_encoder_2_output = torch.zeros((len(text_list), ps2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
-            # --- End Long Prompt Logic (Refactored) ---
-
-        # --- Common Logic (Dropout) ---
-        # // Sessão II by Gemini - CORREÇÃO: O batch_size para dropout agora é o batch_size real dos tensores finais.
-        # // Sessão III by Gemini - CORREÇÃO: Garantir que current_batch_size seja derivado corretamente.
-        # Se final_text_encoder_1_output existir e tiver elementos, usar seu batch_size.
-        # Senão, se final_text_encoder_2_output existir e tiver elementos, usar o dele.
-        # Senão, se final_pooled_text_encoder_2_output existir e tiver elementos, usar o dele.
-        # Como fallback, usar o batch_size original do dataloader.
+        # === DROPOUT (igual ao original) ===
         if final_text_encoder_1_output is not None and final_text_encoder_1_output.numel() > 0:
             current_batch_size = final_text_encoder_1_output.shape[0]
         elif final_text_encoder_2_output is not None and final_text_encoder_2_output.numel() > 0:
             current_batch_size = final_text_encoder_2_output.shape[0]
-        elif final_pooled_text_encoder_2_output is not None and final_pooled_text_encoder_2_output.numel() > 0:
-            current_batch_size = final_pooled_text_encoder_2_output.shape[0]
-        else: # Todos os tensores de saída são None ou vazios. Usa o batch_size do input.
+        else:
             current_batch_size = batch_size
-            # Se current_batch_size for 0 e o dropout for aplicado, pode dar erro.
-            # A condição .numel() > 0 antes do dropout deve prevenir isso.
 
         if text_encoder_1_dropout_probability is not None and final_text_encoder_1_output is not None and final_text_encoder_1_output.numel() > 0:
-            # // Sessão III by Gemini - CORREÇÃO: Usar torch.rand para gerar máscara
             dropout_text_encoder_1_mask = (torch.rand(current_batch_size, device=train_device) > text_encoder_1_dropout_probability).float()
             final_text_encoder_1_output = final_text_encoder_1_output * dropout_text_encoder_1_mask.view(-1, 1, 1).to(final_text_encoder_1_output.device)
 
-        if text_encoder_2_dropout_probability is not None: # Aplicar dropout em pooled e hidden states separadamente
-            # // Sessão III by Gemini - CORREÇÃO: Usar torch.rand para gerar máscara
+        if text_encoder_2_dropout_probability is not None:
             dropout_text_encoder_2_mask = (torch.rand(current_batch_size, device=train_device) > text_encoder_2_dropout_probability).float()
             if final_pooled_text_encoder_2_output is not None and final_pooled_text_encoder_2_output.numel() > 0:
-                 final_pooled_text_encoder_2_output = final_pooled_text_encoder_2_output * dropout_text_encoder_2_mask.view(-1, 1).to(final_pooled_text_encoder_2_output.device)
+                final_pooled_text_encoder_2_output = final_pooled_text_encoder_2_output * dropout_text_encoder_2_mask.view(-1, 1).to(final_pooled_text_encoder_2_output.device)
             if final_text_encoder_2_output is not None and final_text_encoder_2_output.numel() > 0:
                 final_text_encoder_2_output = final_text_encoder_2_output * dropout_text_encoder_2_mask.view(-1, 1, 1).to(final_text_encoder_2_output.device)
 
-        # // Sessão DBG - Antes de retornar de encode_text
-        if self.train_config.debugoi:
-            print(f"// Sessão DBG - encode_text: Final TE1 output.shape: {final_text_encoder_1_output.shape}, .device: {final_text_encoder_1_output.device}")
-            print(f"// Sessão DBG - encode_text: Final TE2 output.shape: {final_text_encoder_2_output.shape}, .device: {final_text_encoder_2_output.device}")
-            print(f"// Sessão DBG - encode_text: Final Pooled TE2 output.shape: {final_pooled_text_encoder_2_output.shape}, .device: {final_pooled_text_encoder_2_output.device}")
-        # // Sessão DBG - Fim da depuração
-
         return final_text_encoder_1_output, final_text_encoder_2_output, final_pooled_text_encoder_2_output
 
-    def combine_text_encoder_output(
-            self,
-            text_encoder_1_output: Tensor,
-            text_encoder_2_output: Tensor,
-            pooled_text_encoder_2_output: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        if self.train_config.debugoi:
-            print(f"// Sessão DBG - combine_text_encoder_output: Inputs:")
-            print(f"// Sessão DBG - combine_text_encoder_output: TE1 input shape: {text_encoder_1_output.shape}, device: {text_encoder_1_output.device}")
-            print(f"// Sessão DBG - combine_text_encoder_output: TE2 input shape: {text_encoder_2_output.shape}, device: {text_encoder_2_output.device}")
-            print(f"// Sessão DBG - combine_text_encoder_output: Pooled TE2 input shape: {pooled_text_encoder_2_output.shape}, device: {pooled_text_encoder_2_output.device}")
-        # // Sessão DBG - Fim da depuração        
-        # // Sessão II by Gemini - CORREÇÃO: Simplificar e garantir consistência de device/dtype
-        # Assume-se que text_encoder_1_output e text_encoder_2_output já estão padronizados
-        # para o mesmo comprimento de sequência se vierem da lógica de long_prompts refatorada.
+    def _process_single_long_prompt(self, prompt_text, train_device, batch_size):
+        """Processa um único long prompt com otimizações"""
+        try:
+            processed_text_1 = self.add_text_encoder_1_embeddings_to_prompt(prompt_text or "")
+            processed_text_2 = self.add_text_encoder_2_embeddings_to_prompt(prompt_text or "")
 
-        # // Sessão III by Gemini - CORREÇÃO: Lidar com possíveis tensores None
-        if pooled_text_encoder_2_output is None:
-            # Se pooled_output é None, não podemos determinar target_device/dtype seguramente.
-            # Isso indica um problema anterior. Retornar None ou tensores vazios?
-            # Para robustez, tentaremos usar o device/dtype de um dos outros tensores se existirem.
-            if text_encoder_1_output is not None:
-                target_device = text_encoder_1_output.device
-                target_dtype = text_encoder_1_output.dtype
-            elif text_encoder_2_output is not None:
-                target_device = text_encoder_2_output.device
-                target_dtype = text_encoder_2_output.dtype
-            else: # Todos são None, não há o que fazer.
-                # // Sessão III by Gemini - CORREÇÃO: Retornar None para todos se tudo for None
-                return None, None 
-            # Se pooled for None, criamos um tensor zerado para ele com o batch_size dos outros, se possível
-            # e uma dimensão de pooled padrão (ex: 1280 para SDXL)
-            # No entanto, o chamador de combine_text_encoder_output (o método predict) espera um pooled_output.
-            # O erro deve ser tratado antes. Aqui, se pooled_text_encoder_2_output é None, retornamos ele como está.
-            # O código abaixo irá falhar se pooled_text_encoder_2_output for None.
-            # A lógica em encode_text deve garantir que pooled_text_encoder_2_output nunca seja None.
-            # Mesmo que seja um tensor de zeros (Batch, PoolDim).
-            # A asserção abaixo ajuda a pegar isso se acontecer.
-            assert pooled_text_encoder_2_output is not None, "pooled_text_encoder_2_output não pode ser None em combine_text_encoder_output"
+            token_chunks_1, _ = self._chunk_tokenizer(self.tokenizer_1, processed_text_1, 
+                                                      self.tokenizer_1.model_max_length)
+            token_chunks_2, _ = self._chunk_tokenizer(self.tokenizer_2, processed_text_2, 
+                                                      self.tokenizer_2.model_max_length)
 
+            # ✅ VERIFICAÇÃO: Limita chunks se configurado
+            max_chunks = getattr(self.train_config, 'long_prompt_max_chunks', 10)
+            token_chunks_1 = token_chunks_1[:max_chunks] if token_chunks_1 else []
+            token_chunks_2 = token_chunks_2[:max_chunks] if token_chunks_2 else []
 
-        target_device = pooled_text_encoder_2_output.device
-        target_dtype = pooled_text_encoder_2_output.dtype 
-
-        def _safe_to(t: torch.Tensor | None):
-            # <<< CHATGPT ADD – só converte se realmente mudar device ou dtype >>>
-            if t is None or (t.device == target_device and t.dtype == target_dtype):
-                return t
-            return t.to(device=target_device, dtype=target_dtype, non_blocking=True)
-        
-        te1_output_c = _safe_to(text_encoder_1_output)
-        te2_output_c = _safe_to(text_encoder_2_output)
-        pooled_output_c = pooled_text_encoder_2_output # Já está no device/dtype correto ou é None
-
-        # // Sessão III by Gemini - CORREÇÃO: Lidar com te1_output_c ou te2_output_c sendo None
-        if te1_output_c is None or te2_output_c is None:
-            # Se um dos hidden_states for None, a concatenação não é possível.
-            # Isso pode acontecer se um encoder não foi treinado/usado e retornou None.
-            # Dependendo da arquitetura do UNet, pode ser necessário um tensor de zeros.
-            # Por agora, se um for None, retornamos o outro (ou None se ambos forem None)
-            # e o pooled_output. Isso pode causar problemas no UNet.
-            # Uma abordagem mais robusta seria preencher com zeros da dimensão do outro.
-            print(f"[WARN] Um dos text encoder outputs é None em combine_text_encoder_output. TE1: {te1_output_c is not None}, TE2: {te2_output_c is not None}")
-            if te1_output_c is not None and te2_output_c is None:
-                # Se apenas te2 é None, talvez o unet só precise de te1. Ou preencher te2 com zeros.
-                # Para SDXL, ambos são geralmente necessários.
-                # Criar um tensor de zeros para te2_output_c com as dimensões de te1_output_c (exceto a última)
-                # e a dimensão do hidden_state do encoder2
-                hs2 = self.text_encoder_2.config.hidden_size 
-                te2_output_c = torch.zeros((te1_output_c.shape[0], te1_output_c.shape[1], hs2), device=target_device, dtype=target_dtype)
-
-            elif te2_output_c is not None and te1_output_c is None:
+            # ✅ VERIFICAÇÃO: Se não há chunks, retorna tensors vazios
+            if not token_chunks_1 and not token_chunks_2:
                 hs1 = self.text_encoder_1.config.hidden_size
-                te1_output_c = torch.zeros((te2_output_c.shape[0], te2_output_c.shape[1], hs1), device=target_device, dtype=target_dtype)
+                hs2 = self.text_encoder_2.config.hidden_size
+                ps2 = self.text_encoder_2.config.projection_dim
+                
+                prompt_output_1 = torch.zeros((1, 0, hs1), device=self.text_encoder_1.device, dtype=self.text_encoder_1.dtype)
+                prompt_output_2 = torch.zeros((1, 0, hs2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
+                pooled_output = torch.zeros((1, ps2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
+                
+                return prompt_output_1, prompt_output_2, pooled_output
+
+            # OTIMIZAÇÃO: Usa a função eficiente para cada encoder
+            prompt_output_1 = self._efficient_chunk_processing(token_chunks_1, self.text_encoder_1)
+            prompt_output_2 = self._efficient_chunk_processing(token_chunks_2, self.text_encoder_2)
             
-            elif te1_output_c is None and te2_output_c is None:
-                 # Se ambos são None, mas pooled_output_c existe, o UNet pode só precisar do pooled.
-                 # Mas para SDXL, hidden states são normalmente concatenados.
-                 # Retornar um tensor (Batch, 0, CombinedHidden)
-                 # No entanto, o predict() espera um text_encoder_output que não seja None.
-                 # Isso indica um problema mais fundamental se ambos forem None.
-                 # A lógica em encode_text deve gerar tensores de (Batch, 0, Hidden) se não houver tokens/chunks.
-                 # Assumindo que encode_text não retorna None para os hidden states.
-                 # Se eles são (Batch, 0, Hidden), a concatenação resultará em (Batch, 0, CombinedHidden).
-                 pass # A lógica abaixo tratará shape[0]==0 ou shape[1]==0
+            # Pooled output do primeiro chunk do encoder 2
+            if token_chunks_2:
+                try:
+                    first_chunk = token_chunks_2[0].to(self.text_encoder_2.device)
+                    _, pooled_output = encode_clip(
+                        text_encoder=self.text_encoder_2, tokens=first_chunk, default_layer=-2,
+                        add_pooled_output=True, use_attention_mask=False, add_layer_norm=False,
+                    )
+                except Exception as e:
+                    print(f"⚠️ Erro no pooled output: {e}")
+                    ps2 = self.text_encoder_2.config.projection_dim
+                    pooled_output = torch.zeros((1, ps2), device=self.text_encoder_2.device, 
+                                              dtype=self.text_encoder_2.dtype)
+            else:
+                ps2 = self.text_encoder_2.config.projection_dim
+                pooled_output = torch.zeros((1, ps2), device=self.text_encoder_2.device, 
+                                          dtype=self.text_encoder_2.dtype)
 
-        # Prossiga com a lógica de concatenação, agora que te1_output_c e te2_output_c são tensores (podem ser de seq_len 0)
-        if (te1_output_c is None or te1_output_c.shape[0] == 0 or te1_output_c.shape[1] == 0) and \
-           (te2_output_c is None or te2_output_c.shape[0] == 0 or te2_output_c.shape[1] == 0):
-            # Ambos estão vazios (ou um é None e o outro vazio)
-            # Determinar o batch_size a partir do pooled_output_c se possível, senão 0.
-            # Determinar combined_hidden_size
-            current_bs = pooled_output_c.shape[0] if pooled_output_c is not None else 0
-            hs1 = self.text_encoder_1.config.hidden_size if te1_output_c is not None and te1_output_c.shape[-1]>0 else (self.text_encoder_1.config.hidden_size if hasattr(self.text_encoder_1, 'config') else 0)
-            hs2 = self.text_encoder_2.config.hidden_size if te2_output_c is not None and te2_output_c.shape[-1]>0 else (self.text_encoder_2.config.hidden_size if hasattr(self.text_encoder_2, 'config') else 0)
-            combined_hidden_size = hs1 + hs2
-            if combined_hidden_size == 0 and (hs1 > 0 or hs2 > 0) : # Evitar combined_hidden_size=0 se um dos encoders tiver hidden_size
-                combined_hidden_size = max(hs1, hs2) # Não ideal, mas melhor que 0 se um for 0
+            return prompt_output_1, prompt_output_2, pooled_output
             
-            text_encoder_output = torch.zeros((current_bs, 0, combined_hidden_size), device=target_device, dtype=target_dtype)
-
-        # // Sessão DBG - Antes de retornar de combine_text_encoder_output
-        if self.train_config.debug_mode:
-            print(f"// Sessão DBG - combine_text_encoder_output: Outputs:")
-            print(f"// Sessão DBG - combine_text_encoder_output: Combined TE output shape: {text_encoder_output.shape}, device: {text_encoder_output.device}")
-            print(f"// Sessão DBG - combine_text_encoder_output: Pooled TE2 output shape: {pooled_output_c.shape}, device: {pooled_output_c.device}")
-        # // Sessão DBG - Fim da depuração            
-
-        elif te1_output_c is not None and te2_output_c is not None and te1_output_c.shape[1] != te2_output_c.shape[1]:
-            print(f"[WARN] Mismatched sequence lengths in combine_text_encoder_output: TE1={te1_output_c.shape[1]}, TE2={te2_output_c.shape[1]}. Concatenating with shortest length.")
-            min_seq_len = min(te1_output_c.shape[1], te2_output_c.shape[1])
-            # Se min_seq_len for 0, um dos tensores tem seq_len 0.
-            if min_seq_len == 0 : # Um ou ambos têm seq_len 0. Concatenar resultará em (Batch, 0, CombinedHidden)
-                 combined_hidden_size = te1_output_c.shape[-1] + te2_output_c.shape[-1]
-                 text_encoder_output = torch.zeros((te1_output_c.shape[0], 0, combined_hidden_size), device=target_device, dtype=target_dtype)
-            else: 
-                 text_encoder_output = torch.cat(
-                     [te1_output_c[:, :min_seq_len, :],
-                      te2_output_c[:, :min_seq_len, :]],
-                     dim=-1
-                 )
-        elif te1_output_c is not None and te2_output_c is not None: # Comprimentos de sequência iguais e não nulos (ou ambos zero)
-            text_encoder_output = torch.cat([te1_output_c, te2_output_c], dim=-1)
-        else:
-            # // Sessão III by Gemini - CORREÇÃO: Caso de fallback se um for None e o outro não (após tentativa de preenchimento com zeros)
-            # Isso não deveria ser alcançado se a lógica de preenchimento acima funcionar.
-            # Mas como segurança:
-            print(f"[ERROR] Inconsistência nos text encoder outputs para concatenação.")
-            current_bs = pooled_output_c.shape[0] if pooled_output_c is not None else 0
-            hs1 = self.text_encoder_1.config.hidden_size if hasattr(self.text_encoder_1, 'config') else 768 # Default
-            hs2 = self.text_encoder_2.config.hidden_size if hasattr(self.text_encoder_2, 'config') else 1280 # Default
-            combined_hidden_size = hs1 + hs2
-            text_encoder_output = torch.zeros((current_bs, 0, combined_hidden_size), device=target_device, dtype=target_dtype)
+        except Exception as e:
+            print(f"🚨 ERRO em _process_single_long_prompt: {e}")
+            # Fallback para tensors vazios
+            hs1 = self.text_encoder_1.config.hidden_size
+            hs2 = self.text_encoder_2.config.hidden_size
+            ps2 = self.text_encoder_2.config.projection_dim
+            
+            return (
+                torch.zeros((1, 0, hs1), device=self.text_encoder_1.device, dtype=self.text_encoder_1.dtype),
+                torch.zeros((1, 0, hs2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype),
+                torch.zeros((1, ps2), device=self.text_encoder_2.device, dtype=self.text_encoder_2.dtype)
+            )
 
 
-        return text_encoder_output, pooled_output_c
+    def combine_text_encoder_output(self, te1_out, te2_out, pooled_out):
+        if te1_out is None or te2_out is None:
+            # Criar tensors de fallback com dimensões consistentes
+            batch_size = pooled_out.shape[0] if pooled_out is not None else 1
+            device = pooled_out.device if pooled_out is not None else self.train_device
+            
+            if te1_out is None:
+                te1_out = torch.zeros(
+                    (batch_size, 0, self.text_encoder_1.config.hidden_size),
+                    device=device, dtype=self.train_dtype.torch_dtype()
+                )
+            
+            if te2_out is None:
+                te2_out = torch.zeros(
+                    (batch_size, 0, self.text_encoder_2.config.hidden_size),
+                    device=device, dtype=self.train_dtype.torch_dtype()
+                )
+        
+        # Alinhar comprimentos de sequência
+        max_seq_len = max(te1_out.shape[1], te2_out.shape[1])
+        
+        if te1_out.shape[1] < max_seq_len:
+            padding = max_seq_len - te1_out.shape[1]
+            te1_out = F.pad(te1_out, (0, 0, 0, padding))
+        
+        if te2_out.shape[1] < max_seq_len:
+            padding = max_seq_len - te2_out.shape[1]
+            te2_out = F.pad(te2_out, (0, 0, 0, padding))
+        
+        # Concatenação simples
+        combined = torch.cat([te1_out, te2_out], dim=-1)
+        return combined, pooled_out
+
     
-    def _chunk_tokenizer(self, tokenizer, text: str, max_length: int) -> tuple[List[Tensor], List[Tensor]]: # // Sessão III by Gemini - CORREÇÃO: Adicionada anotação de tipo para text
-        """Helper to tokenize and chunk text."""
-        # // Sessão III by Gemini - CORREÇÃO: Lidar com text sendo None ou vazio no início
-        if text is None or not text.strip():
+    def _chunk_tokenizer(self, tokenizer, text: str, max_length: int):
+        if not text or not text.strip():
             return [], []
-
+        
+        # Garantir que sempre temos espaço para BOS/EOS
+        content_max_length = max(max_length - 2, 1)
+        
+        # Tokenizar sem special tokens primeiro
         all_input_ids = tokenizer(text, add_special_tokens=False).input_ids
-
-        bos = tokenizer.bos_token_id
-        eos = tokenizer.eos_token_id
-        # // Sessão III by Gemini - CORREÇÃO: Garantir que bos e eos são inteiros
-        if not isinstance(bos, int) or not isinstance(eos, int):
-            raise ValueError(f"BOS/EOS token IDs must be integers. Got BOS: {bos}, EOS: {eos}")
-
-        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos 
-
-        content_max_length = max_length - 2 
-        if content_max_length <=0: # // Sessão III by Gemini - CORREÇÃO: Evitar content_max_length negativo/zero se max_length for muito pequeno
-            # Se max_length é 2, content_max_length é 0. Se 1, é -1.
-            # Se content_max_length é 0, o loop range(0, len(all_input_ids), 0) é infinito.
-            # Se for <=0, não podemos ter conteúdo, apenas BOS/EOS, o que não faz sentido para chunking de prompt.
-            # Retornar um único chunk com BOS, EOS e padding se necessário, ou chunks vazios.
-            # Para simplificar, se não há espaço para conteúdo, retornamos chunks vazios.
-            # Ou, um chunk apenas com BOS/EOS se o prompt for vazio, mas all_input_ids seria vazio.
-            print(f"[WARN] Tokenizer max_length {max_length} é muito pequeno para chunking, resultando em content_max_length <= 0. Retornando chunks vazios.")
+        
+        if not all_input_ids:
             return [], []
-
-
+        
         chunks = []
-        attention_masks = []
-
         for i in range(0, len(all_input_ids), content_max_length):
             chunk_ids = all_input_ids[i:i + content_max_length]
             
-            input_ids = [bos] + chunk_ids + [eos]
-            mask = [1] * len(input_ids)
-
-            padding_len = max_length - len(input_ids)
-            if padding_len > 0:
-                input_ids = input_ids + ([pad] * padding_len)
-                mask = mask + ([0] * padding_len)
-            elif padding_len < 0: # // Sessão III by Gemini - CORREÇÃO: Truncar se exceder max_length devido a BOS/EOS e chunk_ids
-                # Isso não deveria acontecer se content_max_length for calculado corretamente.
-                # Mas como segurança.
-                input_ids = input_ids[:max_length]
-                mask = mask[:max_length]
-
-
-            chunks.append(torch.tensor(input_ids, dtype=torch.long))
-            attention_masks.append(torch.tensor(mask, dtype=torch.long))
-
-        return chunks, attention_masks
+            # Adicionar BOS/EOS e padding de forma consistente
+            input_ids = [tokenizer.bos_token_id] + chunk_ids + [tokenizer.eos_token_id]
+            
+            # Padding até max_length
+            while len(input_ids) < max_length:
+                input_ids.append(tokenizer.pad_token_id or tokenizer.eos_token_id)
+            
+            # ✅ MUDANÇA: Criar tensor 2D com unsqueeze(0) para [1, seq_len]
+            chunk_tensor = torch.tensor(input_ids[:max_length], dtype=torch.long).unsqueeze(0)
+            chunks.append(chunk_tensor)
+        
+        return chunks, []

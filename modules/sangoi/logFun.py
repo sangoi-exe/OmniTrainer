@@ -1,39 +1,114 @@
-from rich.console import Console as RichConsole  # Renomear para clareza
-from typing import Optional
+# logFun.txt
+from rich.console import Console as RichConsole, Group # Adicionar Group aqui
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TaskProgressColumn
+from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
+from typing import Optional, Dict, Any
+import threading
 
-# Cria um console global padrão para logFun, se nenhum específico for passado
+# Console global padrão
 _default_logfun_console = RichConsole()
 _current_logfun_console = _default_logfun_console
 
+# Progress manager global
+_global_progress: Optional[Progress] = None
+# REMOVIDO: _progress_live não será mais gerenciado aqui
+# _progress_live: Optional[Live] = None 
+_progress_lock = threading.Lock()
+
 def set_logfun_console(console: RichConsole) -> None:
-    """
-    Redefine o console que o logFun vai usar por padrão.
-    Deve ser chamado antes de instanciar o Live, ex:
-        set_logfun_console(meu_trainer.console)
-    """
+    """Define o console que o logFun vai usar por padrão."""
     global _current_logfun_console
     _current_logfun_console = console
 
+def init_global_progress() -> Progress:
+    """
+    Inicializa o sistema de progresso global (apenas o objeto Progress, sem iniciar Live).
+    O objeto Progress retornado deve ser adicionado a um Rich Live display externo.
+    """
+    global _global_progress
+    
+    with _progress_lock:
+        if _global_progress is None:
+            _global_progress = Progress(
+                SpinnerColumn(),
+                "[progress.description]{task.description}",
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                TextColumn("• {task.speed:.2f} it/s"),
+                console=_current_logfun_console,
+                transient=False, # Tasks added to this progress object will remain after completion
+                refresh_per_second=4
+            )
+            # REMOVIDO: O Live para este Progress será iniciado externamente.
+            # _progress_live = Live(...)
+            # _progress_live.start()
+    
+    return _global_progress
+
+def cleanup_global_progress():
+    """Limpa o sistema de progresso global. (Apenas reseta _global_progress)."""
+    global _global_progress
+    
+    with _progress_lock:
+        # REMOVIDO: Não há _progress_live para parar aqui
+        # if _progress_live:
+        #     _progress_live.stop()
+        #     _progress_live = None
+        if _global_progress:
+            _global_progress = None
+
+def create_progress_task(description: str, total: int) -> int:
+    """
+    Cria uma nova task de progresso.
+    
+    Args:
+        description: Descrição da task
+        total: Total de itens
+        
+    Returns:
+        task_id para usar nas atualizações
+    """
+    # init_global_progress agora apenas retorna o objeto Progress, sem iniciar Live.
+    progress = init_global_progress() 
+    return progress.add_task(description, total=total)
+
+def update_progress_task(task_id: int, advance: int = 1, **kwargs):
+    """Atualiza uma task de progresso."""
+    if _global_progress:
+        _global_progress.update(task_id, advance=advance, **kwargs)
+
+def remove_progress_task(task_id: int):
+    """Remove uma task de progresso."""
+    if _global_progress:
+        _global_progress.remove_task(task_id)
 
 def logFun(mensagem: str, lvl: str = "INFO", _console: Optional[RichConsole] = None) -> None:
     """
-    Imprime uma mensagem de log colorida no console usando match-case.
-
+    Imprime uma mensagem de log colorida no console.
+    
     Args:
-        mensagem (str): A mensagem a ser exibida.
-        lvl (str): O nível do log ('INFO', 'VERBOSE', 'WARNING', 'ERROR', 'DEBUG', 'SUCCESS', 'LOOP', 'CONVCTRL', 'TRAINGPS', 'LORA').
-                   Determina a cor da mensagem.
-        _console (Optional[RichConsole]): O console Rich a ser usado. Se None, usa um console padrão.
+        mensagem: A mensagem a ser exibida
+        lvl: O nível do log
+        _console: Console específico (opcional)
     """
     console_to_use = _console or _current_logfun_console
     level_upper = lvl.upper()
 
+    # NOTA: O logFun agora pode imprimir sobre o Live display sem problemas,
+    # desde que seja no console que o Live está usando.
+    # O Live automaticamente suspende sua exibição para permitir o print,
+    # e depois retoma.
+
     match level_upper:
         case "INFO":
             console_to_use.print(f"[dark_olive_green1][INFO][/dark_olive_green1] [sky_blue1]{mensagem}[/sky_blue1]")
-        case "LOOP":  # Usado pelo Trainer
+        case "LOOP":
             console_to_use.print(f"[cyan][TRAINER][/cyan] [sky_blue1]{mensagem}[/sky_blue1]")
-        case "CONVCTRL":  # Específico para ConvergeControl
+        case "CONVCTRL":
             console_to_use.print(f"[light_salmon1][CONVCTRL][/light_salmon1] [sky_blue1]{mensagem}[/sky_blue1]")
         case "TRAINGPS":
             console_to_use.print(f"[light_steel_blue3][TRAINGPS][/light_steel_blue3] [sky_blue1]{mensagem}[/sky_blue1]")
@@ -44,14 +119,34 @@ def logFun(mensagem: str, lvl: str = "INFO", _console: Optional[RichConsole] = N
         case "WARNING":
             console_to_use.print(f"[gold1][WARNING][/gold1] [sky_blue1]{mensagem}[/sky_blue1]")
         case "ERROR":
-            console_to_use.print(f"[red][ERROR][/red] [pink1]{mensagem}[/pink1]",
-                                 soft_wrap=True)  # Adicionado soft_wrap
-            # Adicionar traceback aqui se desejado, condicionalmente
-            # import traceback
-            # console_to_use.print_exception(show_locals=True) # Ou False para menos verbosidade
+            console_to_use.print(f"[red][ERROR][/red] [pink1]{mensagem}[/pink1]", soft_wrap=True)
         case "DEBUG":
             console_to_use.print(f"[grey35][DEBUG][/grey35] [sky_blue1]{mensagem}[/sky_blue1]")
         case "SUCCESS":
             console_to_use.print(f"[spring_green3][SUCCESS][/spring_green3] [sky_blue1]{mensagem}[/sky_blue1]")
+        case "PROGRESS":
+            console_to_use.print(f"[medium_purple1][PROGRESS][/medium_purple1] [sky_blue1]{mensagem}[/sky_blue1]")
         case _:
             console_to_use.print(f"[white][{level_upper}][/white] [sky_blue1]{mensagem}[/sky_blue1]")
+
+# Context manager para facilitar o uso (mantém-se o mesmo, pois depende de _global_progress)
+class ProgressContext:
+    """Context manager para barras de progresso."""
+    
+    def __init__(self, description: str, total: int):
+        self.description = description
+        self.total = total
+        self.task_id = None
+    
+    def __enter__(self):
+        self.task_id = create_progress_task(self.description, self.total)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.task_id is not None:
+            remove_progress_task(self.task_id)
+    
+    def update(self, advance: int = 1, **kwargs):
+        """Atualiza o progresso."""
+        if self.task_id is not None:
+            update_progress_task(self.task_id, advance=advance, **kwargs)

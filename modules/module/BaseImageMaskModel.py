@@ -11,6 +11,7 @@ from torchvision.transforms import transforms
 
 from PIL import Image
 from tqdm import tqdm
+from modules.sangoi.logFun import logFun, ProgressContext
 
 
 class MaskSample:
@@ -189,14 +190,21 @@ class BaseImageMaskModel(metaclass=ABCMeta):
 
         if progress_callback is not None:
             progress_callback(0, len(filenames))
-        for i, filename in enumerate(tqdm(filenames)):
-            try:
-                self.mask_image(filename, prompts, mode, alpha, threshold, smooth_pixels, expand_pixels)
-            except Exception:
-                if error_callback is not None:
-                    error_callback(filename)
-            if progress_callback is not None:
-                progress_callback(i + 1, len(filenames))
+        
+        # Usar Rich em vez de tqdm
+        with ProgressContext(f"Gerando máscaras ({mode})", len(filenames)) as progress:
+            for i, filename in enumerate(filenames):
+                try:
+                    self.mask_image(filename, prompts, mode, alpha, threshold, smooth_pixels, expand_pixels)
+                except Exception as e:
+                    if error_callback is not None:
+                        error_callback(filename)
+                    logFun(f"Erro ao processar máscara {filename}: {e}", lvl="ERROR")
+                
+                progress.update(1)
+                
+                if progress_callback is not None:
+                    progress_callback(i + 1, len(filenames))
 
     def mask_folder(
             self,

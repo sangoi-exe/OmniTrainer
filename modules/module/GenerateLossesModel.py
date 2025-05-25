@@ -12,6 +12,7 @@ from modules.util.TrainProgress import TrainProgress
 import torch
 
 from tqdm import tqdm
+from modules.sangoi.logFun import logFun, ProgressContext
 
 
 class GenerateLossesModel:
@@ -85,23 +86,28 @@ class GenerateLossesModel:
 
         filename_loss_list: list[tuple[str, float]] = []
         # Don't really need a backward pass here, so we can make the calculation MUCH faster.
+        # Contar total de batches primeiro
+        total_batches = len(self.data_loader.get_data_loader())
+        
         with torch.inference_mode():
-            for batch in step_tqdm:
-                model_output_data = self.model_setup.predict(
-                    self.model,
-                    batch,
-                    self.config,
-                    self.model.train_progress,
-                    deterministic=True,
-                )
-                loss = self.model_setup.calculate_loss(
-                    self.model,
-                    batch,
-                    model_output_data,
-                    self.config,
-                    self.progress,
-                )
-                filename_loss_list.append((batch["image_path"][0], float(loss)))
+            with ProgressContext("Calculando losses", total_batches) as progress:
+                for batch in self.data_loader.get_data_loader():
+                    model_output_data = self.model_setup.predict(
+                        self.model,
+                        batch,
+                        self.config,
+                        self.model.train_progress,
+                        deterministic=True,
+                    )
+                    loss = self.model_setup.calculate_loss(
+                        self.model,
+                        batch,
+                        model_output_data,
+                        self.config,
+                        self.progress,
+                    )
+                    filename_loss_list.append((batch["image_path"][0], float(loss)))
+                progress.update(1)
 
         # Sort such that highest loss comes first
         filename_loss_list.sort(key=lambda x: x[1], reverse=True)

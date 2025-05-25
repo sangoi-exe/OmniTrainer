@@ -8,7 +8,7 @@ from modules.util import path_util
 
 from PIL import Image
 from tqdm import tqdm
-
+from modules.sangoi.logFun import logFun, ProgressContext
 
 class CaptionSample:
     def __init__(self, filename: str):
@@ -144,14 +144,21 @@ class BaseImageCaptionModel(metaclass=ABCMeta):
 
         if progress_callback is not None:
             progress_callback(0, len(filenames))
-        for i, filename in enumerate(tqdm(filenames)):
-            try:
-                self.caption_image(filename, initial_caption, caption_prefix, caption_postfix, mode)
-            except Exception:
-                if error_callback is not None:
-                    error_callback(filename)
-            if progress_callback is not None:
-                progress_callback(i + 1, len(filenames))
+        
+        # Usar Rich em vez de tqdm
+        with ProgressContext(f"Gerando legendas ({mode})", len(filenames)) as progress:
+            for i, filename in enumerate(filenames):
+                try:
+                    self.caption_image(filename, initial_caption, caption_prefix, caption_postfix, mode)
+                except Exception as e:
+                    if error_callback is not None:
+                        error_callback(filename)
+                    logFun(f"Erro ao processar {filename}: {e}", lvl="ERROR")
+                
+                progress.update(1)
+                
+                if progress_callback is not None:
+                    progress_callback(i + 1, len(filenames))
 
     def caption_folder(
             self,

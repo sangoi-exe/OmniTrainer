@@ -124,7 +124,16 @@ class StableDiffusionXLBaseDataLoader(
 
         return modules
 
-    def _cache_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+    def _cache_modules(self, config, model):
+        # Simplificar a lógica de cache para long prompts
+        if config.enable_long_prompts:
+            # Para long prompts, não cachear embeddings pré-computados
+            text_split_names_for_cache = ['tokens_1', 'tokens_2', 'prompt']
+        else:
+            # Lógica original para prompts normais
+            text_split_names_for_cache = ['tokens_1', 'tokens_2']
+            if not config.train_text_encoder_or_embedding():
+                text_split_names_for_cache.append('text_encoder_1_hidden_state')
         image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
 
         if config.masked_training or config.model_type.has_mask_input():
