@@ -294,10 +294,14 @@ class TrainUI(ctk.CTk):
 
         components.label(frame, 0, 0, "Aspect Ratio Bucketing", tooltip="...")
         components.switch(frame, 0, 1, self.ui_state, "aspect_ratio_bucketing")
-        components.label(frame, 1, 0, "Latent Caching", tooltip="...")
-        components.switch(frame, 1, 1, self.ui_state, "latent_caching")
-        components.label(frame, 2, 0, "Clear cache before training", tooltip="...")
-        components.switch(frame, 2, 1, self.ui_state, "clear_cache_before_training")
+        components.label(frame, 1, 0, "Bucket Ratio", tooltip="...")
+        components.entry(frame, 1, 1, self.ui_state, "bucket_ratio")
+        components.label(frame, 2, 0, "Latent Caching", tooltip="...")
+        components.switch(frame, 2, 1, self.ui_state, "latent_caching")
+        components.label(frame, 3, 0, "Cache Raw Images", tooltip="Saves a copy of the post-processed images for debugging purposes.")
+        components.switch(frame, 3, 1, self.ui_state, "latent_caching")
+        components.label(frame, 4, 0, "Clear cache before training", tooltip="...")
+        components.switch(frame, 4, 1, self.ui_state, "clear_cache_before_training")
 
         frame.pack(fill="both", expand=True)
         return frame  # Retorna o frame criado
@@ -897,6 +901,3 @@ class TrainUI(ctk.CTk):
             train_commands.save()
         else:
             self.on_update_status("Cannot save: Not training")
-
-
-# Fim da classe TrainUI

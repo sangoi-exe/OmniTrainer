@@ -269,11 +269,13 @@ class TrainConfig(BaseConfig):
     layer_offload_fraction: float
     force_circular_padding: bool
     
-		# sangoi settings
+    # sangoi settings
     lora_layers_blacklist: list[str]
     lora_modules_rank_rules: list[dict[str, int]] = []
     lora_modules_alpha_rules: list[dict[str, int]] = []
+    cache_raw_images: bool
     gen_lora_keys: bool
+    bucket_ratio: int
     debugoi: bool
     
     # text encoder long prompts
@@ -295,13 +297,13 @@ class TrainConfig(BaseConfig):
     # convctrl settings
     convctrl_use_it: bool
     
-		# dynrecorder settings
+    # dynrecorder settings
     data_recorder: bool
     
-		# which run
+    # which run
     run_number: int = 1
     
-		# data settings
+    # data settings
     concept_file_name: str
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
@@ -454,7 +456,7 @@ class TrainConfig(BaseConfig):
     # secrets - not saved into config file
     secrets: SecretsConfig
     
-		# grad_sample
+    # grad_sample
     add_grad_sample: bool = False
     
     def __init__(self, data: list[(str, Any, type, bool)]):
@@ -789,12 +791,14 @@ class TrainConfig(BaseConfig):
         data.append(("layer_offload_fraction", 0.0, float, False))
         data.append(("force_circular_padding", False, bool, False))
         
-				# sangoi settings				
+        # sangoi settings
         data.append(("lora_modules_rank_rules", [], list, False))
         data.append(("lora_modules_alpha_rules", [], list, False))
         data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("gen_lora_keys", False, bool, False))
         data.append(("debugoi", False, bool, False))
+        data.append(("cache_raw_images", False, bool, False))
+        data.append(("bucket_ratio", 64, int, False))
         data.append(("train_gps_save_it", False, bool, False))
         data.append(("train_gps_use_it", False, bool, False))
         data.append(("train_gps_weight", 0.0, float, False))
@@ -806,7 +810,7 @@ class TrainConfig(BaseConfig):
         data.append(("run_number", 1, int, False))        
         # text encoder long prompt
         data.append(("enable_long_prompts", False, bool, False))
-        data.append(("long_prompt_max_chunks", 4, int, False)) 
+        data.append(("long_prompt_max_chunks", 4, int, False))
         
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))

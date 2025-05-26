@@ -127,11 +127,11 @@ class DataLoaderText2ImageMixin:
 
         return modules
 
-    def _aspect_bucketing_in(self, config: TrainConfig, aspect_bucketing_quantization: int, frame_dim_enabled:bool=False):
+    def _aspect_bucketing_in(self, config: TrainConfig, frame_dim_enabled:bool=False):
+        
         calc_aspect = CalcAspect(image_in_name='image', resolution_out_name='original_resolution')
-
         aspect_bucketing_quantization = AspectBucketing(
-            quantization=aspect_bucketing_quantization,
+            quantization=config.bucket_ratio,
             resolution_in_name='original_resolution',
             target_resolution_in_name='settings.target_resolution',
             enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
