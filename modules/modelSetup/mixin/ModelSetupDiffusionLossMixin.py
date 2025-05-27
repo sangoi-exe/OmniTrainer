@@ -442,16 +442,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                             data["timestep"],                        
                             data["predicted_image_rgb"],
                             data["target_image_rgb"],
-                            losses.device,
-                            config.loss_weight_strength,
+                            losses.device,                            
                         )
                     else:
                         losses *= self.__sangoi_loss_weighting(
                             data["timestep"],                        
                             data["target_image_latent"],
                             data["predicted_image_latent"],
-                            losses.device,
-                            config.loss_weight_strength,
+                            losses.device,                            
                         )
                     self.tensorboard.add_scalar(
                         "sangoi/6loss_after_sangoi",
@@ -530,8 +528,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     def _safe_ssim(self, pred_bf16: torch.Tensor, tgt_bf16: torch.Tensor) -> torch.Tensor:
         """ Calcula SSIM em fp32 para evitar underflow; devolve no dtype original. """
-        ssim_fp32 = ssim(pred_bf16.float(), tgt_bf16.float(),
-                        data_range=1.0, size_average=False)
+        ssim_fp32 = ssim(pred_bf16.float(), tgt_bf16.float(), data_range=1.0, size_average=False)
         return ssim_fp32.to(dtype=pred_bf16.dtype)
 
     def latent_ssim(self, pred_lat: torch.Tensor, tgt_lat: torch.Tensor) -> torch.Tensor:
@@ -543,7 +540,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if pred_lat.shape[-1] < 128:
             pred_lat = F.interpolate(pred_lat, size=128, mode="nearest")
             tgt_lat  = F.interpolate(tgt_lat,  size=128, mode="nearest")
-
-        ssim32 = ssim(pred_lat.float(), tgt_lat.float(),
-                      data_range=1.0, size_average=False, win_size=11)
+        with torch.no_grad():
+            ssim32 = ssim(pred_lat.float(), tgt_lat.float(), data_range=1.0, size_average=False, win_size=11)
         return ssim32.to(dtype=pred_lat.dtype)
