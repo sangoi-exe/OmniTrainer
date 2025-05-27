@@ -318,72 +318,47 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     def __sangoi_loss_weighting(
         self,
         timesteps: Tensor,
-        predicted: Tensor,      # agora RGB decodificado
-        target: Tensor,         # idem
+        predicted: Tensor,
+        target: Tensor,
         device: torch.device,
-        gamma: float,
     ):
         """
-        Função Sangoi Loss Weighting (versão 2025-05-27).
-        • Dificuldade via *Min-SNR-γ*.
-        • Currículo linear γ_start → γ_end.
-        • Bonifica via SSIM perceptual (dispensa MAPE).
-        • Normaliza reward ∈ [gamma, 1].
+        Função Sangoi Loss Weighting (versão 2025-05-27b).
+        • Bonifica qualidade × dificuldade.
+        • Dificuldade = exp(-SNR / α), onde α = config.alpha_sangoi.
+        • Remove currículo ao longo das épocas.
         """
-        progress = self.progress
-        config   = self.config
-        eps      = 1e-8
+        config = self.config
+        eps    = 1e-8
 
-        # ------------------------------------------------------------------
         # 1) SNR por timestep (fora do grafo)
-        # ------------------------------------------------------------------
         with torch.no_grad():
-            snr = self.__snr(timesteps, device)
-        snr = snr + eps
+            snr = self.__snr(timesteps, device) + eps          # (batch,)
 
-        # ------------------------------------------------------------------
-        # 2) Métrica de qualidade  →  SSIM
-        # ------------------------------------------------------------------
+        # 2) Métrica de qualidade → SSIM ou Latent-SSIM
         if config.full_vae_mf:
             ssim_val   = self._safe_ssim(predicted, target)
-            perceptual = 1.0 - ssim_val
         else:
             ssim_val   = self.latent_ssim(predicted, target)
-            perceptual = 1.0 - ssim_val
+        perceptual = 1.0 - ssim_val                            # 0 = perfeito
 
-        # ------------------------------------------------------------------
-        # 3) Currículo γ
-        # ------------------------------------------------------------------
-        total_epochs = max(config.epochs, 1)
-        alpha        = progress.epoch / float(total_epochs - 1) if total_epochs > 1 else 1.0
-        gamma_start, gamma_end = 2.0, 5.0
-        gamma_curr   = gamma_start + (gamma_end - gamma_start) * alpha
+        # 3) Dificuldade → exp(-SNR / α)  (mais ruído → peso ↑)
+        alpha_sangoi = torch.as_tensor(config.alpha_sangoi, device=snr.device, dtype=snr.dtype)
+        difficulty_weight = torch.exp(-snr / alpha_sangoi)     # (batch,)
 
-        # ------------------------------------------------------------------
-        # 4) Peso de dificuldade  →  Min-SNR-γ
-        # ------------------------------------------------------------------
-        scenario_snr_weight = torch.minimum(snr, snr.new_full((), gamma_curr)) / snr
+        # 4) Reward bruto = qualidade × dificuldade
+        raw_reward = torch.exp(-perceptual) * difficulty_weight
 
-        # ------------------------------------------------------------------
-        # 5) Reward bruto = qualidade × dificuldade
-        # ------------------------------------------------------------------
-        raw_reward = torch.exp(-perceptual) * scenario_snr_weight
+        # 5) Clamp simples (0,1] — sem normalização por γ
+        reward = raw_reward.clamp_(0.0, 1.0)
 
-        # ------------------------------------------------------------------
-        # 6) Normalização final
-        # ------------------------------------------------------------------
-        reward_floor = gamma
-        reward = reward_floor + (1.0 - reward_floor) * raw_reward.clamp_(0.0, 1.0)
+        # 6) TensorBoard
+        step = self.progress.global_step
+        self.tensorboard.add_scalar("sangoi/alpha_sangoi",        float(alpha_sangoi),            step)
+        self.tensorboard.add_scalar("sangoi/ssim_mean",           float(ssim_val.mean()),         step)
+        self.tensorboard.add_scalar("sangoi/difficulty_weight",   float(difficulty_weight.mean()),step)
+        self.tensorboard.add_scalar("sangoi/reward_mean",         float(reward.mean()),           step)
 
-        # ------------------------------------------------------------------
-        # 7) TensorBoard (opcional)
-        # ------------------------------------------------------------------
-        step = progress.global_step
-        self.tensorboard.add_scalar("sangoi/alpha",                float(alpha), step)
-        self.tensorboard.add_scalar("sangoi/reward_mean",          float(reward.mean()), step)
-        self.tensorboard.add_scalar("sangoi/scenario_snr_weight",  float(scenario_snr_weight.mean()), step)
-        
-        # multiplicador aplicado à loss (shape = batch)
         return reward
 
     def _diffusion_losses(

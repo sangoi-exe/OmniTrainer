@@ -66,6 +66,10 @@ class SangoiTab:
         components.label(self.main_frame, row_index, 0, "Full VAE",
                          tooltip="Use full vae on sangoi loss fun, WILL FALLBACK TO SYSTEM RAM (6gb for VAE)")
         components.switch(self.main_frame, row_index, 1, self.ui_state, "full_vae_mf")
+        
+        components.label(self.main_frame, row_index, 2, "Alpha Sangoi",
+                         tooltip="Scale for sangoi loss function. Values 2~8, suggest 4 (from o3).")
+        components.entry(self.main_frame, row_index, 3, self.ui_state, "alpha_sangoi")
         row_index += 1
         
         # --- Row 2: Use Delta Pattern & Save Delta Pattern ---

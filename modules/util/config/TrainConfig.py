@@ -278,6 +278,7 @@ class TrainConfig(BaseConfig):
     bucket_ratio: int
     debugoi: bool
     full_vae_mf: bool
+    alpha_sangoi: float
     
     # text encoder long prompts
     enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
@@ -801,6 +802,7 @@ class TrainConfig(BaseConfig):
         data.append(("full_vae_mf", False, bool, False))
         data.append(("save_predictions", False, bool, False))
         data.append(("bucket_ratio", 64, int, False))
+        data.append(("alpha_sangoi", 4.0, float, False))
         data.append(("train_gps_save_it", False, bool, False))
         data.append(("train_gps_use_it", False, bool, False))
         data.append(("train_gps_weight", 0.0, float, False))
