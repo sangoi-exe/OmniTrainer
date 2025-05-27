@@ -11,7 +11,7 @@ class LossTracker:
     It can use mean/std or median/MAD for statistics.
     """
 
-    def __init__(self, window_size: int = 100, use_mad: bool = True) -> None:
+    def __init__(self, window_size: int = 1000, use_mad: bool = True) -> None:
         """
         Initializes the LossTracker.
 
@@ -120,7 +120,7 @@ class DynamicLossControl:
     def __init__(
         self,
         use_ema: bool = True,
-        ema_decay: float = 0.7,
+        ema_decay: float = 0.9,
         outlier_threshold: float = 3.0,
         schedule_params: Dict[str, Dict[str, float]] = None,
     ) -> None:
@@ -154,9 +154,9 @@ class DynamicLossControl:
         self, schedule_params: Dict[str, Dict[str, float]] = None
     ) -> Dict[str, Dict[str, float]]:
         default_params = {
-            "mae": {"start": 0.6, "end": 0.0},
-            "mse": {"start": 0.2, "end": 0.6},
-            "log_cosh": {"start": 0.2, "end": 0.4},
+            "mae": {"start": 0.6, "end": 0.3},
+            "mse": {"start": 0.2, "end": 0.5},
+            "log_cosh": {"start": 0.2, "end": 0.3},
         }
         if schedule_params is not None:
             for loss_type, params in default_params.items():

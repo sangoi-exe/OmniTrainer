@@ -237,8 +237,8 @@ class GenericTrainer(BaseTrainer):
                               (global_step_str, "dim cyan"))
 
         # Linha 2: Losses
-        loss_str = f"Loss: {current_loss:.4f}" if current_loss is not None else "Loss: N/A"
-        ema_loss_str = f"Smooth: {current_ema_loss:.4f}" if current_ema_loss is not None else "Smooth: N/A"
+        loss_str = f"Loss: {current_loss:.8f}" if current_loss is not None else "Loss: N/A"
+        ema_loss_str = f"Smooth: {current_ema_loss:.8f}" if current_ema_loss is not None else "Smooth: N/A"
         line2 = Text.assemble((loss_str, "yellow"), " | ", (ema_loss_str, "bright_yellow"))
 
         # Linha 3: Temporização

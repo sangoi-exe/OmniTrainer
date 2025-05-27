@@ -43,7 +43,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.progress = None
         self.config = None
         self.loaded_pattern_deltas = None
-        self.loss_tracker = LossTracker(window_size=100, use_mad=True)
+        self.loss_tracker = LossTracker(window_size=1000, use_mad=True)
         self.dynamic_loss_strengthing = DynamicLossControl()
 
     def __log_cosh_loss(
@@ -315,6 +315,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     ) -> Tensor:
         return self.__sigmas[timesteps].to(device=device)
 
+    # START v2025-05-27c – __sangoi_loss_weighting refeito
     def __sangoi_loss_weighting(
         self,
         timesteps: Tensor,
@@ -323,43 +324,107 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         device: torch.device,
     ):
         """
-        Função Sangoi Loss Weighting (versão 2025-05-27b).
-        • Bonifica qualidade × dificuldade.
-        • Dificuldade = exp(-SNR / α), onde α = config.alpha_sangoi.
-        • Remove currículo ao longo das épocas.
+        Função Sangoi Loss Weighting (2025-05-27c)
+        • Calcula bônus percentual (0 → alpha_sangoi) que REDUZ a loss.
+        • alpha_sangoi agora é só teto máximo; não entra mais no expoente.
         """
         config = self.config
-        eps    = 1e-8
+        eps = 1e-8
 
-        # 1) SNR por timestep (fora do grafo)
+        # 1) SNR fora do grafo
         with torch.no_grad():
-            snr = self.__snr(timesteps, device) + eps          # (batch,)
+            snr = self.__snr(timesteps, device) + eps # SNR nunca será zero aqui
 
-        # 2) Métrica de qualidade → SSIM ou Latent-SSIM
+        # 2) Qualidade perceptual via SSIM
         if config.full_vae_mf:
-            ssim_val   = self._safe_ssim(predicted, target)
+            ssim_val = self._safe_ssim(predicted, target)
         else:
-            ssim_val   = self.latent_ssim(predicted, target)
-        perceptual = 1.0 - ssim_val                            # 0 = perfeito
+            # ATENÇÃO AQUI NA ORDEM!
+            # Se latent_ssim(PRED, TARGET), a chamada em _diffusion_losses deve ser (..., data["predicted_image_latent"], data["target_image_latent"], ...)
+            # Sua chamada em _diffusion_losses é:
+            # data["target_image_latent"], data["predicted_image_latent"]
+            # Isso significa que ssim_val está calculando SSIM(TARGET, PREDICTED)
+            ssim_val = self.latent_ssim(predicted, target) # 'predicted' aqui é data["target_image_latent"]
 
-        # 3) Dificuldade → exp(-SNR / α)  (mais ruído → peso ↑)
-        alpha_sangoi = torch.as_tensor(config.alpha_sangoi, device=snr.device, dtype=snr.dtype)
-        difficulty_weight = torch.exp(-snr / alpha_sangoi)     # (batch,)
+        perceptual = (1.0 - ssim_val).clamp_(1e-3, 1.0) # perceptual alto = ruim, perceptual baixo = bom
 
-        # 4) Reward bruto = qualidade × dificuldade
+        # 3) Dificuldade: exp(-snr)
+        # SNR é sempre > 0 (devido ao +eps).
+        # exp(-snr) será sempre (0, 1]. Próximo de 0 para SNR alto, próximo de 1 para SNR baixo.
+        difficulty_weight = torch.exp(-snr)
+
+        # 4) Reward bruto ∈ (0,1]
+        # torch.exp(-perceptual): perceptual está em [1e-3, 1.0]
+        #   Se perceptual = 1.0 (SSIM baixo), exp(-1) = ~0.36
+        #   Se perceptual = 1e-3 (SSIM alto), exp(-1e-3) = ~0.999
+        # raw_reward = [~0.36 a ~0.999] * (0 a 1] = (0, ~0.999]
         raw_reward = torch.exp(-perceptual) * difficulty_weight
 
-        # 5) Clamp simples (0,1] — sem normalização por γ
-        reward = raw_reward.clamp_(0.0, 1.0)
+        # 5) Escala até o teto alpha_sangoi (bônus máximo)
+        # config.alpha_sangoi é o seu teto de REDUÇÃO PERCENTUAL.
+        # Se config.alpha_sangoi = 0.7 (para 70% de redução máxima),
+        # então o FATOR MULTIPLICATIVO da loss deveria ser no mínimo (1.0 - 0.7) = 0.3.
+        #
+        # A sua linha: reward = raw_reward.clamp_(0.0, 1.0) * alpha_sangoi
+        # Se raw_reward.clamp_(0.0, 1.0) é, por exemplo, 0.5
+        # E alpha_sangoi = 0.7 (interpretado como 0.7)
+        # reward = 0.5 * 0.7 = 0.35.
+        #
+        # Este 'reward' é então usado como: losses *= reward
+        # Então, losses *= 0.35. Isso está correto para REDUZIR a loss.
+        #
+        # ONDE PODE ZERAR?
+        # - Se raw_reward for efetivamente 0 (o que é improvável devido aos clamps e exponenciais).
+        # - Se alpha_sangoi for 0.
+        # - Se o `losses` original (antes de `losses *= reward`) for 0.
 
-        # 6) TensorBoard
+        alpha_sangoi_val = torch.as_tensor( # teto de REDUÇÃO (ex.: 0.5 ⇒ perda mínima 50 %)
+            config.alpha_sangoi, device=snr.device, dtype=snr.dtype
+        ).clamp_(0.0, 1.0) # Garante que alpha_sangoi_val seja [0,1]
+        
+        # Mérito bruto ∈[0,1]
+        reward_pct = raw_reward.clamp_(0.0, 1.0) 
+        
+        # 'reward_reduction_percentage' é quanto da redução MÁXIMA (alpha_sangoi_val) será aplicada.
+        # Não, esta interpretação está errada.
+        # Se alpha_sangoi_val é o teto da REDUÇÃO, ex: 0.7 (70% de redução)
+        # E reward_factor_before_alpha é o "mérito" dessa redução, ex: 0.8 (merece 80% do teto)
+        # Redução a ser aplicada = 0.8 * 0.7 = 0.56 (56% de redução)
+        # Fator multiplicativo da loss = 1.0 - 0.56 = 0.44
+        # Esta é a lógica da v7 que discutimos.
+
+        # SUA LÓGICA ATUAL:
+        # final_reward_multiplier = reward_factor_before_alpha * alpha_sangoi_val
+        # Este `final_reward_multiplier` é o que você usa para `losses *= final_reward_multiplier`.
+        # Se `alpha_sangoi_val` for, por exemplo, 0.5 (significando que você quer que a loss seja NO MÁXIMO reduzida pela metade, ou seja, fator 0.5)
+        # E `reward_factor_before_alpha` (qualidade*dificuldade) for 0.1 (muito baixo mérito)
+        # `final_reward_multiplier` = 0.1 * 0.5 = 0.05.
+        # A loss é multiplicada por 0.05 (redução de 95%). Isso parece muito agressivo se alpha_sangoi_val não for interpretado como (1 - teto_redução).
+
+        # *** O PONTO CRÍTICO ***
+        # Se `config.alpha_sangoi` no seu arquivo de configuração é 0.0, então `alpha_sangoi_val` será 0.0.
+        # Então `final_reward_multiplier` será `reward_factor_before_alpha * 0.0 = 0.0`.
+        # E `losses *= 0.0` ZERA A LOSS.
+
+        # START Faixa correta: [alpha_sangoi_val, 1.0]
+        # mult = 1 − merito × (1 − alpha)  ⇒
+        # merito=0 → mult=1  (sem bônus)
+        # merito=1 → mult=alpha (máx. redução)
+        final_reward_multiplier = 1.0 - reward_pct * (1.0 - alpha_sangoi_val)
+        # final_reward_multiplier = final_reward_multiplier.clamp_(alpha_sangoi_val, 1.0) # aqui nesse caso o alpha é entre 0.5~1, faz carinho se acertar bem no difícil
+        final_reward_multiplier = final_reward_multiplier.clamp(1.0, 1.0 + alpha_sangoi_val) # aqui nesse caso o alpha é entre 0~0.5, espanca quando errar no difícil (aparentemente mais eficiente)
+        
+
+        # 6) Logs
         step = self.progress.global_step
-        self.tensorboard.add_scalar("sangoi/alpha_sangoi",        float(alpha_sangoi),            step)
-        self.tensorboard.add_scalar("sangoi/ssim_mean",           float(ssim_val.mean()),         step)
-        self.tensorboard.add_scalar("sangoi/difficulty_weight",   float(difficulty_weight.mean()),step)
-        self.tensorboard.add_scalar("sangoi/reward_mean",         float(reward.mean()),           step)
+        tb = self.tensorboard
+        tb.add_scalar("sangoi/alpha_sangoi_config_val", float(alpha_sangoi_val.mean() if isinstance(alpha_sangoi_val, Tensor) else alpha_sangoi_val),          step) # Logando o valor de alpha_sangoi usado
+        tb.add_scalar("sangoi/ssim_mean",      float(ssim_val.mean()),       step)
+        tb.add_scalar("sangoi/difficulty_mean",float(difficulty_weight.mean()), step)
+        tb.add_scalar("sangoi/reward_pct", float(reward_pct.mean()), step)
+        tb.add_scalar("sangoi/final_reward_multiplier", float(final_reward_multiplier.mean()), step) # Era reward_pct
 
-        return reward
+        return final_reward_multiplier # Este é o fator que multiplica a loss
 
     def _diffusion_losses(
         self,
@@ -445,10 +510,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                             losses.device,                            
                         )
                     else:
-                        losses *= self.__sangoi_loss_weighting(
+                        losses = losses / self.__sangoi_loss_weighting(
                             data["timestep"],                        
-                            data["target_image_latent"],
                             data["predicted_image_latent"],
+                            data["target_image_latent"],
                             losses.device,                            
                         )
                     self.tensorboard.add_scalar(
