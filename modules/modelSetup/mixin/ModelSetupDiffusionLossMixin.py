@@ -383,7 +383,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         ).clamp_(0.0, 1.0) # Garante que alpha_sangoi_val seja [0,1]
         
         # Mérito bruto ∈[0,1]
-        reward_pct = raw_reward.clamp_(0.0, 1.0) 
+        reward_pct = raw_reward.clamp_(0.0, 1.0)          # ∈[0,1]
         
         # 'reward_reduction_percentage' é quanto da redução MÁXIMA (alpha_sangoi_val) será aplicada.
         # Não, esta interpretação está errada.
@@ -410,9 +410,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # mult = 1 − merito × (1 − alpha)  ⇒
         # merito=0 → mult=1  (sem bônus)
         # merito=1 → mult=alpha (máx. redução)
-        final_reward_multiplier = 1.0 - reward_pct * (1.0 - alpha_sangoi_val)
         # final_reward_multiplier = final_reward_multiplier.clamp_(alpha_sangoi_val, 1.0) # aqui nesse caso o alpha é entre 0.5~1, faz carinho se acertar bem no difícil
-        final_reward_multiplier = final_reward_multiplier.clamp(1.0, 1.0 + alpha_sangoi_val) # aqui nesse caso o alpha é entre 0~0.5, espanca quando errar no difícil (aparentemente mais eficiente)
+        final_reward_multiplier = 1.0 + alpha_sangoi_val * (1.0 - reward_pct) 
+        final_reward_multiplier = final_reward_multiplier.clamp_(max=1.0 + float(alpha_sangoi_val)) # aqui nesse caso o alpha é entre 0~0.5, espanca quando errar no difícil (aparentemente mais eficiente)
         
 
         # 6) Logs
