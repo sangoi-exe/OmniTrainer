@@ -298,8 +298,8 @@ class TrainUI(ctk.CTk):
         components.entry(frame, 1, 1, self.ui_state, "bucket_ratio")
         components.label(frame, 2, 0, "Latent Caching", tooltip="...")
         components.switch(frame, 2, 1, self.ui_state, "latent_caching")
-        components.label(frame, 3, 0, "Cache Raw Images", tooltip="Saves a copy of the post-processed images for debugging purposes.")
-        components.switch(frame, 3, 1, self.ui_state, "cache_raw_images")
+        components.label(frame, 3, 0, "Save Predictions", tooltip="Saves a copy of predictions (predict, noise and noisy img) for debugging purposes.")
+        components.switch(frame, 3, 1, self.ui_state, "save_predictions")
         components.label(frame, 4, 0, "Clear cache before training", tooltip="...")
         components.switch(frame, 4, 1, self.ui_state, "clear_cache_before_training")
 

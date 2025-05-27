@@ -25,6 +25,22 @@ from mgds.pipelineModules.VariationSorting import VariationSorting
 
 import torch
 
+class _BucketPathModule:
+    """Adiciona sample['bucketed_path'] = '<HxW>_<basename>' como prefixo."""
+    
+    def init(self, pipeline, seed, index, state):
+        return self
+    
+    def __call__(self, sample):
+        try:
+            h, w = sample['crop_resolution']
+            basename = os.path.basename(sample['image_path'])
+            # Usar prefixo em vez de pasta
+            sample['bucketed_path'] = f"{h}x{w}_{basename}"
+        except KeyError:
+            # Fallback caso crop_resolution não exista
+            sample['bucketed_path'] = os.path.basename(sample['image_path'])
+        return sample
 
 class StableDiffusionXLBaseDataLoader(
     BaseDataLoader,
@@ -68,27 +84,6 @@ class StableDiffusionXLBaseDataLoader(
         
         rescale_image = RescaleImageChannels(image_in_name='image', image_out_name='image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
         rescale_conditioning_image = RescaleImageChannels(image_in_name='conditioning_image', image_out_name='conditioning_image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
-
-				# salvar uma cópia das imagens imediatamente antes de converter em latents
-        # as imagens serão salvas por pastas conforme os buckets
-        if config.cache_raw_images:
-            # 1) converte o crop_resolution em string “{h}x{w}”
-            map_raw_dir = MapData(
-                in_name='crop_resolution',
-                out_name='raw_image_dir',
-                map_fn=lambda res: os.path.join(config.cache_dir, 'image_raw', f"{res[0]}x{res[1]}")
-            )
-
-            # 2) salva a imagem usando o diretório dinâmico
-            save_raw_image = SaveImage(
-                image_in_name='image',
-                original_path_in_name='image_path',
-                path_in_name='raw_image_dir',
-                in_range_min=-1, in_range_max=1
-            )
-
-            modules.extend([map_raw_dir, save_raw_image])
-
         encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
         image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
         downscale_mask = ScaleImage(in_name='mask', out_name='latent_mask', factor=0.125)
@@ -338,6 +333,36 @@ class StableDiffusionXLBaseDataLoader(
         modules.append(decode_prompt)
         modules.append(save_prompt)
 
+        convert_original_res = MapData(
+            in_name='original_resolution',
+            out_name='original_resolution_str',
+            map_fn=lambda res: f"{res[0]}x{res[1]}"
+        )
+        convert_crop_res = MapData(
+            in_name='crop_resolution',
+            out_name='crop_resolution_str',
+            map_fn=lambda res: f"{res[0]}x{res[1]}"
+        )
+        save_original_res = SaveText(
+            text_in_name='original_resolution_str',
+            original_path_in_name='image_path',
+            path=debug_dir,
+            before_save_fun=before_save_fun
+        )
+        save_crop_res = SaveText(
+            text_in_name='crop_resolution_str',
+            original_path_in_name='image_path',
+            path=debug_dir,
+            before_save_fun=before_save_fun
+        )
+
+        modules.extend([
+            convert_original_res,
+            convert_crop_res,
+            save_original_res,
+            save_crop_res,
+        ])        
+
         return modules
 
     def create_dataset(
@@ -381,7 +406,7 @@ class StableDiffusionXLBaseDataLoader(
             is_validation,
         )
 
-		# POR ENQUANTO FICA ASSIM, PRA USAR A LÓGICA ORIGINAL CASO LONG PROMPTS ESTEJA DESATIVADO
+    # POR ENQUANTO FICA ASSIM, PRA USAR A LÓGICA ORIGINAL CASO LONG PROMPTS ESTEJA DESATIVADO
     # depois vou inverter, e as funções originais vão ficar com os nomes originais e vice-versa    
 
     def _preparation_modules_original(self, config: TrainConfig, model: StableDiffusionXLModel):
@@ -404,6 +429,8 @@ class StableDiffusionXLBaseDataLoader(
             add_embeddings_to_prompt_1, tokenize_prompt_1,
             add_embeddings_to_prompt_2, tokenize_prompt_2,
         ]
+
+        modules.extend([encode_image, image_sample])
 
         if config.masked_training or config.model_type.has_mask_input():
             modules.append(downscale_mask)
@@ -466,22 +493,40 @@ class StableDiffusionXLBaseDataLoader(
             'image_path', 'latent_image',
             'prompt_1', 'prompt_2',
             'tokens_1', 'tokens_2',
-            'original_resolution', 'crop_resolution', 'crop_offset',
+            'original_resolution', 'crop_resolution', 'crop_offset', 'prompt',
         ]
+
         if config.masked_training or config.model_type.has_mask_input():
             output_names.append('latent_mask')
+
         if config.model_type.has_conditioning_image_input():
             output_names.append('latent_conditioning_image')
+
         if not config.train_text_encoder_or_embedding():
             output_names.append('text_encoder_1_hidden_state')
+
         if not config.train_text_encoder_2_or_embedding():
-            output_names.append('text_encoder_2_hidden_state'); output_names.append('text_encoder_2_pooled_state')
+            output_names.append('text_encoder_2_hidden_state')
+            output_names.append('text_encoder_2_pooled_state')
+
+        sort_names = output_names + ['concept']
+        output_names = output_names + [('concept.loss_weight', 'loss_weight')]
+
+        # add for calculating loss per concept
+        if config.validation:
+            output_names.append(('concept.name', 'concept_name'))
+            output_names.append(('concept.path', 'concept_path'))
+            output_names.append(('concept.seed', 'concept_seed'))
 
         def before_cache_image_fun():
-            model.to(self.temp_device); model.vae_to(self.train_device); model.eval(); torch_gc()
+            model.to(self.temp_device)
+            model.vae_to(self.train_device)
+            model.eval()
+            torch_gc()
 
         return self._output_modules_from_out_names(
             output_names=output_names,
+            sort_names=sort_names,
             config=config,
             before_cache_image_fun=before_cache_image_fun,
             use_conditioning_image=True,

@@ -207,7 +207,7 @@ def enable_checkpointing_for_basic_transformer_blocks(
 
 		for name, child_module in orig_module.named_modules(): # Iterar com nomes
 			if isinstance(child_module, BasicTransformerBlock):
-				print(f"DEBUG: Encontrado BasicTransformerBlock: {name}") # Print para cada bloco encontrado
+				if config.debugoi: print(f"DEBUG: Encontrado BasicTransformerBlock: {name}") # Print para cada bloco encontrado
 				# Verifica se o nome desta camada corresponde aos padrões
 				if should_checkpoint_layer(name, layers_to_checkpoint_selectively):
 					#print(f"DEBUG: *** CHECKPOINTING CAMADA: {name} ***") # Destaca a camada checkpointada

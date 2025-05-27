@@ -273,10 +273,11 @@ class TrainConfig(BaseConfig):
     lora_layers_blacklist: list[str]
     lora_modules_rank_rules: list[dict[str, int]] = []
     lora_modules_alpha_rules: list[dict[str, int]] = []
-    cache_raw_images: bool
+    save_predictions: bool
     gen_lora_keys: bool
     bucket_ratio: int
     debugoi: bool
+    full_vae_mf: bool
     
     # text encoder long prompts
     enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
@@ -797,7 +798,8 @@ class TrainConfig(BaseConfig):
         data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("gen_lora_keys", False, bool, False))
         data.append(("debugoi", False, bool, False))
-        data.append(("cache_raw_images", False, bool, False))
+        data.append(("full_vae_mf", False, bool, False))
+        data.append(("save_predictions", False, bool, False))
         data.append(("bucket_ratio", 64, int, False))
         data.append(("train_gps_save_it", False, bool, False))
         data.append(("train_gps_use_it", False, bool, False))

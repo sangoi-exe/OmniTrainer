@@ -61,6 +61,12 @@ class SangoiTab:
                          tooltip="Debug pros meus badalhos")
         components.switch(self.main_frame, row_index, 5, self.ui_state, "debugoi")
         row_index += 1
+
+        # Slot 3 (cols 4, 5) fica em branco
+        components.label(self.main_frame, row_index, 0, "Full VAE",
+                         tooltip="Use full vae on sangoi loss fun, WILL FALLBACK TO SYSTEM RAM (6gb for VAE)")
+        components.switch(self.main_frame, row_index, 1, self.ui_state, "full_vae_mf")
+        row_index += 1
         
         # --- Row 2: Use Delta Pattern & Save Delta Pattern ---
         # Slot 1

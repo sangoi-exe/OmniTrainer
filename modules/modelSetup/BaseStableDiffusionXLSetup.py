@@ -22,6 +22,7 @@ from modules.util.TrainProgress import TrainProgress
 from modules.util.TensorBoardManager import TensorBoardManager
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
@@ -386,73 +387,7 @@ class BaseStableDiffusionXLSetup(
           'predicted': predicted_latent_noise,
           'target': target_velocity,
         }
-
-        if config.debugoi:
-            with torch.no_grad():
-                # // Sessão DBG - Se text for List[str], essa linha pode precisar de ajuste
-                # self._save_text(
-                #     self._decode_tokens(batch['tokens_1'], model.tokenizer_1),
-                #     config.debug_dir + "/training_batches",
-                #     "7-prompt",
-                #     train_progress.global_step,
-                # )
-
-                # noise
-                self._save_image(
-                    self._project_latent_to_image_sdxl(latent_noise),
-                    config.debug_dir + "/training_batches",
-                    "1-noise",
-                    train_progress.global_step,
-                    True
-                )
-
-                # predicted noise
-                self._save_image(
-                    self._project_latent_to_image_sdxl(predicted_latent_noise),
-                    config.debug_dir + "/training_batches",
-                    "2-predicted_noise",
-                    train_progress.global_step,
-                    True
-                )
-
-                # noisy image
-                self._save_image(
-                    self._project_latent_to_image_sdxl(scaled_noisy_latent_image),
-                    config.debug_dir + "/training_batches",
-                    "3-noisy_image",
-                    train_progress.global_step,
-                    True
-                )
-
-                # predicted image
-                alphas_cumprod = model.noise_scheduler.alphas_cumprod.to(config.train_device)
-                sqrt_alpha_prod = alphas_cumprod[timestep] ** 0.5
-                sqrt_alpha_prod = sqrt_alpha_prod.flatten().reshape(-1, 1, 1, 1)
-
-                sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timestep]) ** 0.5
-                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten().reshape(-1, 1, 1, 1)
-
-                scaled_predicted_latent_image = \
-                    (scaled_noisy_latent_image - predicted_latent_noise * sqrt_one_minus_alpha_prod) \
-                    / sqrt_alpha_prod
-                self._save_image(
-                    self._project_latent_to_image_sdxl(scaled_predicted_latent_image),
-                    config.debug_dir + "/training_batches",
-                    "4-predicted_image",
-                    model.train_progress.global_step,
-                    True
-                )
-
-                # image
-                self._save_image(
-                    self._project_latent_to_image_sdxl(scaled_latent_image),
-                    config.debug_dir + "/training_batches",
-                    "5-image",
-                    model.train_progress.global_step,
-                    True
-                )
-
-      if config.debug_mode:
+      if config.debug_mode or config.save_predictions:
         with torch.no_grad():
           self._save_text(
             self._decode_tokens(batch['tokens_1'], model.tokenizer_1),
@@ -495,10 +430,11 @@ class BaseStableDiffusionXLSetup(
 
           sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timestep]) ** 0.5
           sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten().reshape(-1, 1, 1, 1)
-
+          
           scaled_predicted_latent_image = \
             (scaled_noisy_latent_image - predicted_latent_noise * sqrt_one_minus_alpha_prod) \
             / sqrt_alpha_prod
+
           self._save_image(
             self._project_latent_to_image_sdxl(scaled_predicted_latent_image),
             config.debug_dir + "/training_batches",
@@ -515,9 +451,40 @@ class BaseStableDiffusionXLSetup(
             model.train_progress.global_step,
             True
           )
+      else:
+          # predicted image
+          alphas_cumprod = model.noise_scheduler.alphas_cumprod.to(config.train_device)
+          sqrt_alpha_prod = alphas_cumprod[timestep] ** 0.5
+          sqrt_alpha_prod = sqrt_alpha_prod.flatten().reshape(-1, 1, 1, 1)
 
-    model_output_data['prediction_type'] = model.noise_scheduler.config.prediction_type
+          sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timestep]) ** 0.5
+          sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten().reshape(-1, 1, 1, 1)
+          
+          scaled_predicted_latent_image = \
+            (scaled_noisy_latent_image - predicted_latent_noise * sqrt_one_minus_alpha_prod) \
+            / sqrt_alpha_prod
+
+      if config.full_vae_mf:
+          model_output_data["target_image_rgb"]    = self._decode_latent_sdxl(model, scaled_latent_image.detach())
+          model_output_data["predicted_image_rgb"] = self._decode_latent_sdxl(model, scaled_predicted_latent_image.detach())
+      else:
+          model_output_data["target_image_latent"] = scaled_latent_image.detach()
+          model_output_data["predicted_image_latent"] = scaled_predicted_latent_image.detach()              
+
+      model_output_data['prediction_type'] = model.noise_scheduler.config.prediction_type
+
     return model_output_data
+
+  def _decode_latent_sdxl(self, model, latents: torch.Tensor):
+      model.vae_to(self.train_device)
+      scaling = getattr(model.vae.config, "scaling_factor", 0.18215)
+      latents = latents / scaling
+      # mantemos o mesmo dtype do treino (bf16)
+      target_dtype = latents.dtype
+      latents = latents.to(device=model.vae.device, dtype=target_dtype)
+      with torch.autocast("cuda", dtype=target_dtype):   # API nova          
+          decoded = model.vae.decode(latents, return_dict=False)[0]
+      return decoded
 
   def calculate_loss(
       self,

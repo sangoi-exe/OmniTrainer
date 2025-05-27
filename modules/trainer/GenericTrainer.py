@@ -258,14 +258,28 @@ class GenericTrainer(BaseTrainer):
                 eta_s = remaining_steps * effective_avg_step_time
                 eta_epoch_disp = f"ETAEpoch: {format_time_delta(eta_s)}"
 
+        eta_total_disp = "ETATotal: Calc..."
+        if tp and self._steps_per_epoch > 0 and effective_avg_step_time > 0:
+            total_steps = self._num_total_epochs * self._steps_per_epoch
+            completed_steps = tp.global_step + 1
+            remaining_steps_total = total_steps - completed_steps
+            if remaining_steps_total >= 0:
+                eta_s_total = remaining_steps_total * effective_avg_step_time
+                eta_total_disp = f"ETATotal: {format_time_delta(eta_s_total)}"
+
         total_time_str = ""
         if self._total_training_time_start_s is not None:
             total_elapsed = time.monotonic() - self._total_training_time_start_s
             total_time_str = f"TotalRun: {format_time_delta(total_elapsed)}"
 
-        line3 = Text.assemble((step_time_disp, "green"), " | ", (avg_step_disp, "blue"), " | ",
-                              (epoch_elapsed_disp, "magenta"), " | ", (eta_epoch_disp, "magenta"),
-                              (" | " + total_time_str if total_time_str else "", "dim white"))
+        line3 = Text.assemble(
+            (step_time_disp,      "green"), " | ",
+            (avg_step_disp,       "blue"),  " | ",
+            (epoch_elapsed_disp,  "magenta"), " | ",
+            (eta_epoch_disp,      "magenta"), " | ",
+            (eta_total_disp,      "magenta"),
+            (" | " + total_time_str if total_time_str else "", "dim white")
+        )
 
         # Linha 4: Status de Componentes (Opcional, se houver espaço e quiser exibir)
         components_status = []

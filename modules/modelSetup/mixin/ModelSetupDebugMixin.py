@@ -59,8 +59,7 @@ class ModelSetupDebugMixin(metaclass=ABCMeta):
 
         weights_tensor = torch.t(torch.tensor(weights, dtype=latent_tensor.dtype).to(latent_tensor.device))
         biases_tensor = torch.tensor((150, 140, 130), dtype=latent_tensor.dtype).to(latent_tensor.device)
-        rgb_tensor = torch.einsum("...lxy,lr -> ...rxy", latent_tensor, weights_tensor) \
-                     + biases_tensor.unsqueeze(-1).unsqueeze(-1)
+        rgb_tensor = torch.einsum("...lxy,lr -> ...rxy", latent_tensor, weights_tensor) + biases_tensor.unsqueeze(-1).unsqueeze(-1)
         image_array = rgb_tensor.clamp(0, 255)[0].byte().cpu().numpy()
         image_array = image_array.transpose(1, 2, 0)
 
