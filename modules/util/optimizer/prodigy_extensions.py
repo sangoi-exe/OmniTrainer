@@ -3,6 +3,16 @@ import traceback
 import torch
 import torch.distributed as dist
 
+try:
+    # A importação correta é diretamente pelo nome do módulo
+    import bf16_stochastic_cuda_custom
+    _bf16_cuda_ext_available = True
+    print("Successfully loaded 'bf16_stochastic_cuda_custom' extension.")
+except ImportError as e:
+    _bf16_cuda_ext_available = False
+    print(f"Warning: Could not load 'bf16_stochastic_cuda_custom' extension: {e}")
+    print("Falling back to Python loop for BF16 stochastic rounding copy.")
+
 from modules.util.bf16_stochastic_rounding import (
     add_stochastic_,
     addcdiv_stochastic_,

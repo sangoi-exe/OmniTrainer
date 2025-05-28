@@ -66,6 +66,8 @@ class BaseStableDiffusionSetup(
         quantize_layers(model.text_encoder, self.train_device, model.train_dtype)
         quantize_layers(model.vae, self.train_device, model.train_dtype)
         quantize_layers(model.unet, self.train_device, model.train_dtype)
+        
+        model.unet = torch.compile(model.unet, mode="max-autotune") # testando pra ver se funciona e se rende
 
     def _setup_embeddings(
             self,

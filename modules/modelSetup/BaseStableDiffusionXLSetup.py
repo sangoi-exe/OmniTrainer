@@ -285,11 +285,12 @@ class BaseStableDiffusionXLSetup(
 
       # // Sessão DBG - Fim da depuração
 
-      latent_image = batch['latent_image']
+      latent_image = batch['latent_image'].to(device=self.train_device, memory_format=torch.channels_last)
       scaled_latent_image = latent_image * vae_scaling_factor
 
       scaled_latent_conditioning_image = None
       if config.model_type.has_conditioning_image_input():
+        batch['latent_conditioning_image'] = batch['latent_conditioning_image'].to(device=self.train_device, memory_format=torch.channels_last)
         scaled_latent_conditioning_image = batch['latent_conditioning_image'] * vae_scaling_factor
 
       latent_noise = self._create_noise(scaled_latent_image, config, generator)

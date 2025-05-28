@@ -271,6 +271,3 @@ class TensorBoardManager:
     @property
     def writer(self):
         return self._writer
-
-
-# END: Adição Módulo TensorBoardManager

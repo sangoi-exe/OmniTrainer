@@ -56,8 +56,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # 1) Diferença e máscara
         diff = data["predicted"] - data["target"]  
         mask = batch.get("latent_mask", None)
-
-        if getattr(config, "sangoi_use_huber", False):
+        # 5) Schedule por fase de treinamento
+        epoch = getattr(self.progress, "current_epoch", 0)
+        total = getattr(config, "num_epochs", 100)
+        frac  = epoch / total
+        
+        if frac < 1/2:      # fase 0-50%           
+        # if getattr(config, "sangoi_use_huber", False):
             diff   = data["predicted"] - data["target"]
             mask   = batch.get("latent_mask", None)
             device = diff.device
@@ -98,8 +103,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 progress.global_step,
             )                
             return huber_raw.mean([1, 2, 3])
-
+        else:
         # 3) Cálculo das perdas básicas
+            mse_loss = masked_losses(
+                losses=diff.pow(2), mask=mask,
+                unmasked_weight=config.unmasked_weight,
+                normalize_masked_area_loss=config.normalize_masked_area_loss
+            ).mean([1, 2, 3])
+            self.tensorboard.add_scalar(
+                "sangoi/mse",
+                mse_loss.mean([1, 2, 3]),
+                progress.global_step,
+            )                
+            return mse_loss
+    
         mae_loss = masked_losses(
             losses=diff.abs(), mask=mask,
             unmasked_weight=config.unmasked_weight,
@@ -113,12 +130,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             normalize_masked_area_loss=config.normalize_masked_area_loss
         ).mean([1, 2, 3])
 
-        mse_loss = masked_losses(
-            losses=diff.pow(2), mask=mask,
-            unmasked_weight=config.unmasked_weight,
-            normalize_masked_area_loss=config.normalize_masked_area_loss
-        ).mean([1, 2, 3])
-
+    
         # 4) DynamicLossControl (agora só equaliza via z-score / EMA)
         self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
         mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
@@ -131,31 +143,27 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         log_cosh_w_loss = log_cosh_loss * log_cosh_w
         mse_w_loss      = mse_loss      * mse_w
 
-        # 5) Schedule por fase de treinamento
-        epoch = getattr(self.progress, "current_epoch", 0)
-        total = getattr(config, "num_epochs", 100)
-        frac  = epoch / total
-        if frac < 1/3:      # fase 0-33 %
-            self.tensorboard.add_scalar(
-                "sangoi/mae_w_loss",
-                mae_w_loss,
-                progress.global_step,
-            )                
-            return mae_w_loss
-        elif frac < 2/3:    # fase 33-66 %
-            self.tensorboard.add_scalar(
-                "sangoi/log_cosh_w_loss",
-                log_cosh_w_loss,
-                progress.global_step,
-            )                
-            return log_cosh_w_loss
-        else:               # fase final
-            self.tensorboard.add_scalar(
-                "sangoi/mse_w_loss",
-                mse_w_loss,
-                progress.global_step,
-            )                
-            return mse_w_loss
+
+        #     self.tensorboard.add_scalar(
+        #         "sangoi/mae_w_loss",
+        #         mae_w_loss,
+        #         progress.global_step,
+        #     )                
+        #     return mae_w_loss
+        # elif frac < 2/3:    # fase 33-66 %
+        #     self.tensorboard.add_scalar(
+        #         "sangoi/log_cosh_w_loss",
+        #         log_cosh_w_loss,
+        #         progress.global_step,
+        #     )                
+        #     return log_cosh_w_loss
+        # else:               # fase final
+        #     self.tensorboard.add_scalar(
+        #         "sangoi/mse_w_loss",
+        #         mse_w_loss,
+        #         progress.global_step,
+        #     )                
+        #     return mse_w_loss
 
     def __log_cosh_loss(
         self,

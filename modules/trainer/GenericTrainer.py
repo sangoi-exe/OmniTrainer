@@ -415,7 +415,7 @@ class GenericTrainer(BaseTrainer):
         self.model_setup.setup_optimizations(self.model, self.config)
         self.model_setup.setup_train_device(self.model, self.config)
         self.model_setup.setup_model(self.model, self.config, self.tensorboard)
-        self.model.to(self.temp_device)
+        # self.model.to(self.temp_device) será que dá pra desativar essa bosta?
         self.model.eval()
         torch_gc()
 
