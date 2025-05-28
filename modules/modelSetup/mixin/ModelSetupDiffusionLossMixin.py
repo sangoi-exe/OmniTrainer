@@ -5,6 +5,7 @@ import traceback
 
 from modules.module.AestheticScoreModel import AestheticScoreModel
 from modules.module.HPSv2ScoreModel import HPSv2ScoreModel
+from modules.sangoi.logFun import logFun
 from modules.util.TrainProgress import TrainProgress
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
@@ -57,15 +58,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         diff = data["predicted"] - data["target"]  
         mask = batch.get("latent_mask", None)
         # 5) Schedule por fase de treinamento
-        epoch = getattr(self.progress, "current_epoch", 0)
-        total = getattr(config, "num_epochs", 100)
+        epoch = progress.epoch + 1
+        total = getattr(config, "epochs", 100)
         frac  = epoch / total
+        if progress.global_step == 1 or progress.global_step % 250 == 0:
+            logFun(f"Actual epoch: {epoch}.", lvl="warning")   
+            logFun(f"Actual frac: {frac}.", lvl="warning")   
+            logFun(f"Total epoches: {total}.", lvl="warning")        
         
-        if frac < 1/2:      # fase 0-50%           
+        if frac <= 0.5:      # fase 0-50%           
         # if getattr(config, "sangoi_use_huber", False):
-            diff   = data["predicted"] - data["target"]
-            mask   = batch.get("latent_mask", None)
+            if progress.global_step % 100 == 0:
+                logFun("Using Huber loss.", lvl="warning")
             device = diff.device
+            huber_raw = 0
 
             # 1) β dinâmico de acordo com schedule
             timesteps      = data.get("timestep")
@@ -76,8 +82,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             if huber_schedule == "snr":
                 beta_t = huber_c * snr
             elif huber_schedule == "exponential":
-                epoch = getattr(self.progress, "current_epoch", 0)
-                total = getattr(config, "num_epochs", 100)
+                epoch = getattr(self.progress, "epoch", 0)
+                total = getattr(config, "epochs", 100)
                 val   = huber_c * math.exp(- epoch / total)
                 beta_t = torch.full_like(snr, val)
             else:  # constant
@@ -105,6 +111,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             return huber_raw.mean([1, 2, 3])
         else:
         # 3) Cálculo das perdas básicas
+            if progress.global_step % 100 == 0:
+                logFun("Using MSE loss.", lvl="warning")
+            mse_loss = 0
             mse_loss = masked_losses(
                 losses=diff.pow(2), mask=mask,
                 unmasked_weight=config.unmasked_weight,
