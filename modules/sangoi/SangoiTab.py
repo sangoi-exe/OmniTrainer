@@ -71,6 +71,21 @@ class SangoiTab:
                          tooltip="Scale for sangoi loss function. Values 2~8, suggest 4 (from o3).")
         components.entry(self.main_frame, row_index, 3, self.ui_state, "alpha_sangoi")
         row_index += 1
+
+        # Slot 3 (cols 4, 5) fica em branco
+        components.label(self.main_frame, row_index, 0, "Use Sangoi Schedule",
+                         tooltip="Use sangoi loss schedule (includes huber).")
+        components.switch(self.main_frame, row_index, 1, self.ui_state, "sangoi_schedule")
+        
+        # Slot 3 (cols 4, 5) fica em branco
+        components.label(self.main_frame, row_index, 2, "Use Uber Loss",
+                         tooltip="Use huber loss style from kohya scripts")
+        components.switch(self.main_frame, row_index, 3, self.ui_state, "sangoi_use_huber")
+        
+        components.label(self.main_frame, row_index, 4, "Huber Factor",
+                         tooltip="Huber factor. Default 0.1.")
+        components.entry(self.main_frame, row_index, 5, self.ui_state, "sangoi_huber_factor")
+        row_index += 1
         
         # --- Row 2: Use Delta Pattern & Save Delta Pattern ---
         # Slot 1

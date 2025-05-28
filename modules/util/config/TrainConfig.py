@@ -278,6 +278,9 @@ class TrainConfig(BaseConfig):
     bucket_ratio: int
     debugoi: bool
     full_vae_mf: bool
+    sangoi_use_huber: bool
+    sangoi_use_loss_schedule: bool
+    sangoi_schedule: bool
     alpha_sangoi: float
     
     # text encoder long prompts
@@ -803,6 +806,10 @@ class TrainConfig(BaseConfig):
         data.append(("save_predictions", False, bool, False))
         data.append(("bucket_ratio", 64, int, False))
         data.append(("alpha_sangoi", 4.0, float, False))
+        data.append(("sangoi_use_huber", False, bool, False))
+        data.append(("sangoi_schedule", False, bool, False))
+        data.append(("sangoi_huber_factor", 0.1, float, False))
+        data.append(("sangoi_use_loss_schedule", False, bool, False))
         data.append(("train_gps_save_it", False, bool, False))
         data.append(("train_gps_use_it", False, bool, False))
         data.append(("train_gps_weight", 0.0, float, False))

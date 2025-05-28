@@ -46,6 +46,117 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.loss_tracker = LossTracker(window_size=1000, use_mad=True)
         self.dynamic_loss_strengthing = DynamicLossControl()
 
+    # START v2025-06-01 – sangoi_loss_schedule
+    def __sangoi_loss_schedule(self, batch: dict, data: dict, config: TrainConfig, progress: TrainProgress) -> torch.Tensor:
+        """
+        Schedule de perdas Sangoi:
+        • Fases: MAE → log-cosh → MSE
+        • Opção: usar Huber loss isolada (config.sangoi_use_huber)
+        """
+        # 1) Diferença e máscara
+        diff = data["predicted"] - data["target"]  
+        mask = batch.get("latent_mask", None)
+
+        if getattr(config, "sangoi_use_huber", False):
+            diff   = data["predicted"] - data["target"]
+            mask   = batch.get("latent_mask", None)
+            device = diff.device
+
+            # 1) β dinâmico de acordo com schedule
+            timesteps      = data.get("timestep")
+            eps            = 1e-8
+            snr            = self.__snr(timesteps, device) + eps
+            huber_c        = getattr(config, "sangoi_huber_factor", 0.1)
+            huber_schedule = getattr(config, "huber_schedule", "snr")
+            if huber_schedule == "snr":
+                beta_t = huber_c * snr
+            elif huber_schedule == "exponential":
+                epoch = getattr(self.progress, "current_epoch", 0)
+                total = getattr(config, "num_epochs", 100)
+                val   = huber_c * math.exp(- epoch / total)
+                beta_t = torch.full_like(snr, val)
+            else:  # constant
+                beta_t = torch.full_like(snr, huber_c)
+            beta = beta_t.view(-1, 1, 1, 1)
+
+            # 2) Cálculo manual da Huber Loss
+            abs_diff = diff.abs()
+            huber_raw = torch.where(
+                abs_diff < beta,
+                0.5 * abs_diff * abs_diff / beta,
+                abs_diff - 0.5 * beta
+            )
+            if mask is not None:
+                huber_raw = masked_losses(
+                    losses=huber_raw, mask=mask,
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss
+                )
+            self.tensorboard.add_scalar(
+                "sangoi/huber_raw",
+                huber_raw.mean([1, 2, 3]),
+                progress.global_step,
+            )                
+            return huber_raw.mean([1, 2, 3])
+
+        # 3) Cálculo das perdas básicas
+        mae_loss = masked_losses(
+            losses=diff.abs(), mask=mask,
+            unmasked_weight=config.unmasked_weight,
+            normalize_masked_area_loss=config.normalize_masked_area_loss
+        ).mean([1, 2, 3])
+
+        log_cosh_tensor = diff + F.softplus(-2.0 * diff) - math.log(2.0)
+        log_cosh_loss = masked_losses(
+            losses=log_cosh_tensor, mask=mask,
+            unmasked_weight=config.unmasked_weight,
+            normalize_masked_area_loss=config.normalize_masked_area_loss
+        ).mean([1, 2, 3])
+
+        mse_loss = masked_losses(
+            losses=diff.pow(2), mask=mask,
+            unmasked_weight=config.unmasked_weight,
+            normalize_masked_area_loss=config.normalize_masked_area_loss
+        ).mean([1, 2, 3])
+
+        # 4) DynamicLossControl (agora só equaliza via z-score / EMA)
+        self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
+        mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
+            mse_loss, mae_loss, log_cosh_loss
+        )
+        mse_w, mae_w, log_cosh_w = self.dynamic_loss_strengthing.adjust_weights(
+            mse_z, mae_z, log_cosh_z, config, self.progress
+        )
+        mae_w_loss      = mae_loss      * mae_w
+        log_cosh_w_loss = log_cosh_loss * log_cosh_w
+        mse_w_loss      = mse_loss      * mse_w
+
+        # 5) Schedule por fase de treinamento
+        epoch = getattr(self.progress, "current_epoch", 0)
+        total = getattr(config, "num_epochs", 100)
+        frac  = epoch / total
+        if frac < 1/3:      # fase 0-33 %
+            self.tensorboard.add_scalar(
+                "sangoi/mae_w_loss",
+                mae_w_loss,
+                progress.global_step,
+            )                
+            return mae_w_loss
+        elif frac < 2/3:    # fase 33-66 %
+            self.tensorboard.add_scalar(
+                "sangoi/log_cosh_w_loss",
+                log_cosh_w_loss,
+                progress.global_step,
+            )                
+            return log_cosh_w_loss
+        else:               # fase final
+            self.tensorboard.add_scalar(
+                "sangoi/mse_w_loss",
+                mse_w_loss,
+                progress.global_step,
+            )                
+            return mse_w_loss
+
     def __log_cosh_loss(
         self,
         pred: torch.Tensor,
@@ -67,6 +178,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     ):
 
         progress = self.progress
+        if getattr(config, "sangoi_schedule", False):
+            return self.__sangoi_loss_schedule(batch, data, config, progress)        
         losses = 0
 
         # teste de vetorização
@@ -172,6 +285,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     ):
 
         progress = self.progress
+        if getattr(config, "sangoi_loss", False):
+            return self.__sangoi_loss_schedule(batch, data, config)        
         losses = 0
 
         mse_loss = torch.tensor(0.0, device=data["predicted"].device)
@@ -418,7 +533,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # 6) Logs
         step = self.progress.global_step
         tb = self.tensorboard
-        tb.add_scalar("sangoi/alpha_sangoi_config_val", float(alpha_sangoi_val.mean() if isinstance(alpha_sangoi_val, Tensor) else alpha_sangoi_val),          step) # Logando o valor de alpha_sangoi usado
         tb.add_scalar("sangoi/ssim_mean",      float(ssim_val.mean()),       step)
         tb.add_scalar("sangoi/difficulty_mean",float(difficulty_weight.mean()), step)
         tb.add_scalar("sangoi/reward_pct", float(reward_pct.mean()), step)
@@ -510,7 +624,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                             losses.device,                            
                         )
                     else:
-                        losses = losses / self.__sangoi_loss_weighting(
+                        losses *= self.__sangoi_loss_weighting(
                             data["timestep"],                        
                             data["predicted_image_latent"],
                             data["target_image_latent"],

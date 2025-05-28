@@ -64,9 +64,9 @@ class LossTracker:
             mae_loss (Tensor): The Mean Absolute Error loss.
             log_cosh_loss (Tensor): The log-cosh loss.
         """
-        self.mse_losses.append(mse_loss.detach().cpu())
-        self.mae_losses.append(mae_loss.detach().cpu())
-        self.log_cosh_losses.append(log_cosh_loss.detach().cpu())
+        self.log_cosh_losses.append(log_cosh_loss.detach())
+        self.mse_losses.append(mse_loss.detach())
+        self.mae_losses.append(mae_loss.detach())
 
     def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[Tensor, Tensor]:
         """Computa estatísticas de uma lista de valores"""
@@ -74,18 +74,10 @@ class LossTracker:
             return self._get_defaults()
         
         # Conversão mais robusta
-        tensors = []
-        for v in values_list:
-            try:
-                if isinstance(v, Tensor):
-                    if v.numel() > 0:
-                        tensors.append(v.flatten().float())
-                else:
-                    tensors.append(torch.tensor(float(v)).flatten())
-            except (ValueError, RuntimeError):
-                continue  # Pula valores inválidos
-        
-        if not tensors:
+        tensors = [v.flatten().float()
+						for v in values_list
+						if isinstance(v, Tensor) and v.numel() > 0]
+        if len(tensors) == 0:
             return self._get_defaults()
         
         arr = torch.cat(tensors)
@@ -140,54 +132,15 @@ class DynamicLossControl:
         self.last_logged_delta_epoch = -1
         self.progress = None
         self.last_logged_delta_epoch = -1
-        self._sched_tensors_cached = False
 
-        self.schedule_params: Dict[str, Dict[str, float]] = (
-            self._initialize_schedule_params(schedule_params)
-        )
-
-        # // Sessão V by Gemini - CORREÇÃO: EMA weights podem ser tensores se z-scores forem tensores.
-        self.ema_weights: Dict[str, Union[float, Tensor]] = {"mse": 1.0, "mae": 1.0, "log_cosh": 1.0}
+        self.ema_weights: Tensor | None = None  # tensor [3]
         self.initialized: bool = False
-
-    def _initialize_schedule_params(
-        self, schedule_params: Dict[str, Dict[str, float]] = None
-    ) -> Dict[str, Dict[str, float]]:
-        default_params = {
-            "mae": {"start": 0.6, "end": 0.3},
-            "mse": {"start": 0.2, "end": 0.5},
-            "log_cosh": {"start": 0.2, "end": 0.3},
-        }
-        if schedule_params is not None:
-            for loss_type, params in default_params.items():
-                if loss_type in schedule_params:
-                    default_params[loss_type].update(schedule_params[loss_type])
-        return default_params
-
-    def _cache_schedule_tensors(self, device):
-        self._sched_start = torch.tensor([
-            self.schedule_params["mse"]["start"],
-            self.schedule_params["mae"]["start"], 
-            self.schedule_params["log_cosh"]["start"]
-        ], device=device)
-        
-        self._sched_end = torch.tensor([
-            self.schedule_params["mse"]["end"],
-            self.schedule_params["mae"]["end"],
-            self.schedule_params["log_cosh"]["end"]
-        ], device=device)
-        
-        self._sched_tensors_cached = True
 
     # testando vetorização
     @torch.no_grad()
     def adjust_weights(self, mse_z, mae_z, log_cosh_z, config, progress):
         device = mse_z.device
         
-        # Cache de tensores constantes
-        if not hasattr(self, '_sched_tensors_cached') or not self._sched_tensors_cached:
-            self._cache_schedule_tensors(device)
-
         z = torch.stack([mse_z, mae_z, log_cosh_z])
         z_clamped = torch.clamp(z.abs(), max=self.outlier_threshold)
         
@@ -196,31 +149,11 @@ class DynamicLossControl:
         w = inv_z / (inv_z.sum(dim=0, keepdim=True) + 1e-8)    # base weights
 
         if self.use_ema:
-            if not self.initialized:
-                self.ema_weights = w.clone()
-                self.initialized = True
-            else:
-                self.ema_weights = (1 - self.ema_decay) * self.ema_weights + self.ema_decay * w
-            w = self.ema_weights                                         # shape [3, …]
+            if self.ema_weights is None:
+                self.ema_weights = w.detach()
+            self.ema_weights = (1 - self.ema_decay) * self.ema_weights + self.ema_decay * w
+            w = self.ema_weights                                      # shape [3, …]
 
-        frac = 0.0 if config.epochs <= 1 else progress.epoch / (config.epochs - 1)
-
-        sched_start = torch.tensor([                                   # [mse, mae, cosh]
-            self.schedule_params["mse"     ]["start"],
-            self.schedule_params["mae"     ]["start"],
-            self.schedule_params["log_cosh"]["start"],
-        ], device=w.device)
-
-        sched_end = torch.tensor([
-            self.schedule_params["mse"     ]["end"],
-            self.schedule_params["mae"     ]["end"],
-            self.schedule_params["log_cosh"]["end"],
-        ], device=w.device)
-
-        sched = sched_start + frac * (sched_end - sched_start)          # shape [3]
-
-
-        w = w * sched[:, None]                                          # broadcasting
         w = w / (w.sum(dim=0, keepdim=True) + 1e-8)
         w_mse, w_mae, w_cosh = w.mean(dim=list(range(1, w.ndim))).tolist()
 
