@@ -1,3 +1,4 @@
+import math
 import os
 import json
 import copy
@@ -58,7 +59,8 @@ from rich.columns import Columns
 from rich.table import Table
 # As importações do logFun já estão OK
 from modules.sangoi.logFun import logFun, set_logfun_console, init_global_progress, cleanup_global_progress, ProgressContext
-
+from pytorch_msssim import ssim
+import torch.nn.functional as F
 
 def format_time_delta(seconds: float) -> str:
     if seconds < 0 or not isinstance(seconds, (int, float)):
@@ -994,8 +996,39 @@ class GenericTrainer(BaseTrainer):
             self.commands.stop()
             self.callbacks.on_update_status(f"Error during pause/resume: {e}")
 
+    def latent_ssim(self, pred_lat: torch.Tensor, tgt_lat: torch.Tensor) -> torch.Tensor:
+        """
+        SSIM proxy p/ latentes 128×128 (ou menor).
+        - Se H < 128: faz upscale NN → 128.
+        - Normaliza ambos tensores para [0,1] antes do SSIM.
+        - Usa janela 11×11 (ou a maior ímpar que couber).
+        - Calcula SSIM em fp32 e devolve no dtype original.
+        """
+        if pred_lat.shape[-1] < 128:
+            pred_lat = F.interpolate(pred_lat, size=128, mode="nearest")
+            tgt_lat  = F.interpolate(tgt_lat,  size=128, mode="nearest")
+
+        with torch.no_grad():
+            # 1) normalização conjunta → [0,1]
+            stacked   = torch.cat([pred_lat, tgt_lat], dim=0)
+            min_val   = stacked.min()
+            max_val   = stacked.max()
+            data_rng  = (max_val - min_val).clamp(min=1e-7)  # evita div/0
+            pred_norm = (pred_lat.float() - min_val) / data_rng
+            tgt_norm  = (tgt_lat.float() - min_val) / data_rng
+
+            ssim32 = ssim(
+                pred_norm, tgt_norm,
+                data_range=1.0,
+                size_average=True,
+                win_size=11
+            )
+
+        return ssim32.to(dtype=pred_lat.dtype)
+
     def train(self):
         scheduler_step_counter = 0
+        discard_counter = 0
         train_device = torch.device(self.config.train_device)
         train_progress = self.model.train_progress
 
@@ -1008,7 +1041,7 @@ class GenericTrainer(BaseTrainer):
                 logFun(f"[DEBUG] scheduler.last_epoch = {lr_scheduler.last_epoch}", lvl="DEBUG")
                 return orig_step(*args, **kwargs)
             return wrapped
-        
+
         # Verificar se é só cache (mantém como está)
         if self.config.only_cache:
             self._handle_cache_only_mode()
@@ -1133,13 +1166,54 @@ class GenericTrainer(BaseTrainer):
                             self.model_setup.setup_train_device(self.model, self.config)
 
                     with TorchMemoryRecorder(enabled=False):
-                        model_output_data = self.model_setup.predict(
-                            self.model,
-                            batch,
-                            self.config,
-                            train_progress,
-                        )
+                        # model_output_data = self.model_setup.predict(
+                        #     self.model,
+                        #     batch,
+                        #     self.config,
+                        #     train_progress,
+                        # )
+                        # START retry_predict_ssim
+                        max_attempts = 4
+                        start_tau = 0.85
+                        end_tau = 0.60
+                        # total de steps no treinamento inteiro
+                        total_steps = self.model.train_config.epochs * self.data_loader.get_data_set().approximate_length()
 
+                        # progresso normalizado [0,1]
+                        progress = self.model.train_progress.global_step / max(total_steps - 1, 1)
+
+                        # cosseno decrescente: start_tau → end_tau
+                        cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+                        tau = end_tau + (start_tau - end_tau) * cosine_factor          
+                        
+                        if train_progress.global_step % 100 == 0:
+                            logFun(f"Tau atual: {tau}")
+                            logFun(f"Predicts descartados: {discard_counter}")
+                        for _ in range(max_attempts):                            
+                            model_output_data = self.model_setup.predict(
+                                self.model,
+                                batch,
+                                self.config,
+                                train_progress,
+                            )
+
+                            ssim_val = self.latent_ssim(
+                                model_output_data["predicted_image_latent"],
+                                model_output_data["target_image_latent"],
+                            )
+
+                            if ssim_val < tau:
+                                break
+                            else: discard_counter += 1
+                        else:
+                            continue
+                        
+                        self.tensorboard.add_scalar(
+                            "sangoi/ssim_val",
+                            ssim_val,
+                            train_progress.global_step,
+                        )
+                            
                         if self.config.masked_training:
                             predicted = model_output_data["predicted"]
                             predicted.register_hook(lambda g: g * batch["latent_mask"])

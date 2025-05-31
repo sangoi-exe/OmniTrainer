@@ -95,7 +95,7 @@ class BaseStableDiffusionXLSetup(
     quantize_layers(model.text_encoder_2, self.train_device, model.train_dtype)
     quantize_layers(model.vae, self.train_device, model.vae_train_dtype)
     quantize_layers(model.unet, self.train_device, model.train_dtype)
-
+    
   def _setup_embeddings(
       self,
       model: StableDiffusionXLModel,
@@ -205,10 +205,19 @@ class BaseStableDiffusionXLSetup(
       deterministic: bool = False,
   ) -> dict:
     with model.autocast_context:
-      batch_seed = 0 if deterministic else train_progress.global_step
-      generator = torch.Generator(device=config.train_device)
-      generator.manual_seed(batch_seed)
-      rand = Random(batch_seed)
+      if deterministic:
+          batch_seed = 0  # reprodutibilidade total
+      # flag idiota, essa merda AINDA É deterministic mesmo false, porque usa o global step
+      # mudei pra ser realmente aleatória, pra poder funcionar o OHEM lá no predict 
+      else:
+          # gera seed imprevisível via Torch (GPU-safe) a cada invocação
+          batch_seed = torch.randint(
+              low=1, high=2**31 - 1, size=(1,),
+              device=config.train_device
+          ).item()
+
+      generator = torch.Generator(device=config.train_device).manual_seed(batch_seed)
+      rand      = Random(batch_seed)
 
       vae_scaling_factor = model.vae.config['scaling_factor']
 
@@ -301,6 +310,7 @@ class BaseStableDiffusionXLSetup(
         generator,
         scaled_latent_image.shape[0],
         config,
+        train_progress,
       )
 
       scaled_noisy_latent_image = self._add_noise_discrete(

@@ -1,6 +1,7 @@
 import math
 from abc import ABCMeta
 
+from modules.util.TrainProgress import TrainProgress
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 
@@ -14,6 +15,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         super().__init__()
 
         self.__weights = None
+        self.__weights_epoch = -1
 
     def _create_noise(
             self,
@@ -57,6 +59,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             config: TrainConfig,
             latent_width: int | None = None,
             latent_height: int | None = None,
+            train_progress: TrainProgress | None = None,
     ) -> Tensor:
         if deterministic:
             # -1 is for zero-based indexing
@@ -140,14 +143,35 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                     samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True) + min_timestep
                     timestep = samples.to(dtype=torch.long, device=generator.device)
                 elif config.timestep_distribution == TimestepDistribution.SIGMOID:
-                    if self.__weights is None:
+                    # if self.__weights is None:
+                    #     bias = config.noising_bias + 0.5
+                    #     weight = config.noising_weight
+
+                    #     weights = linspace / (shift - shift * linspace + linspace)
+                    #     weights = 1 / (1 + torch.exp(-weight * (weights - bias)))  # Sigmoid
+                    #     weights *= linspace_derivative
+                    #     self.__weights = weights
+
+                    # testando um schedule pra sigmoid dos timesteps, começa em 0 e fecha no valor definido na UI
+                    current_epoch = getattr(train_progress, "epoch", 1)
+                    total_epochs = config.epochs
+                    
+                    if self.__weights is None or self.__weights_epoch != current_epoch:
                         bias = config.noising_bias + 0.5
                         weight = config.noising_weight
 
-                        weights = linspace / (shift - shift * linspace + linspace)
-                        weights = 1 / (1 + torch.exp(-weight * (weights - bias)))  # Sigmoid
+                        # Recalcula somente uma vez por época
+                        scaled = linspace / (shift - shift * linspace + linspace)
+                        
+                        # Ajusta 'weight' de 0 até config.noising_weight linearmente
+                        prog = float(current_epoch) / float(total_epochs)
+                        scheduled_weight = weight * prog
+
+                        weights = 1 / (1 + torch.exp(-scheduled_weight * (scaled - bias)))  # Sigmoid
                         weights *= linspace_derivative
+
                         self.__weights = weights
+                        self.__weights_epoch = current_epoch
 
                     samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True) + min_timestep
                     timestep = samples.to(dtype=torch.long, device=generator.device)

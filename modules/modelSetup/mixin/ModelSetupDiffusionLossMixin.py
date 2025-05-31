@@ -64,115 +64,93 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if progress.global_step == 1 or progress.global_step % 250 == 0:
             logFun(f"Actual epoch: {epoch}.", lvl="warning")   
             logFun(f"Actual frac: {frac}.", lvl="warning")   
-            logFun(f"Total epoches: {total}.", lvl="warning")        
-        
-        if frac <= 0.5:      # fase 0-50%           
-        # if getattr(config, "sangoi_use_huber", False):
+            logFun(f"Total epoches: {total}.", lvl="warning")
+
+        if frac <= 0.3:
             if progress.global_step % 100 == 0:
-                logFun("Using Huber loss.", lvl="warning")
-            device = diff.device
-            huber_raw = 0
-
-            # 1) β dinâmico de acordo com schedule
-            timesteps      = data.get("timestep")
-            eps            = 1e-8
-            snr            = self.__snr(timesteps, device) + eps
-            huber_c        = getattr(config, "sangoi_huber_factor", 0.1)
-            huber_schedule = getattr(config, "huber_schedule", "snr")
-            if huber_schedule == "snr":
-                beta_t = huber_c * snr
-            elif huber_schedule == "exponential":
-                epoch = getattr(self.progress, "epoch", 0)
-                total = getattr(config, "epochs", 100)
-                val   = huber_c * math.exp(- epoch / total)
-                beta_t = torch.full_like(snr, val)
-            else:  # constant
-                beta_t = torch.full_like(snr, huber_c)
-            beta = beta_t.view(-1, 1, 1, 1)
-
-            # 2) Cálculo manual da Huber Loss
-            abs_diff = diff.abs()
-            huber_raw = torch.where(
-                abs_diff < beta,
-                0.5 * abs_diff * abs_diff / beta,
-                abs_diff - 0.5 * beta
+                logFun("Using MAE loss.", lvl="warning")
+            mae_loss = masked_losses(
+                losses=F.l1_loss(
+                    data["predicted"],
+                    data["target"],
+                    reduction="none",
+                ),
+                mask=batch["latent_mask"],
+                unmasked_weight=config.unmasked_weight,
+                normalize_masked_area_loss=config.normalize_masked_area_loss,
             )
-            if mask is not None:
-                huber_raw = masked_losses(
-                    losses=huber_raw, mask=mask,
-                    unmasked_weight=config.unmasked_weight,
-                    normalize_masked_area_loss=config.normalize_masked_area_loss
-                )
-            self.tensorboard.add_scalar(
-                "sangoi/huber_raw",
-                huber_raw.mean([1, 2, 3]),
-                progress.global_step,
-            )                
-            return huber_raw.mean([1, 2, 3])
+            return mae_loss.mean([1, 2, 3])
+        elif 0.3 < frac <= 0.6:                     
+            if progress.global_step % 100 == 0:
+                logFun("Using log-cosh loss.", lvl="warning")                       
+            log_cosh_loss = masked_losses(
+                losses=self.__log_cosh_loss(
+                    data["predicted"],
+                    data["target"],
+                ),
+                mask=batch["latent_mask"],
+                unmasked_weight=config.unmasked_weight,
+                normalize_masked_area_loss=config.normalize_masked_area_loss,
+            )
+            return log_cosh_loss.mean([1, 2, 3])
         else:
-        # 3) Cálculo das perdas básicas
             if progress.global_step % 100 == 0:
                 logFun("Using MSE loss.", lvl="warning")
-            mse_loss = 0
             mse_loss = masked_losses(
-                losses=diff.pow(2), mask=mask,
+                losses=F.mse_loss(
+                    data["predicted"],
+                    data["target"],
+                    reduction="none",
+                ),
+                mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss
-            ).mean([1, 2, 3])
-            self.tensorboard.add_scalar(
-                "sangoi/mse",
-                mse_loss.mean([1, 2, 3]),
-                progress.global_step,
-            )                
-            return mse_loss
-    
-        mae_loss = masked_losses(
-            losses=diff.abs(), mask=mask,
-            unmasked_weight=config.unmasked_weight,
-            normalize_masked_area_loss=config.normalize_masked_area_loss
-        ).mean([1, 2, 3])
+                normalize_masked_area_loss=config.normalize_masked_area_loss,
+            ) 
+            return mse_loss.mean([1, 2, 3])     
 
-        log_cosh_tensor = diff + F.softplus(-2.0 * diff) - math.log(2.0)
-        log_cosh_loss = masked_losses(
-            losses=log_cosh_tensor, mask=mask,
-            unmasked_weight=config.unmasked_weight,
-            normalize_masked_area_loss=config.normalize_masked_area_loss
-        ).mean([1, 2, 3])
+        # if frac <= 0.5:      # fase 0-50%           
+        # # if getattr(config, "sangoi_use_huber", False):
+        #     if progress.global_step % 100 == 0:
+        #         logFun("Using Huber loss.", lvl="warning")
+        #     device = diff.device
+        #     huber_raw = 0
 
-    
-        # 4) DynamicLossControl (agora só equaliza via z-score / EMA)
-        self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
-        mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
-            mse_loss, mae_loss, log_cosh_loss
-        )
-        mse_w, mae_w, log_cosh_w = self.dynamic_loss_strengthing.adjust_weights(
-            mse_z, mae_z, log_cosh_z, config, self.progress
-        )
-        mae_w_loss      = mae_loss      * mae_w
-        log_cosh_w_loss = log_cosh_loss * log_cosh_w
-        mse_w_loss      = mse_loss      * mse_w
+        #     # 1) β dinâmico de acordo com schedule
+        #     timesteps      = data.get("timestep")
+        #     eps            = 1e-8
+        #     snr            = self.__snr(timesteps, device) + eps
+        #     huber_c        = getattr(config, "sangoi_huber_factor", 0.1)
+        #     huber_schedule = getattr(config, "huber_schedule", "snr")
+        #     if huber_schedule == "snr":
+        #         beta_t = huber_c * snr
+        #     elif huber_schedule == "exponential":
+        #         epoch = getattr(self.progress, "epoch", 0)
+        #         total = getattr(config, "epochs", 100)
+        #         val   = huber_c * math.exp(- epoch / total)
+        #         beta_t = torch.full_like(snr, val)
+        #     else:  # constant
+        #         beta_t = torch.full_like(snr, huber_c)
+        #     beta = beta_t.view(-1, 1, 1, 1)
 
-
+        #     # 2) Cálculo manual da Huber Loss
+        #     abs_diff = diff.abs()
+        #     huber_raw = torch.where(
+        #         abs_diff < beta,
+        #         0.5 * abs_diff * abs_diff / beta,
+        #         abs_diff - 0.5 * beta
+        #     )
+        #     if mask is not None:
+        #         huber_raw = masked_losses(
+        #             losses=huber_raw, mask=mask,
+        #             unmasked_weight=config.unmasked_weight,
+        #             normalize_masked_area_loss=config.normalize_masked_area_loss
+        #         )
         #     self.tensorboard.add_scalar(
-        #         "sangoi/mae_w_loss",
-        #         mae_w_loss,
+        #         "sangoi/huber_raw",
+        #         huber_raw.mean([1, 2, 3]),
         #         progress.global_step,
         #     )                
-        #     return mae_w_loss
-        # elif frac < 2/3:    # fase 33-66 %
-        #     self.tensorboard.add_scalar(
-        #         "sangoi/log_cosh_w_loss",
-        #         log_cosh_w_loss,
-        #         progress.global_step,
-        #     )                
-        #     return log_cosh_w_loss
-        # else:               # fase final
-        #     self.tensorboard.add_scalar(
-        #         "sangoi/mse_w_loss",
-        #         mse_w_loss,
-        #         progress.global_step,
-        #     )                
-        #     return mse_w_loss
+        #     return huber_raw.mean([1, 2, 3])
 
     def __log_cosh_loss(
         self,

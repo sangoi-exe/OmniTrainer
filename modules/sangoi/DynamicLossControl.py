@@ -5,6 +5,106 @@ from collections import deque
 
 from typing import Tuple, List, Dict, Union
 
+from modules.util.config.TrainConfig import TrainConfig
+
+class ScheduledLoss:
+    def __init__(self, config: TrainConfig):
+        self.config = config
+        self.mae_range = config.scheduled_loss_mae_range
+        self.log_cosh_range = config.scheduled_loss_mae_range
+        self.mse_range = config.scheduled_loss_mae_range
+
+    def _calculate_segment_weight(self, progress: float, p0: float, p1: float, p2: float, p3: float) -> float:
+        """
+        Calcula o peso para um segmento com ramp-in, full, ramp-out.
+        p0: Início do ramp-in
+        p1: Fim do ramp-in (início do peso 1.0)
+        p2: Início do ramp-out (fim do peso 1.0)
+        p3: Fim do ramp-out
+        Todos os pX e progress devem estar entre 0.0 e 1.0.
+        """
+        weight = 0.0
+        # Garante que os pontos estejam em ordem para evitar problemas
+        p1 = max(p0, p1)
+        p2 = max(p1, p2)
+        p3 = max(p2, p3)
+
+        if p0 <= progress < p1 and p1 > p0: # Ramp-in
+            weight = (progress - p0) / (p1 - p0)
+        elif p1 <= progress < p2: # Full weight
+            weight = 1.0
+        elif p2 <= progress < p3 and p3 > p2: # Ramp-out
+            weight = 1.0 - (progress - p2) / (p3 - p2)
+        
+        # Caso especial: se p0=p1, significa início direto em full_weight ou ramp-in zero.
+        # Se progress == p1 == p0, e p1 < p2, deve ser 1.0.
+        if p0 == p1 and progress == p0 and p1 < p2: weight = 1.0
+        
+        # Caso especial: se p2=p3, significa fim abrupto ou ramp-out zero.
+        # Se progress == p2 == p3, e p1 < p2, deveria ser 0.0 (já acabou).
+        # Se p1 <= progress < p2 e p2 == p3, peso é 1.0 (ainda na fase full).
+        # A lógica acima cobre isso, mas é bom ter em mente.
+
+        # Se a fase inteira é um ponto (p0=p1=p2=p3)
+        if p0 == p3 and progress == p0:
+            weight = 1.0 # Ou 0.0 dependendo da interpretação, para um "pulso" seria 1.0
+
+        return max(0.0, min(1.0, weight))
+
+    def get_loss_weights(self, progress_percent: float) -> tuple[float, float, float]:
+        """
+        Retorna os pesos para MAE, Log-Cosh, MSE baseados no progresso.
+        Exemplo:
+        MAE: 0-30% (total), sobrepõe com Log-Cosh de 20-30%
+        Log-Cosh: 20-60% (total), sobrepõe com MAE de 20-30%, com MSE de 50-60%
+        MSE: 50-100% (total), sobrepõe com Log-Cosh de 50-60%
+        """
+        
+        mae_p_start, mae_p_end = self.mae_range
+        lc_p_start, lc_p_end = self.log_cosh_range
+        mse_p_start, mse_p_end = self.mse_range
+
+        # MAE:
+        # Ramp-in: [mae_p_start, mae_p_start] (começa direto, sem ramp-in de uma loss anterior no exemplo)
+        # Full:    [mae_p_start, lc_p_start] (até Log-Cosh começar a entrar)
+        # Ramp-out: [lc_p_start, mae_p_end] (enquanto Log-Cosh entra)
+        p0_mae = mae_p_start
+        p1_mae = mae_p_start 
+        p2_mae = min(mae_p_end, lc_p_start) # MAE começa a sair quando LogCosh começa a entrar
+        p3_mae = mae_p_end
+        w_mae = self._calculate_segment_weight(progress_percent, p0_mae, p1_mae, p2_mae, p3_mae)
+
+        # Log-Cosh:
+        # Ramp-in: [lc_p_start, mae_p_end] (enquanto MAE está saindo)
+        # Full:    [mae_p_end, mse_p_start] (entre MAE ter saído e MSE começar a entrar)
+        # Ramp-out: [mse_p_start, lc_p_end] (enquanto MSE está entrando)
+        p0_lc = lc_p_start
+        p1_lc = min(lc_p_end, mae_p_end) # LogCosh termina ramp-in quando MAE termina
+        p2_lc = max(lc_p_start, mse_p_start) # LogCosh começa ramp-out quando MSE começa
+        p3_lc = lc_p_end
+        w_lc = self._calculate_segment_weight(progress_percent, p0_lc, p1_lc, p2_lc, p3_lc)
+        
+        # MSE:
+        # Ramp-in: [mse_p_start, lc_p_end] (enquanto Log-Cosh está saindo)
+        # Full:    [lc_p_end, mse_p_end] (depois que Log-Cosh saiu, até o fim)
+        # Ramp-out: [mse_p_end, mse_p_end] (termina no fim, sem ramp-out para uma loss posterior no exemplo)
+        p0_mse = mse_p_start
+        p1_mse = min(mse_p_end, lc_p_end) # MSE termina ramp-in quando LogCosh termina
+        p2_mse = mse_p_end 
+        p3_mse = mse_p_end
+        w_mse = self._calculate_segment_weight(progress_percent, p0_mse, p1_mse, p2_mse, p3_mse)
+        
+        # Normalização opcional para garantir que a soma dos pesos não exceda 1.0 significativamente
+        # A lógica de _calculate_segment_weight com transições lineares deve naturalmente 
+        # fazer com que em overlaps de duas funções, a soma seja ~1.0.
+        # Ex: MAE (1-alpha) + LogCosh (alpha).
+        # Se houver uma pequena sobreposição de 3 funções, pode ser > 1.
+        # O design atual de p0-p3 deve evitar isso.
+        
+        # print(f"Prog: {progress_percent:.2f} -> MAE: {w_mae:.2f} (P: {p0_mae:.2f},{p1_mae:.2f},{p2_mae:.2f},{p3_mae:.2f}), LC: {w_lc:.2f} (P: {p0_lc:.2f},{p1_lc:.2f},{p2_lc:.2f},{p3_lc:.2f}), MSE: {w_mse:.2f} (P: {p0_mse:.2f},{p1_mse:.2f},{p2_mse:.2f},{p3_mse:.2f})")
+
+        return w_mae, w_lc, w_mse
+
 class LossTracker:
     """
     Tracks and generates statistics for the latest N loss values for MSE, MAE, and log-cosh.
