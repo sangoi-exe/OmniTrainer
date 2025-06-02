@@ -25,23 +25,6 @@ from mgds.pipelineModules.VariationSorting import VariationSorting
 
 import torch
 
-class _BucketPathModule:
-    """Adiciona sample['bucketed_path'] = '<HxW>_<basename>' como prefixo."""
-    
-    def init(self, pipeline, seed, index, state):
-        return self
-    
-    def __call__(self, sample):
-        try:
-            h, w = sample['crop_resolution']
-            basename = os.path.basename(sample['image_path'])
-            # Usar prefixo em vez de pasta
-            sample['bucketed_path'] = f"{h}x{w}_{basename}"
-        except KeyError:
-            # Fallback caso crop_resolution não exista
-            sample['bucketed_path'] = os.path.basename(sample['image_path'])
-        return sample
-
 class StableDiffusionXLBaseDataLoader(
     BaseDataLoader,
     DataLoaderText2ImageMixin,
@@ -79,9 +62,6 @@ class StableDiffusionXLBaseDataLoader(
         return self.__dl
 
     def _preparation_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
-        if not config.enable_long_prompts:
-            return self._preparation_modules_original(config, model)
-        
         rescale_image = RescaleImageChannels(image_in_name='image', image_out_name='image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
         rescale_conditioning_image = RescaleImageChannels(image_in_name='conditioning_image', image_out_name='conditioning_image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
         encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
@@ -91,27 +71,10 @@ class StableDiffusionXLBaseDataLoader(
         add_embeddings_to_prompt_2 = MapData(in_name='prompt', out_name='prompt_2', map_fn=model.add_text_encoder_2_embeddings_to_prompt)
         encode_conditioning_image = EncodeVAE(in_name='conditioning_image', out_name='latent_conditioning_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
         conditioning_image_sample = SampleVAEDistribution(in_name='latent_conditioning_image_distribution', out_name='latent_conditioning_image', mode='mean')
-        
-        tokenize_prompt_1 = Tokenize(
-            in_name='prompt_1', tokens_out_name='tokens_1', mask_out_name='tokens_mask_1',
-            tokenizer=model.tokenizer_1,
-            max_token_length=model.tokenizer_1.model_max_length if not config.enable_long_prompts else None # No limit if long prompts
-        )
-        tokenize_prompt_2 = Tokenize(
-            in_name='prompt_2', tokens_out_name='tokens_2', mask_out_name='tokens_mask_2',
-            tokenizer=model.tokenizer_2,
-            max_token_length=model.tokenizer_2.model_max_length if not config.enable_long_prompts else None # No limit if long prompts
-        )
-        
-        # Conditionally add EncodeClipText only if NOT training text encoders AND NOT using long prompts
-        encode_prompt_1 = None
-        if not config.train_text_encoder_or_embedding() and not config.enable_long_prompts:
-            encode_prompt_1 = EncodeClipText(in_name='tokens_1', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_1_hidden_state', pooled_out_name=None, add_layer_norm=False, text_encoder=model.text_encoder_1, hidden_state_output_index=-(2 + config.text_encoder_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-
-        encode_prompt_2 = None
-        if not config.train_text_encoder_2_or_embedding() and not config.enable_long_prompts:
-            encode_prompt_2 = EncodeClipText(in_name='tokens_2', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_2_hidden_state', pooled_out_name='text_encoder_2_pooled_state', add_layer_norm=False, text_encoder=model.text_encoder_2, hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-        
+        tokenize_prompt_1 = Tokenize(in_name='prompt_1', tokens_out_name='tokens_1', mask_out_name='tokens_mask_1', tokenizer=model.tokenizer_1, max_token_length=model.tokenizer_1.model_max_length)
+        tokenize_prompt_2 = Tokenize(in_name='prompt_2', tokens_out_name='tokens_2', mask_out_name='tokens_mask_2', tokenizer=model.tokenizer_2, max_token_length=model.tokenizer_2.model_max_length)
+        encode_prompt_1 = EncodeClipText(in_name='tokens_1', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_1_hidden_state', pooled_out_name=None, add_layer_norm=False, text_encoder=model.text_encoder_1, hidden_state_output_index=-(2 + config.text_encoder_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
+        encode_prompt_2 = EncodeClipText(in_name='tokens_2', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_2_hidden_state', pooled_out_name='text_encoder_2_pooled_state', add_layer_norm=False, text_encoder=model.text_encoder_2, hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
 
         modules = [
             rescale_image, encode_image, image_sample,
@@ -133,28 +96,9 @@ class StableDiffusionXLBaseDataLoader(
         if not config.train_text_encoder_2_or_embedding():
             modules.append(encode_prompt_2)
 
-        
-        # Conditionally add encoding modules
-        if encode_prompt_1:
-            modules.append(encode_prompt_1)
-        if encode_prompt_2:
-            modules.append(encode_prompt_2)
-        
-
         return modules
 
-    def _cache_modules(self, config, model):
-        if not config.enable_long_prompts:
-            return self._cache_modules_original(config, model)
-                
-        if config.enable_long_prompts:
-            # Para long prompts, não cachear embeddings pré-computados
-            text_split_names_for_cache = ['tokens_1', 'tokens_2', 'prompt']
-        else:
-            # Lógica original para prompts normais
-            text_split_names_for_cache = ['tokens_1', 'tokens_2']
-            if not config.train_text_encoder_or_embedding():
-                text_split_names_for_cache.append('text_encoder_1_hidden_state')
+    def _cache_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
         image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
 
         if config.masked_training or config.model_type.has_mask_input():
@@ -164,32 +108,23 @@ class StableDiffusionXLBaseDataLoader(
             image_split_names.append('latent_conditioning_image')
 
         image_aggregate_names = ['crop_resolution', 'image_path']
-        
-        # Define text_split_names_for_cache based on long_prompts and training status
-        text_split_names_for_cache = ['tokens_1', 'tokens_2'] # Always cache tokens
-        sort_base_names = ['prompt_1', 'prompt_2', 'concept'] # Base names needed for sorting/grouping
 
-        # Conditionally add pre-computed embeddings to cache/sort if NOT using long prompts
-        # and NOT training the respective encoder
-        if not config.enable_long_prompts:
-            if not config.train_text_encoder_or_embedding():
-                text_split_names_for_cache.append('text_encoder_1_hidden_state')
-                sort_base_names.append('text_encoder_1_hidden_state')
-            if not config.train_text_encoder_2_or_embedding():
-                text_split_names_for_cache.append('text_encoder_2_hidden_state')
-                text_split_names_for_cache.append('text_encoder_2_pooled_state')
-                sort_base_names.append('text_encoder_2_hidden_state')
-                sort_base_names.append('text_encoder_2_pooled_state')
+        text_split_names = []
 
-        # A definição original de sort_names:
-        # sort_names = image_aggregate_names + image_split_names + [
-        # 'prompt_1', 'tokens_1', 'text_encoder_1_hidden_state',
-        # 'prompt_2', 'tokens_2', 'text_encoder_2_hidden_state', 'text_encoder_2_pooled_state',
-        # 'concept'
-        # ]
-        # A linha abaixo usa sort_base_names que foi corretamente definida no bloco "OneTrainer Long Prompt Mod" acima.
+        sort_names = image_aggregate_names + image_split_names + [
+            'prompt_1', 'tokens_1', 'text_encoder_1_hidden_state',
+            'prompt_2', 'tokens_2', 'text_encoder_2_hidden_state', 'text_encoder_2_pooled_state',
+            'concept'
+        ]
 
-        sort_names = image_aggregate_names + image_split_names + sort_base_names
+        if not config.train_text_encoder_or_embedding():
+            text_split_names.append('tokens_1')
+            text_split_names.append('text_encoder_1_hidden_state')
+
+        if not config.train_text_encoder_2_or_embedding():
+            text_split_names.append('tokens_2')
+            text_split_names.append('text_encoder_2_hidden_state')
+            text_split_names.append('text_encoder_2_pooled_state')
 
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
@@ -202,58 +137,46 @@ class StableDiffusionXLBaseDataLoader(
 
         def before_cache_text_fun():
             model.to(self.temp_device)
-            
-            # Conditionally move text encoders based on training AND long prompt setting
-            if not config.enable_long_prompts:
-                if not config.train_text_encoder_or_embedding():
-                    model.text_encoder_1_to(self.train_device)
-                if not config.train_text_encoder_2_or_embedding():
-                    model.text_encoder_2_to(self.train_device)
-            
+
+            if not config.train_text_encoder_or_embedding():
+                model.text_encoder_1_to(self.train_device)
+
+            if not config.train_text_encoder_2_or_embedding():
+                model.text_encoder_2_to(self.train_device)
+
             model.eval()
             torch_gc()
 
-        # Use updated text_split_names
         image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
-        
-        # // Sessão I by Gemini - CORREÇÃO: Usar text_split_names_for_cache que foi definida corretamente.
-        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names_for_cache, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+
+        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
 
         modules = []
 
         if config.latent_caching:
             modules.append(image_disk_cache)
-            # Remove image names from sorting list after image cache
+
+        if config.latent_caching:
             sort_names = [x for x in sort_names if x not in image_aggregate_names]
             sort_names = [x for x in sort_names if x not in image_split_names]
-            
-            # Conditionally add text cache and remove text names from sorting list
-            # The condition checks if we *might* have pre-computed embeddings (i.e., long prompts disabled AND not training)
-            should_cache_text = not config.enable_long_prompts and (not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding())
 
-            if should_cache_text:
+            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
                 modules.append(text_disk_cache)
-                sort_names = [x for x in sort_names if x not in text_split_names_for_cache]
-            
+                sort_names = [x for x in sort_names if x not in text_split_names]
+
         if len(sort_names) > 0:
-            # Use the potentially modified sort_names list
             variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled')
             modules.append(variation_sorting)
 
         return modules
-
+    
     def _output_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
-        if not config.enable_long_prompts:
-            return self._output_modules_original(config, model)
-        
-        # Base output names, always include tokens and raw prompts
         output_names = [
-            'image_path', 'latent_image', 
-            'prompt',
-            'prompt_1', 'prompt_2', # Raw prompts needed if encode_text uses them 
-            'tokens_1', 'tokens_2', # Tokens needed if encode_text uses them (original path) 
-            'original_resolution', 'crop_resolution', 'crop_offset', 
-        ]        
+            'image_path', 'latent_image',
+            'prompt_1', 'prompt_2',
+            'tokens_1', 'tokens_2',
+            'original_resolution', 'crop_resolution', 'crop_offset',
+        ]
 
         if config.masked_training or config.model_type.has_mask_input():
             output_names.append('latent_mask')
@@ -261,19 +184,17 @@ class StableDiffusionXLBaseDataLoader(
         if config.model_type.has_conditioning_image_input():
             output_names.append('latent_conditioning_image')
 
-        # Conditionally add pre-computed hidden states if they might exist
-        if not config.enable_long_prompts:
-            if not config.train_text_encoder_or_embedding():
-                output_names.append('text_encoder_1_hidden_state')
-            if not config.train_text_encoder_2_or_embedding():
-                output_names.append('text_encoder_2_hidden_state')
-                output_names.append('text_encoder_2_pooled_state')
-        
+        if not config.train_text_encoder_or_embedding():
+            output_names.append('text_encoder_1_hidden_state')
 
-        # Combine with concept info for sorting and final output mapping
+        if not config.train_text_encoder_2_or_embedding():
+            output_names.append('text_encoder_2_hidden_state')
+            output_names.append('text_encoder_2_pooled_state')
+
         sort_names = output_names + ['concept']
         output_names = output_names + [('concept.loss_weight', 'loss_weight')]
 
+        # add for calculating loss per concept
         if config.validation:
             output_names.append(('concept.name', 'concept_name'))
             output_names.append(('concept.path', 'concept_path'))
@@ -285,7 +206,6 @@ class StableDiffusionXLBaseDataLoader(
             model.eval()
             torch_gc()
 
-        # Call the base mixin method with potentially modified output_names and sort_names
         return self._output_modules_from_out_names(
             output_names=output_names,
             sort_names=sort_names,
@@ -375,7 +295,7 @@ class StableDiffusionXLBaseDataLoader(
         enumerate_input = self._enumerate_input_modules(config)
         load_input = self._load_input_modules(config, model.vae_train_dtype)
         mask_augmentation = self._mask_augmentation_modules(config)
-        aspect_bucketing_in = self._aspect_bucketing_in(config) # parametrizei o ratio do bucketing, vai hardcodar param de treino na puta que te pariu, Nerogar viado do caralho
+        aspect_bucketing_in = self._aspect_bucketing_in(config, 64)
         crop_modules = self._crop_modules(config)
         augmentation_modules = self._augmentation_modules(config)
         inpainting_modules = self._inpainting_modules(config)
@@ -404,133 +324,4 @@ class StableDiffusionXLBaseDataLoader(
             ],
             train_progress,
             is_validation,
-        )
-
-    # POR ENQUANTO FICA ASSIM, PRA USAR A LÓGICA ORIGINAL CASO LONG PROMPTS ESTEJA DESATIVADO
-    # depois vou inverter, e as funções originais vão ficar com os nomes originais e vice-versa    
-
-    def _preparation_modules_original(self, config: TrainConfig, model: StableDiffusionXLModel):
-        rescale_image = RescaleImageChannels(image_in_name='image', image_out_name='image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
-        rescale_conditioning_image = RescaleImageChannels(image_in_name='conditioning_image', image_out_name='conditioning_image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
-        encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
-        image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
-        downscale_mask = ScaleImage(in_name='mask', out_name='latent_mask', factor=0.125)
-        add_embeddings_to_prompt_1 = MapData(in_name='prompt', out_name='prompt_1', map_fn=model.add_text_encoder_1_embeddings_to_prompt)
-        add_embeddings_to_prompt_2 = MapData(in_name='prompt', out_name='prompt_2', map_fn=model.add_text_encoder_2_embeddings_to_prompt)
-        encode_conditioning_image = EncodeVAE(in_name='conditioning_image', out_name='latent_conditioning_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
-        conditioning_image_sample = SampleVAEDistribution(in_name='latent_conditioning_image_distribution', out_name='latent_conditioning_image', mode='mean')
-        tokenize_prompt_1 = Tokenize(in_name='prompt_1', tokens_out_name='tokens_1', mask_out_name='tokens_mask_1', tokenizer=model.tokenizer_1, max_token_length=model.tokenizer_1.model_max_length)
-        tokenize_prompt_2 = Tokenize(in_name='prompt_2', tokens_out_name='tokens_2', mask_out_name='tokens_mask_2', tokenizer=model.tokenizer_2, max_token_length=model.tokenizer_2.model_max_length)
-        encode_prompt_1 = EncodeClipText(in_name='tokens_1', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_1_hidden_state', pooled_out_name=None, add_layer_norm=False, text_encoder=model.text_encoder_1, hidden_state_output_index=-(2 + config.text_encoder_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-        encode_prompt_2 = EncodeClipText(in_name='tokens_2', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_2_hidden_state', pooled_out_name='text_encoder_2_pooled_state', add_layer_norm=False, text_encoder=model.text_encoder_2, hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-
-        modules = [
-            rescale_image, encode_image, image_sample,
-            add_embeddings_to_prompt_1, tokenize_prompt_1,
-            add_embeddings_to_prompt_2, tokenize_prompt_2,
-        ]
-
-        modules.extend([encode_image, image_sample])
-
-        if config.masked_training or config.model_type.has_mask_input():
-            modules.append(downscale_mask)
-
-        if config.model_type.has_conditioning_image_input():
-            modules.extend([rescale_conditioning_image, encode_conditioning_image, conditioning_image_sample])
-
-        if not config.train_text_encoder_or_embedding():
-            modules.append(encode_prompt_1)
-
-        if not config.train_text_encoder_2_or_embedding():
-            modules.append(encode_prompt_2)
-
-        return modules
-
-
-    def _cache_modules_original(self, config: TrainConfig, model: StableDiffusionXLModel):
-        image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
-        if config.masked_training or config.model_type.has_mask_input():
-            image_split_names.append('latent_mask')
-        if config.model_type.has_conditioning_image_input():
-            image_split_names.append('latent_conditioning_image')
-        image_aggregate_names = ['crop_resolution', 'image_path']
-
-        text_split_names = []
-        if not config.train_text_encoder_or_embedding():
-            text_split_names.extend(['tokens_1', 'text_encoder_1_hidden_state'])
-        if not config.train_text_encoder_2_or_embedding():
-            text_split_names.extend(['tokens_2', 'text_encoder_2_hidden_state', 'text_encoder_2_pooled_state'])
-
-        image_cache_dir = os.path.join(config.cache_dir, "image")
-        text_cache_dir = os.path.join(config.cache_dir, "text")
-
-        def before_cache_image_fun():
-            model.to(self.temp_device); model.vae_to(self.train_device); model.eval(); torch_gc()
-        def before_cache_text_fun():
-            model.to(self.temp_device)
-            if not config.train_text_encoder_or_embedding(): model.text_encoder_1_to(self.train_device)
-            if not config.train_text_encoder_2_or_embedding(): model.text_encoder_2_to(self.train_device)
-            model.eval(); torch_gc()
-
-        image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path','concept.seed','concept.include_subdirectories','concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
-        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path','concept.seed','concept.include_subdirectories','concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
-
-        modules = []
-        if config.latent_caching:
-            modules.append(image_disk_cache)
-            sort_names = image_aggregate_names + image_split_names + ['prompt_1','tokens_1','text_encoder_1_hidden_state','prompt_2','tokens_2','text_encoder_2_hidden_state','text_encoder_2_pooled_state','concept']
-            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
-            if text_split_names:
-                modules.append(text_disk_cache)
-                sort_names = [x for x in sort_names if x not in text_split_names]
-            if sort_names:
-                modules.append(VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path','concept.seed','concept.include_subdirectories','concept.text'], group_enabled_in_name='concept.enabled'))
-        return modules
-
-
-    def _output_modules_original(self, config: TrainConfig, model: StableDiffusionXLModel):
-        output_names = [
-            'image_path', 'latent_image',
-            'prompt_1', 'prompt_2',
-            'tokens_1', 'tokens_2',
-            'original_resolution', 'crop_resolution', 'crop_offset', 'prompt',
-        ]
-
-        if config.masked_training or config.model_type.has_mask_input():
-            output_names.append('latent_mask')
-
-        if config.model_type.has_conditioning_image_input():
-            output_names.append('latent_conditioning_image')
-
-        if not config.train_text_encoder_or_embedding():
-            output_names.append('text_encoder_1_hidden_state')
-
-        if not config.train_text_encoder_2_or_embedding():
-            output_names.append('text_encoder_2_hidden_state')
-            output_names.append('text_encoder_2_pooled_state')
-
-        sort_names = output_names + ['concept']
-        output_names = output_names + [('concept.loss_weight', 'loss_weight')]
-
-        # add for calculating loss per concept
-        if config.validation:
-            output_names.append(('concept.name', 'concept_name'))
-            output_names.append(('concept.path', 'concept_path'))
-            output_names.append(('concept.seed', 'concept_seed'))
-
-        def before_cache_image_fun():
-            model.to(self.temp_device)
-            model.vae_to(self.train_device)
-            model.eval()
-            torch_gc()
-
-        return self._output_modules_from_out_names(
-            output_names=output_names,
-            sort_names=sort_names,
-            config=config,
-            before_cache_image_fun=before_cache_image_fun,
-            use_conditioning_image=True,
-            vae=model.vae,
-            autocast_context=[model.autocast_context, model.vae_autocast_context],
-            train_dtype=model.vae_train_dtype,
         )

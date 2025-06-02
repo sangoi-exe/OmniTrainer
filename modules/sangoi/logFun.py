@@ -1,11 +1,7 @@
-# logFun.txt
-from rich.console import Console as RichConsole, Group # Adicionar Group aqui
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TaskProgressColumn
-from rich.live import Live
-from rich.panel import Panel
-from rich.text import Text
-from typing import Optional, Dict, Any
 import threading
+from rich.console import Console as RichConsole
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TaskProgressColumn
+from typing import Optional
 
 # Console global padrão
 _default_logfun_console = RichConsole()
@@ -13,7 +9,7 @@ _current_logfun_console = _default_logfun_console
 
 # Progress manager global
 _global_progress: Optional[Progress] = None
-# REMOVIDO: _progress_live não será mais gerenciado aqui
+
 # _progress_live: Optional[Live] = None 
 _progress_lock = threading.Lock()
 
@@ -43,9 +39,6 @@ def init_global_progress() -> Progress:
                 transient=False, # Tasks added to this progress object will remain after completion
                 refresh_per_second=4
             )
-            # REMOVIDO: O Live para este Progress será iniciado externamente.
-            # _progress_live = Live(...)
-            # _progress_live.start()
     
     return _global_progress
 
@@ -54,10 +47,6 @@ def cleanup_global_progress():
     global _global_progress
     
     with _progress_lock:
-        # REMOVIDO: Não há _progress_live para parar aqui
-        # if _progress_live:
-        #     _progress_live.stop()
-        #     _progress_live = None
         if _global_progress:
             _global_progress = None
 
@@ -72,7 +61,6 @@ def create_progress_task(description: str, total: int) -> int:
     Returns:
         task_id para usar nas atualizações
     """
-    # init_global_progress agora apenas retorna o objeto Progress, sem iniciar Live.
     progress = init_global_progress() 
     return progress.add_task(description, total=total)
 

@@ -39,161 +39,147 @@ class BaseStableDiffusionXLSetup(
 ):
 
   def setup_optimizations(
-      self,
-      model: StableDiffusionXLModel,
-      config: TrainConfig,
+          self,
+          model: StableDiffusionXLModel,
+          config: TrainConfig,
   ):
-    model.unet_offload_conductor = None # Inicializa como None
-    # model.text_encoder_1_offload_conductor = None # Não usado para CLIP, mas boa prática zerar
-    # model.text_encoder_2_offload_conductor = None # Não usado para CLIP, mas boa prática zerar
-    
-    if config.gradient_checkpointing.enabled():
-      # Limpa/Inicializa os possíveis condutores
-      model.unet_offload_conductor = None
-      model.text_encoder_1_offload_conductor = None # Não usado para CLIP, mas seguro zerar
-      model.text_encoder_2_offload_conductor = None # Não usado para CLIP, mas seguro zerar
+      if config.gradient_checkpointing.enabled():
+          model.unet.enable_gradient_checkpointing()
+          enable_checkpointing_for_basic_transformer_blocks(model.unet, config, offload_enabled=False)
+          enable_checkpointing_for_clip_encoder_layers(model.text_encoder_1, config)
+          enable_checkpointing_for_clip_encoder_layers(model.text_encoder_2, config)
 
-    # Aplica checkpointing se não estiver OFF
-    if config.gradient_checkpointing != GradientCheckpointingMethod.OFF:
-      # Chama as funções modificadas. Elas decidirão internamente se aplicam
-      # checkpointing baseado em config.gradient_checkpointing_layers se o modo for ON.
-      # Passamos offload_enabled=True para permitir que a função crie o conductor se o modo for CPU_OFFLOADED.
-      unet_conductor_or_none = enable_checkpointing_for_basic_transformer_blocks(model.unet, config, offload_enabled=True)
-      enable_checkpointing_for_clip_encoder_layers(model.text_encoder_1, config)
-      enable_checkpointing_for_clip_encoder_layers(model.text_encoder_2, config)
+      if config.force_circular_padding:
+          apply_circular_padding_to_conv2d(model.vae)
+          apply_circular_padding_to_conv2d(model.unet)
+          if model.unet_lora is not None:
+              apply_circular_padding_to_conv2d(model.unet_lora)
 
-      # Atribui o conductor retornado APENAS se o modo for CPU_OFFLOADED
-      if config.gradient_checkpointing == GradientCheckpointingMethod.CPU_OFFLOADED:
-        model.unet_offload_conductor = unet_conductor_or_none
+      model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
+          config.weight_dtypes().unet,
+          config.weight_dtypes().text_encoder,
+          config.weight_dtypes().text_encoder_2,
+          config.weight_dtypes().vae,
+          config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
+          config.weight_dtypes().embedding if config.train_any_embedding() else None,
+      ], config.enable_autocast_cache)
 
-    if config.force_circular_padding:
-      apply_circular_padding_to_conv2d(model.vae)
-      apply_circular_padding_to_conv2d(model.unet)
-      if model.unet_lora is not None:
-        apply_circular_padding_to_conv2d(model.unet_lora)
+      model.vae_autocast_context, model.vae_train_dtype = disable_fp16_autocast_context(
+          self.train_device,
+          config.train_dtype,
+          config.fallback_train_dtype,
+          [
+              config.weight_dtypes().vae,
+          ],
+          config.enable_autocast_cache,
+      )
 
-    model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
-      config.weight_dtypes().unet,
-      config.weight_dtypes().text_encoder,
-      config.weight_dtypes().text_encoder_2,
-      config.weight_dtypes().vae,
-      config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
-      config.weight_dtypes().embedding if config.train_any_embedding() else None,
-    ], config.enable_autocast_cache)
+      quantize_layers(model.text_encoder_1, self.train_device, model.train_dtype)
+      quantize_layers(model.text_encoder_2, self.train_device, model.train_dtype)
+      quantize_layers(model.vae, self.train_device, model.vae_train_dtype)
+      quantize_layers(model.unet, self.train_device, model.train_dtype)
 
-    model.vae_autocast_context, model.vae_train_dtype = disable_fp16_autocast_context(
-      self.train_device,
-      config.train_dtype,
-      config.fallback_train_dtype,
-      [
-        config.weight_dtypes().vae,
-      ],
-      config.enable_autocast_cache,
-    )
-
-    quantize_layers(model.text_encoder_1, self.train_device, model.train_dtype)
-    quantize_layers(model.text_encoder_2, self.train_device, model.train_dtype)
-    quantize_layers(model.vae, self.train_device, model.vae_train_dtype)
-    quantize_layers(model.unet, self.train_device, model.train_dtype)
     
   def _setup_embeddings(
-      self,
-      model: StableDiffusionXLModel,
-      config: TrainConfig,
+          self,
+          model: StableDiffusionXLModel,
+          config: TrainConfig,
   ):
-    additional_embeddings = []
-    for embedding_config in config.all_embedding_configs():
-      embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
-      if embedding_state is None:
-        embedding_state_1 = self._create_new_embedding(
-          embedding_config,
-          model.tokenizer_1,
-          model.text_encoder_1,
-          lambda text: model.encode_text(
-            text=text,
-            train_device=self.temp_device,
-          )[0][0][1:],
-        )
+      additional_embeddings = []
+      for embedding_config in config.all_embedding_configs():
+          embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
+          if embedding_state is None:
+              embedding_state_1 = self._create_new_embedding(
+                  model,
+                  embedding_config,
+                  model.tokenizer_1,
+                  model.text_encoder_1,
+                  lambda text: model.encode_text(
+                      text=text,
+                      train_device=self.temp_device,
+                  )[0][0][1:],
+              )
 
-        embedding_state_2 = self._create_new_embedding(
-          embedding_config,
-          model.tokenizer_2,
-          model.text_encoder_2,
-          lambda text: model.encode_text(
-            text=text,
-            train_device=self.temp_device,
-          )[1][0][1:],
-        )
-      else:
-        embedding_state_1 = embedding_state.get("clip_l_out", embedding_state.get("clip_l", None))
-        embedding_state_2 = embedding_state.get("clip_g_out", embedding_state.get("clip_g", None))
+              embedding_state_2 = self._create_new_embedding(
+                  model,
+                  embedding_config,
+                  model.tokenizer_2,
+                  model.text_encoder_2,
+                  lambda text: model.encode_text(
+                      text=text,
+                      train_device=self.temp_device,
+                  )[1][0][1:],
+              )
+          else:
+              embedding_state_1 = embedding_state.get("clip_l_out", embedding_state.get("clip_l", None))
+              embedding_state_2 = embedding_state.get("clip_g_out", embedding_state.get("clip_g", None))
 
-      embedding_state_1 = embedding_state_1.to(
-        dtype=model.text_encoder_1.get_input_embeddings().weight.dtype,
-        device=self.train_device,
-      ).detach()
+          embedding_state_1 = embedding_state_1.to(
+              dtype=model.text_encoder_1.get_input_embeddings().weight.dtype,
+              device=self.train_device,
+          ).detach()
 
-      embedding_state_2 = embedding_state_2.to(
-        dtype=model.text_encoder_2.get_input_embeddings().weight.dtype,
-        device=self.train_device,
-      ).detach()
+          embedding_state_2 = embedding_state_2.to(
+              dtype=model.text_encoder_2.get_input_embeddings().weight.dtype,
+              device=self.train_device,
+          ).detach()
 
-      embedding = StableDiffusionXLModelEmbedding(
-        embedding_config.uuid,
-        embedding_state_1,
-        embedding_state_2,
-        embedding_config.placeholder,
-        embedding_config.is_output_embedding,
-      )
-      if embedding_config.uuid == config.embedding.uuid:
-        model.embedding = embedding
-      else:
-        additional_embeddings.append(embedding)
+          embedding = StableDiffusionXLModelEmbedding(
+              embedding_config.uuid,
+              embedding_state_1,
+              embedding_state_2,
+              embedding_config.placeholder,
+              embedding_config.is_output_embedding,
+          )
+          if embedding_config.uuid == config.embedding.uuid:
+              model.embedding = embedding
+          else:
+              additional_embeddings.append(embedding)
 
-    model.additional_embeddings = additional_embeddings
+      model.additional_embeddings = additional_embeddings
 
-    self._add_embeddings_to_tokenizer(model.tokenizer_1, model.all_text_encoder_1_embeddings())
-    self._add_embeddings_to_tokenizer(model.tokenizer_2, model.all_text_encoder_2_embeddings())
+      self._add_embeddings_to_tokenizer(model.tokenizer_1, model.all_text_encoder_1_embeddings())
+      self._add_embeddings_to_tokenizer(model.tokenizer_2, model.all_text_encoder_2_embeddings())
 
   def _setup_embedding_wrapper(
-      self,
-      model: StableDiffusionXLModel,
-      config: TrainConfig,
+          self,
+          model: StableDiffusionXLModel,
+          config: TrainConfig,
   ):
-    model.embedding_wrapper_1 = AdditionalEmbeddingWrapper(
-      tokenizer=model.tokenizer_1,
-      orig_module=model.text_encoder_1.text_model.embeddings.token_embedding,
-      embeddings=model.all_text_encoder_1_embeddings(),
-    )
-    model.embedding_wrapper_2 = AdditionalEmbeddingWrapper(
-      tokenizer=model.tokenizer_2,
-      orig_module=model.text_encoder_2.text_model.embeddings.token_embedding,
-      embeddings=model.all_text_encoder_2_embeddings(),
-    )
+      model.embedding_wrapper_1 = AdditionalEmbeddingWrapper(
+          tokenizer=model.tokenizer_1,
+          orig_module=model.text_encoder_1.text_model.embeddings.token_embedding,
+          embeddings=model.all_text_encoder_1_embeddings(),
+      )
+      model.embedding_wrapper_2 = AdditionalEmbeddingWrapper(
+          tokenizer=model.tokenizer_2,
+          orig_module=model.text_encoder_2.text_model.embeddings.token_embedding,
+          embeddings=model.all_text_encoder_2_embeddings(),
+      )
 
-    model.embedding_wrapper_1.hook_to_module()
-    model.embedding_wrapper_2.hook_to_module()
+      model.embedding_wrapper_1.hook_to_module()
+      model.embedding_wrapper_2.hook_to_module()
 
   def _setup_embeddings_requires_grad(
-      self,
-      model: StableDiffusionXLModel,
-      config: TrainConfig,
+          self,
+          model: StableDiffusionXLModel,
+          config: TrainConfig,
   ):
-    for embedding, embedding_config in zip(model.all_text_encoder_1_embeddings(),
-                         config.all_embedding_configs(), strict=True):
-      train_embedding_1 = \
-        embedding_config.train \
-        and config.text_encoder.train_embedding \
-        and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
-      embedding.requires_grad_(train_embedding_1)
+      for embedding, embedding_config in zip(model.all_text_encoder_1_embeddings(),
+                                              config.all_embedding_configs(), strict=True):
+          train_embedding_1 = \
+              embedding_config.train \
+              and config.text_encoder.train_embedding \
+              and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+          embedding.requires_grad_(train_embedding_1)
 
-    for embedding, embedding_config in zip(model.all_text_encoder_2_embeddings(),
-                         config.all_embedding_configs(), strict=True):
-      train_embedding_2 = \
-        embedding_config.train \
-        and config.text_encoder_2.train_embedding \
-        and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
-      embedding.requires_grad_(train_embedding_2)
+      for embedding, embedding_config in zip(model.all_text_encoder_2_embeddings(),
+                                              config.all_embedding_configs(), strict=True):
+          train_embedding_2 = \
+              embedding_config.train \
+              and config.text_encoder_2.train_embedding \
+              and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+          embedding.requires_grad_(train_embedding_2)
 
   def predict(
       self,
@@ -221,85 +207,30 @@ class BaseStableDiffusionXLSetup(
 
       vae_scaling_factor = model.vae.config['scaling_factor']
 
-      # // Sessão DBG - Início da depuração do prompt
-      if config.debugoi:
-          print(f"// Sessão DBG - predict: Tipo de batch['prompt']: {type(batch['prompt'])}")
-          if isinstance(batch['prompt'], list):
-              print(f"// Sessão DBG - predict: batch['prompt'] (primeiros 3 itens): {batch['prompt'][:3]}")
-          else:
-              print(f"// Sessão DBG - predict: batch['prompt'] (inteiro): {batch['prompt']}")
-            # // Sessão DBG - Fim da depuração do prompt			
-
       text_encoder_output, pooled_text_encoder_2_output = model.combine_text_encoder_output(*model.encode_text(
-        train_device=self.train_device,
-        batch_size=batch['latent_image'].shape[0],
-        rand=rand,
-        tokens_1=batch['tokens_1'],
-        tokens_2=batch['tokens_2'],
-        text_encoder_1_layer_skip=config.text_encoder_layer_skip,
-        text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-
-        # só busco hidden_states do batch se estivermos usando o pipeline normal (não long prompts)
-        text_encoder_1_output=(
-            batch['text_encoder_1_hidden_state']
-            if not config.train_text_encoder_or_embedding() and not config.enable_long_prompts
-            else None
-        ),
-        text_encoder_2_output=(
-            batch['text_encoder_2_hidden_state']
-            if not config.train_text_encoder_2_or_embedding() and not config.enable_long_prompts
-            else None
-        ),
-        pooled_text_encoder_2_output=(
-            batch['text_encoder_2_pooled_state']
-            if not config.train_text_encoder_2_or_embedding() and not config.enable_long_prompts
-            else None
-        ),
-        # e, para long prompts, passe o texto bruto em vez de tokens
-        text=(
-            batch['prompt']
-            if config.enable_long_prompts
-            else None
-        ),
-
-        text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
-        text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
+          train_device=self.train_device,
+          batch_size=batch['latent_image'].shape[0],
+          rand=rand,
+          tokens_1=batch['tokens_1'],
+          tokens_2=batch['tokens_2'],
+          text_encoder_1_layer_skip=config.text_encoder_layer_skip,
+          text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
+          text_encoder_1_output=batch[
+              'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
+          text_encoder_2_output=batch[
+              'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
+          pooled_text_encoder_2_output=batch[
+              'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+          text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
+          text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
       ))
 
-      # // Sessão DBG - Depuração após encode_text e combine_text_encoder_output
-      if config.debugoi:
-          print(f"// Sessão DBG - predict: Após encode_text/combine_text_encoder_output:")
-          if text_encoder_output is not None:
-              print(f"// Sessão DBG - predict: text_encoder_output.shape: {text_encoder_output.shape}, .device: {text_encoder_output.device}")
-              print(f"// Sessão DBG - predict: text_encoder_output.dtype: {text_encoder_output.dtype}")
-              print(f"// Sessão DBG - predict: text_encoder_output.mean(): {text_encoder_output.mean().item():.4f}, .std(): {text_encoder_output.std().item():.4f}")
-          else:
-              print(f"// Sessão DBG - predict: text_encoder_output is None.")
-          
-          if pooled_text_encoder_2_output is not None:
-              print(f"// Sessão DBG - predict: pooled_text_encoder_2_output.shape: {pooled_text_encoder_2_output.shape}, .device: {pooled_text_encoder_2_output.device}")
-              print(f"// Sessão DBG - predict: pooled_text_encoder_2_output.dtype: {pooled_text_encoder_2_output.dtype}")
-              print(f"// Sessão DBG - predict: pooled_text_encoder_2_output.mean(): {pooled_text_encoder_2_output.mean().item():.4f}, .std(): {pooled_text_encoder_2_output.std().item():.4f}")
-          else:
-              print(f"// Sessão DBG - predict: pooled_text_encoder_2_output is None.")
-
-          # Inspecionar inputs para o UNet
-          print(f"// Sessão DBG - predict: Inputs para model.unet:")
-          print(f"// Sessão DBG - predict: UNet encoder_hidden_states.shape: {text_encoder_output.shape if text_encoder_output is not None else 'None'}")
-          if text_encoder_output is not None:
-              print(f"// Sessão DBG - predict: UNet encoder_hidden_states.device: {text_encoder_output.device}")
-          print(f"// Sessão DBG - predict: UNet added_cond_kwargs['text_embeds'].shape: {pooled_text_encoder_2_output.shape if pooled_text_encoder_2_output is not None else 'None'}")
-          if pooled_text_encoder_2_output is not None:
-              print(f"// Sessão DBG - predict: UNet added_cond_kwargs['text_embeds'].device: {pooled_text_encoder_2_output.device}")
-
-      # // Sessão DBG - Fim da depuração
-
-      latent_image = batch['latent_image'].to(device=self.train_device, memory_format=torch.channels_last)
+      latent_image = batch['latent_image']
       scaled_latent_image = latent_image * vae_scaling_factor
 
       scaled_latent_conditioning_image = None
       if config.model_type.has_conditioning_image_input():
-        batch['latent_conditioning_image'] = batch['latent_conditioning_image'].to(device=self.train_device, memory_format=torch.channels_last)
+        batch['latent_conditioning_image'] = batch['latent_conditioning_image']
         scaled_latent_conditioning_image = batch['latent_conditioning_image'] * vae_scaling_factor
 
       latent_noise = self._create_noise(scaled_latent_image, config, generator)
@@ -329,75 +260,51 @@ class BaseStableDiffusionXLSetup(
       target_width = batch['crop_resolution'][1]
 
       add_time_ids = torch.stack([
-        original_height,
-        original_width,
-        crops_coords_top,
-        crops_coords_left,
-        target_height,
-        target_width
+          original_height,
+          original_width,
+          crops_coords_top,
+          crops_coords_left,
+          target_height,
+          target_width
       ], dim=1)
 
       add_time_ids = add_time_ids.to(
-        dtype=scaled_noisy_latent_image.dtype,
-        device=scaled_noisy_latent_image.device,
+          dtype=scaled_noisy_latent_image.dtype,
+          device=scaled_noisy_latent_image.device,
       )
-
-      # <<< CHATGPT ADD – põe embeddings/hidden-states no mesmo CUDA do UNet >>>
-      text_encoder_output = text_encoder_output.to(
-        device=self.train_device,
-        dtype=model.train_dtype.torch_dtype(),
-        non_blocking=True,
-      )
-      if pooled_text_encoder_2_output is not None:
-        pooled_text_encoder_2_output = pooled_text_encoder_2_output.to(
-          device=self.train_device,
-          dtype=model.train_dtype.torch_dtype(),
-          non_blocking=True,
-        )
 
       if config.model_type.has_mask_input() and config.model_type.has_conditioning_image_input():
-        latent_input = torch.concat(
-          [
-            scaled_noisy_latent_image,
-            batch['latent_mask'].to(self.train_device, non_blocking=True),
-            scaled_latent_conditioning_image,
-          ],
-          dim=1,
-        )
+          latent_input = torch.concat(
+              [scaled_noisy_latent_image, batch['latent_mask'], scaled_latent_conditioning_image], 1
+          )
       else:
-        latent_input = scaled_noisy_latent_image
+          latent_input = scaled_noisy_latent_image
 
-      added_cond_kwargs = {
-        "text_embeds": pooled_text_encoder_2_output,
-        "time_ids": add_time_ids,
-      }
+      added_cond_kwargs = {"text_embeds": pooled_text_encoder_2_output, "time_ids": add_time_ids}
       predicted_latent_noise = model.unet(
-        sample=latent_input.to(
-          device=self.train_device,
-          dtype=model.train_dtype.torch_dtype(),
-        ),
-        timestep=timestep,
-        encoder_hidden_states=text_encoder_output,
-        added_cond_kwargs=added_cond_kwargs,
+          sample=latent_input.to(dtype=model.train_dtype.torch_dtype()),
+          timestep=timestep,
+          encoder_hidden_states=text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
+          added_cond_kwargs=added_cond_kwargs,
       ).sample
 
       model_output_data = {}
 
       if model.noise_scheduler.config.prediction_type == 'epsilon':
-        model_output_data = {
-          'loss_type': 'target',
-          'timestep': timestep,
-          'predicted': predicted_latent_noise,
-          'target': latent_noise,
-        }
+          model_output_data = {
+              'loss_type': 'target',
+              'timestep': timestep,
+              'predicted': predicted_latent_noise,
+              'target': latent_noise,
+          }
       elif model.noise_scheduler.config.prediction_type == 'v_prediction':
-        target_velocity = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
-        model_output_data = {
-          'loss_type': 'target',
-          'timestep': timestep,
-          'predicted': predicted_latent_noise,
-          'target': target_velocity,
-        }
+          target_velocity = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
+          model_output_data = {
+              'loss_type': 'target',
+              'timestep': timestep,
+              'predicted': predicted_latent_noise,
+              'target': target_velocity,
+          }
       if config.debug_mode or config.save_predictions:
         with torch.no_grad():
           self._save_text(

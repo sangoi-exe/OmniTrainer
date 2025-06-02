@@ -283,11 +283,8 @@ class TrainConfig(BaseConfig):
     sangoi_schedule: bool
     alpha_sangoi: float
     enable_tf: bool
+    sangoi_loss_blend_window: float
     
-    # text encoder long prompts
-    enable_long_prompts: bool # Habilita o processamento de prompts > 77 tokens
-    long_prompt_max_chunks: int     
-
     # delta pattern settings
     train_gps_save_it: bool
     train_gps_use_it: bool
@@ -422,7 +419,7 @@ class TrainConfig(BaseConfig):
     lora_alpha: float
     lora_decompose: bool
     lora_decompose_norm_epsilon: bool
-    lora_decompose_output_axis: bool
+    lora_scale_rowwise: bool
     lora_weight_dtype: DataType
     lora_layers: str  # comma-separated
     lora_layer_preset: str
@@ -821,9 +818,6 @@ class TrainConfig(BaseConfig):
         data.append(("data_recorder", False, bool, False))
         data.append(("convctrl_use_it", False, bool, False))
         data.append(("run_number", 1, int, False))        
-        # text encoder long prompt
-        data.append(("enable_long_prompts", False, bool, False))
-        data.append(("long_prompt_max_chunks", 4, int, False))
         
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
@@ -980,7 +974,7 @@ class TrainConfig(BaseConfig):
         data.append(("lora_alpha", 1.0, float, False))
         data.append(("lora_decompose", False, bool, False))
         data.append(("lora_decompose_norm_epsilon", True, bool, False))
-        data.append(("lora_decompose_output_axis", False, bool, False))
+        data.append(("lora_scale_rowwise", True, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("lora_layers", "", str, False))
         data.append(("lora_layer_preset", None, str, True))

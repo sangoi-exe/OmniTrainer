@@ -51,11 +51,6 @@ class SangoiTab:
                          tooltip="Generate a txt with lora layers that is going to be trained")
         components.switch(self.main_frame, row_index, 1, self.ui_state, "gen_lora_keys")
         
-        # Slot 2
-        components.label(self.main_frame, row_index, 2, "Use Long Prompts",
-                         tooltip="Process more than 77 tokens")
-        components.switch(self.main_frame, row_index, 3, self.ui_state, "enable_long_prompts")
-
         # Slot 3 (cols 4, 5) fica em branco
         components.label(self.main_frame, row_index, 4, "Sangoi Debug",
                          tooltip="Debug pros meus badalhos")
