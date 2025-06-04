@@ -132,6 +132,7 @@ class GenericTrainer(BaseTrainer):
         self.train_device = torch.device(getattr(self.config, "train_device"))
 
         self.console = RichConsole()
+        set_logfun_console(self.console)
 
         self._num_total_epochs = config.epochs
 
@@ -141,7 +142,7 @@ class GenericTrainer(BaseTrainer):
         current_ema_loss: Optional[float] = None
         ) -> Panel:
         """Cria o conteúdo do painel principal de treinamento com dados atualizados."""
-        tp = self.model.train_progress if self.model and hasattr(self.model, 'train_progress') else None
+        tp = self.model.train_progress
 
         # Linha 1: Progresso Epoch/Step
         epoch_str = f"Epoch: {tp.epoch + 1}/{self._num_total_epochs}" if tp else f"Epoch: ?/{self._num_total_epochs}"
@@ -219,6 +220,7 @@ class GenericTrainer(BaseTrainer):
         if self._global_progress_instance is None:
             self._global_progress_instance = init_global_progress() # Isso agora *apenas cria* o objeto Progress
 
+        # Conteúdo do painel de status
         status_panel_content = self._create_training_display_content(current_loss, current_ema_loss)
 
         # Cria um Group contendo o painel de status e a barra de progresso global
@@ -268,10 +270,6 @@ class GenericTrainer(BaseTrainer):
 
         if self.config.clear_cache_before_training and self.config.latent_caching:
             self.__clear_cache()
-
-        if self.config.train_dtype.enable_tf():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
 
         self.model_loader = self.create_model_loader()
         self.model_setup = self.create_model_setup()
@@ -326,6 +324,9 @@ class GenericTrainer(BaseTrainer):
         self.callbacks.on_update_status("creating the data loader/caching")
 
         self.data_loader = self.create_data_loader(self.model, self.model.train_progress)
+        self._steps_per_epoch = self.data_loader.get_data_set().approximate_length() # Pega o total de steps para a epoch atual
+        print("self._steps_per_epoch", self._steps_per_epoch)
+
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -968,8 +969,6 @@ class GenericTrainer(BaseTrainer):
             for _epoch in range(train_progress.epoch, self.config.epochs, 1):
 
                 self._epoch_start_time_s = time.monotonic()
-                self._steps_per_epoch = self.data_loader.get_data_set().approximate_length(
-                )  # Pega o total de steps para a epoch atual
 
                 if self.is_paused:
                     logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="info")
@@ -1059,45 +1058,59 @@ class GenericTrainer(BaseTrainer):
                             self.model_setup.setup_train_device(self.model, self.config)
 
                     with TorchMemoryRecorder(enabled=False):
-                        max_attempts = 5
-                        start_tau = 0.85
-                        end_tau = 0.60
+                        retry_infinite = getattr(self.config, "retry_infinite", False)
+                        max_tau_increments = getattr(self.config, "max_tau_increments", 10)
+                        attempts_per_increment = getattr(self.config, "attempts_per_increment", 2)
+                        tau_increment_amount = getattr(self.config, "tau_increment_amount", 0.02)
+
+                        max_total_attempts = (
+                            math.inf if retry_infinite
+                            else 1 + max_tau_increments * attempts_per_increment
+                        )
+
+                        # --- agendamento do τ base (cosine) ---
+                        initial_tau = 0.85
+                        end_tau     = 0.70
                         total_steps = self.model.train_config.epochs * self.data_loader.get_data_set().approximate_length()
-                        progress = self.model.train_progress.global_step / max(total_steps - 1, 1)
+                        progress    = self.model.train_progress.global_step / max(total_steps - 1, 1)
                         cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                        tau = end_tau + (start_tau - end_tau) * cosine_factor          
-                        
-                        if train_progress.global_step % 100 == 0:
-                            logFun(f"Tau atual: {tau}")
-                            logFun(f"Predicts descartados: {discard_counter}")
+                        base_tau    = end_tau + (initial_tau - end_tau) * cosine_factor  # <-- renomeado
 
-                        # Variável para armazenar o model_output_data da tentativa bem-sucedida
-                        successful_model_output_data = None
-                        final_ssim_val = None
+                        discard_counter = locals().get("discard_counter", 0)
+                        prediction_successful_for_step = False
+                        attempt_idx = 0
+                        current_increment_idx = 0
+                        current_tau_for_attempt = base_tau
 
-                        for attempt_num in range(max_attempts):                            
-                            # Obter uma nova predição a cada tentativa
-                            current_model_output_data = self.model_setup.predict(
-                                self.model,
-                                batch,
-                                self.config,
-                                train_progress,
-                            )
+                        while attempt_idx < max_total_attempts:
+                            if self.config.debugoi: logFun(f"Tentativa {attempt_idx + 1}, τ = {current_tau_for_attempt:.4f}")
+
+                            out = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
                             current_ssim_val = self.latent_ssim(
-                                current_model_output_data["predicted_image_latent"],
-                                current_model_output_data["target_image_latent"],
+                                out["predicted_image_latent"], out["target_image_latent"]
                             )
 
-                            if current_ssim_val < tau: # Condição de sucesso
-                                successful_model_output_data = current_model_output_data
+                            if current_ssim_val < current_tau_for_attempt:
+                                successful_model_output_data = out
                                 final_ssim_val = current_ssim_val
-                                break # Sai do loop de tentativas
-                            else: 
+                                prediction_successful_for_step = True
+                                break
+                            else:
                                 discard_counter += 1
-                        else: # O loop 'for' completou sem um 'break'
-                            logFun(f"Nenhuma predição atingiu o tau {tau} após {max_attempts} tentativas. Pulando step {train_progress.global_step}.", lvl="warning")
-                            continue # Pula para a próxima iteração do loop de treino principal
+
+                            attempt_idx += 1
+
+                            if not retry_infinite and attempt_idx >= max_total_attempts:
+                                break
+
+                            if attempt_idx % attempts_per_increment == 0:
+                                current_increment_idx += 1
+                                current_tau_for_attempt = base_tau + current_increment_idx * tau_increment_amount
+
+                        if not prediction_successful_for_step:
+                            successful_model_output_data = out
+                            final_ssim_val = current_ssim_val
                         
                         # Se chegamos aqui, successful_model_output_data contém a predição válida
                         model_output_data = successful_model_output_data # Usar o nome de variável principal

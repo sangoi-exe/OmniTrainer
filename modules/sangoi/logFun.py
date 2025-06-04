@@ -1,3 +1,4 @@
+import logging
 import threading
 from rich.console import Console as RichConsole
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TaskProgressColumn
