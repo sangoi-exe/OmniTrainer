@@ -135,6 +135,10 @@ class GenericTrainer(BaseTrainer):
         set_logfun_console(self.console)
 
         self._num_total_epochs = config.epochs
+        self.timestep_perf = torch.zeros(1000, device=self.config.train_device)
+        self.timestep_count = torch.zeros_like(self.timestep_perf, dtype=torch.long)
+        self.ema_alpha = getattr(self.config, "timestep_perf_ema_alpha", 0.9)
+        self.burn_in_steps = getattr(self.config, "timestep_burn_in_steps", 1000)        
 
     def _create_training_display_content(
         self,
@@ -1058,70 +1062,11 @@ class GenericTrainer(BaseTrainer):
                             self.model_setup.setup_train_device(self.model, self.config)
 
                     with TorchMemoryRecorder(enabled=False):
-                        retry_infinite = getattr(self.config, "retry_infinite", False)
-                        max_tau_increments = getattr(self.config, "max_tau_increments", 10)
-                        attempts_per_increment = getattr(self.config, "attempts_per_increment", 2)
-                        tau_increment_amount = getattr(self.config, "tau_increment_amount", 0.02)
-
-                        max_total_attempts = (
-                            math.inf if retry_infinite
-                            else 1 + max_tau_increments * attempts_per_increment
-                        )
-
-                        # --- agendamento do τ base (cosine) ---
-                        initial_tau = 0.85
-                        end_tau     = 0.70
-                        total_steps = self.model.train_config.epochs * self.data_loader.get_data_set().approximate_length()
-                        progress    = self.model.train_progress.global_step / max(total_steps - 1, 1)
-                        cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                        base_tau    = end_tau + (initial_tau - end_tau) * cosine_factor  # <-- renomeado
-
-                        discard_counter = locals().get("discard_counter", 0)
-                        prediction_successful_for_step = False
-                        attempt_idx = 0
-                        current_increment_idx = 0
-                        current_tau_for_attempt = base_tau
-
-                        while attempt_idx < max_total_attempts:
-                            if self.config.debugoi: logFun(f"Tentativa {attempt_idx + 1}, τ = {current_tau_for_attempt:.4f}")
-
-                            out = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                            current_ssim_val = self.latent_ssim(
-                                out["predicted_image_latent"], out["target_image_latent"]
-                            )
-
-                            if current_ssim_val < current_tau_for_attempt:
-                                successful_model_output_data = out
-                                final_ssim_val = current_ssim_val
-                                prediction_successful_for_step = True
-                                break
-                            else:
-                                discard_counter += 1
-
-                            attempt_idx += 1
-
-                            if not retry_infinite and attempt_idx >= max_total_attempts:
-                                break
-
-                            if attempt_idx % attempts_per_increment == 0:
-                                current_increment_idx += 1
-                                current_tau_for_attempt = base_tau + current_increment_idx * tau_increment_amount
-
-                        if not prediction_successful_for_step:
-                            successful_model_output_data = out
-                            final_ssim_val = current_ssim_val
-                        
-                        # Se chegamos aqui, successful_model_output_data contém a predição válida
-                        model_output_data = successful_model_output_data # Usar o nome de variável principal
-                        ssim_val = final_ssim_val
-
-                        self.tensorboard.add_scalar(
-                            "sangoi/ssim_val",
-                            ssim_val,
-                            train_progress.global_step,
+                        model_output_data = self.model_setup.predict(
+                            self.model, batch, self.config, train_progress
                         )
                         
+                        t_used = getattr(self.model_setup, "current_timestep", None)                        
                         predicted_tensor_from_model = model_output_data["predicted"] # Saída bruta do modelo (e.g., bf16)
                         
                         mask_fp32 = None
@@ -1148,10 +1093,21 @@ class GenericTrainer(BaseTrainer):
                         )
 
                         loss = loss / self.config.gradient_accumulation_steps
-                        
+
                         if self.config.debugoi:
                             predicted_tensor_from_model.retain_grad()
-                                                        
+
+                        # START update_timestep_perf
+                        if t_used is not None and train_progress.global_step >= 0:
+                            # no batch=1, t_used pode ser um tensor de shape (1,), então faz:
+                            t_idx = t_used.item() if isinstance(t_used, Tensor) else int(t_used)
+                            l_scalar = loss.item()
+                            # EMA de loss por timestep
+                            prev = float(self.timestep_perf[t_idx])
+                            self.timestep_perf[t_idx] = self.ema_alpha * prev + (1 - self.ema_alpha) * l_scalar
+                            self.timestep_count[t_idx] += 1
+                        # END update_timestep_perf
+
                         if scaler:
                             scaler.scale(loss).backward()
                         else:
@@ -1242,6 +1198,48 @@ class GenericTrainer(BaseTrainer):
 
                     train_progress.next_step(self.config.batch_size)
                     self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+                # START adjust_timestep_counts
+                # só atualiza após burn-in (pelo menos uma época completa)
+                if train_progress.global_step >= self.burn_in_steps:
+                    num_timesteps = 1000
+                    steps_per_epoch = self._steps_per_epoch  # já configurado no start
+                    # 1) base_counts: distribuição estratificada pura
+                    base = steps_per_epoch // num_timesteps
+                    rem  = steps_per_epoch % num_timesteps
+                    base_counts = torch.full(
+                        (num_timesteps,), 
+                        base, 
+                        dtype=torch.long, 
+                        device=self.config.train_device
+                    )
+                    if rem > 0:
+                        base_counts[:rem] += 1
+
+                    # 2) calcular adj_factor a partir de perf (norm e clamp)
+                    perf = self.timestep_perf.clone()
+                    # evita dividir por zero
+                    mn, mx = float(perf.min()), float(perf.max())
+                    perf_norm = (perf - mn) / (mx - mn + 1e-8)
+                    scale = getattr(self.config, "timestep_adj_scale", 0.5)
+                    adj_factor = (1.0 + (perf_norm - 0.5) * scale).clamp(0.7, 1.3)
+
+                    # 3) alloc = base_counts * adj_factor; normaliza para steps_per_epoch
+                    alloc = (base_counts.float() * adj_factor).round().to(dtype=torch.long)
+                    total_alloc = int(alloc.sum().item())
+                    # se sobrar, diminui dos maiores
+                    while total_alloc > steps_per_epoch:
+                        idx_max = int(torch.argmax(alloc))
+                        alloc[idx_max] -= 1
+                        total_alloc -= 1
+                    # se faltar, distribui +1 para timesteps com maior adj_factor
+                    while total_alloc < steps_per_epoch:
+                        idx_max = int(torch.argmax(adj_factor))
+                        alloc[idx_max] += 1
+                        total_alloc += 1
+
+                    # 4) finalmente passa esta alloc para o mixin
+                    self.model_setup.set_epoch_timestep_alloc(alloc)
 
                 train_progress.next_epoch() # Avança a epoch para a próxima iteração do loop externo
                 

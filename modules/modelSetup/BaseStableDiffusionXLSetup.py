@@ -1,5 +1,6 @@
 from abc import ABCMeta
 from random import Random
+from typing import Optional
 
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel, StableDiffusionXLModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
@@ -187,9 +188,11 @@ class BaseStableDiffusionXLSetup(
       batch: dict,
       config: TrainConfig,
       train_progress: TrainProgress,
+      tensorboard: Optional[TensorBoardManager] = None,
       *,
       deterministic: bool = False,
   ) -> dict:
+    tensorboard = model.tensorboard
     with model.autocast_context:
       if deterministic:
           batch_seed = 0  # reprodutibilidade total
@@ -390,6 +393,12 @@ class BaseStableDiffusionXLSetup(
           model_output_data["predicted_image_latent"] = scaled_predicted_latent_image.detach()              
 
       model_output_data['prediction_type'] = model.noise_scheduler.config.prediction_type
+      
+      tensorboard.add_scalar(
+          f"sangoi/timestep",
+          timestep,
+          train_progress.global_step,
+      )
 
     return model_output_data
 

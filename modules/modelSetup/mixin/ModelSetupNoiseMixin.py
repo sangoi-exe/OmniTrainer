@@ -14,8 +14,16 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
     def __init__(self):
         super().__init__()
 
-        self.__weights = None
-        self.__weights_epoch = -1
+        # vetor de desempenho e contagem para cada t ∈ [0 .. num_train_timesteps–1]
+        self.__epoch_alloc: Tensor | None = None   # quantas vezes cada t deve aparecer (por época)
+        self.__weights: Tensor | None = None        # lista embaralhada de timesteps, repetidos conforme alloc
+        self.__weights_epoch: int = -1              # marca a época de __weights
+
+        # (Performance tracking)
+        self.timestep_perf: Tensor = None           # será setado externamente, no trainer
+        self.timestep_count: Tensor = None          # idem
+        self.ema_alpha: float = 0.9                 # padrão, mas pode vir do config
+        self.burn_in_steps: int = -1                # idem
 
     def _create_noise(
             self,
@@ -50,6 +58,22 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
         return noise
 
+    def set_epoch_timestep_alloc(self, alloc: Tensor):
+        """
+        Recebe um Tensor (num_timesteps,) com quantas vezes cada t deve aparecer 
+        na PRÓXIMA época. Constroi self.__weights = lista embaralhada de índices de t.
+        """
+        self.__epoch_alloc = alloc.to(dtype=torch.long, device=alloc.device)
+        # Constroi lista repetida de timesteps
+        ts: list[int] = []
+        for t, cnt in enumerate(self.__epoch_alloc.tolist()):
+            ts += [t] * cnt
+        # Embaralha para remover padrão
+        import random
+        random.shuffle(ts)
+        self.__weights = torch.tensor(ts, device=alloc.device, dtype=torch.long)
+        self.__weights_epoch = getattr(self, "__weights_epoch", -1) + 1
+
     def _get_timestep_discrete(
             self,
             num_train_timesteps: int,
@@ -62,12 +86,9 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             train_progress: TrainProgress | None = None,
     ) -> Tensor:
         if deterministic:
-            # -1 is for zero-based indexing
-            return torch.tensor(
-                int(num_train_timesteps * 0.5) - 1,
-                dtype=torch.long,
-                device=generator.device,
-            ).unsqueeze(0)
+            ts = torch.tensor(int(num_train_timesteps * 0.5) - 1, dtype=torch.long, device=generator.device)
+            self.current_timestep = ts.unsqueeze(0)
+            return self.current_timestep
         else:
             min_timestep = int(num_train_timesteps * config.min_noising_strength)
             max_timestep = int(num_train_timesteps * config.max_noising_strength)
@@ -96,29 +117,47 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 TimestepDistribution.LOGIT_NORMAL,
                 TimestepDistribution.HEAVY_TAIL
             ]:
-                # continuous implementations
-                if config.timestep_distribution == TimestepDistribution.UNIFORM:
-                    timestep = min_timestep + (max_timestep - min_timestep) \
-                               * torch.rand(batch_size, generator=generator, device=generator.device)
-                elif config.timestep_distribution == TimestepDistribution.LOGIT_NORMAL:
-                    bias = config.noising_bias
-                    scale = config.noising_weight + 1.0
-
-                    normal = torch.normal(bias, scale, size=(batch_size,), generator=generator, device=generator.device)
-                    logit_normal = normal.sigmoid()
-                    timestep = logit_normal * num_timestep + min_timestep
-                elif config.timestep_distribution == TimestepDistribution.HEAVY_TAIL:
-                    scale = config.noising_weight
-
-                    u = torch.rand(
-                        size=(batch_size,),
-                        generator=generator,
-                        device=generator.device,
+                if self.__weights is not None:
+                    # Amostragem estratificada/adaptativa: tira da lista de __weights
+                    idx = torch.randint(
+                        0, 
+                        len(self.__weights), 
+                        (batch_size,), 
+                        generator=generator, 
+                        device=generator.device
                     )
-                    u = 1.0 - u - scale * (torch.cos(math.pi / 2.0 * u) ** 2.0 - 1.0 + u)
-                    timestep = u * num_timestep + min_timestep
+                    timestep = self.__weights[idx]
+                    self.current_timestep = timestep.detach().clone()
+                else:
+                    # Fallback para o comportamento original (UNIFORM, LOGIT_NORMAL ou HEAVY_TAIL)
+                    if config.timestep_distribution == TimestepDistribution.UNIFORM:
+                        timestep = min_timestep + (max_timestep - min_timestep) * torch.rand(
+                            batch_size, generator=generator, device=generator.device
+                        )
+                        self.current_timestep = timestep.detach().clone()
+                    elif config.timestep_distribution == TimestepDistribution.LOGIT_NORMAL:
+                        bias = config.noising_bias
+                        scale = config.noising_weight + 1.0
+                        normal = torch.normal(
+                            bias, 
+                            scale, 
+                            size=(batch_size,), 
+                            generator=generator, 
+                            device=generator.device
+                        )
+                        logit_normal = normal.sigmoid()
+                        timestep = logit_normal * num_timestep + min_timestep
+                        self.current_timestep = timestep.detach().clone()
+                    else:  # HEAVY_TAIL
+                        scale = config.noising_weight
+                        u = torch.rand(size=(batch_size,), generator=generator, device=generator.device)
+                        u = 1.0 - u - scale * (torch.cos(math.pi / 2.0 * u) ** 2.0 - 1.0 + u)
+                        timestep = u * num_timestep + min_timestep
+                        self.current_timestep = timestep.detach().clone()
 
-                timestep = num_train_timesteps * shift * timestep / ((shift - 1) * timestep + num_train_timesteps)
+                    # Aplica shift contínuo
+                    timestep = num_train_timesteps * shift * timestep / ((shift - 1) * timestep + num_train_timesteps)
+                    self.current_timestep = timestep.detach().clone()
             else:
                 # Shifting a discrete distribution is done in two steps:
                 # 1. Apply the inverse shift to the linspace.
@@ -142,6 +181,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
                     samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True) + min_timestep
                     timestep = samples.to(dtype=torch.long, device=generator.device)
+                    self.current_timestep = timestep.detach().clone()
                 elif config.timestep_distribution == TimestepDistribution.SIGMOID:
                     # if self.__weights is None:
                     #     bias = config.noising_bias + 0.5
@@ -175,6 +215,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
                     samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True) + min_timestep
                     timestep = samples.to(dtype=torch.long, device=generator.device)
+                    self.current_timestep = timestep.detach().clone()
 
             return timestep.int()
 
