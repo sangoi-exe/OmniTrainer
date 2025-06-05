@@ -16,7 +16,7 @@ from modules.util.optimizer_util import init_model_parameters
 from modules.util.torch_util import state_dict_has_prefix
 from modules.util.TrainProgress import TrainProgress
 from modules.module.LoRAModule import PeftBase
-from modules.util.TensorBoardManager import TensorBoardManager
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 
@@ -154,11 +154,11 @@ class StableDiffusionXLLoRASetup(
 
 
     def setup_model(
-        self, model: StableDiffusionXLModel, config: TrainConfig, tensorboard: Optional[TensorBoardManager] = None
+        self, model: StableDiffusionXLModel, config: TrainConfig, tensorboard: Optional[SummaryWriter] = None
     ):
 
         model.tensorboard = tensorboard
-        msg = f"[TensorBoardManager] Instância TensorBoard {'atribuída' if model.tensorboard else 'NÃO atribuída'} ao modelo."
+        msg = f"[SummaryWriter] Instância TensorBoard {'atribuída' if model.tensorboard else 'NÃO atribuída'} ao modelo."
         lvl = "success" if model.tensorboard else "error"
         logFun(msg, lvl=lvl)
 

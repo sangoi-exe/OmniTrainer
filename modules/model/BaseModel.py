@@ -2,8 +2,8 @@ from abc import ABCMeta, abstractmethod
 from typing import Optional
 from uuid import uuid4
 
+from torch.utils.tensorboard import SummaryWriter
 from modules.module.EMAModule import EMAModuleWrapper
-from modules.util.TensorBoardManager import TensorBoardManager
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.modelSpec.ModelSpec import ModelSpec
@@ -74,7 +74,7 @@ class BaseModel(metaclass=ABCMeta):
     train_config: TrainConfig | None
     embedding_state_dicts: dict[str, dict[str, Tensor]] | None
     
-    tensorboard: Optional[TensorBoardManager] = None
+    tensorboard: Optional[SummaryWriter] = None
 
     def __init__(
             self,

@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.utils.hooks import RemovableHandle
-from modules.util.TensorBoardManager import TensorBoardManager
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
@@ -83,8 +83,7 @@ class GenericTrainer(BaseTrainer):
     previous_sample_time: float
     sample_queue: list[Callable]
     parameters: list[Parameter]
-
-    tensorboard: TensorBoardManager
+    tensorboard: SummaryWriter
     recorder: DataRecorder | None
     _temp_recorder_data: collections.defaultdict  # Temporary storage for recorder data before log_step
 
@@ -113,7 +112,7 @@ class GenericTrainer(BaseTrainer):
 
         tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
         os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
-        self.tensorboard = TensorBoardManager(log_dir=os.path.join(
+        self.tensorboard = SummaryWriter(log_dir=os.path.join(
             tensorboard_log_dir,
             f"{config.save_filename_prefix}{get_string_timestamp()}",
         ))
@@ -135,10 +134,6 @@ class GenericTrainer(BaseTrainer):
         set_logfun_console(self.console)
 
         self._num_total_epochs = config.epochs
-        self.timestep_perf = torch.zeros(1000, device=self.config.train_device)
-        self.timestep_count = torch.zeros_like(self.timestep_perf, dtype=torch.long)
-        self.ema_alpha = getattr(self.config, "timestep_perf_ema_alpha", 0.9)
-        self.burn_in_steps = getattr(self.config, "timestep_burn_in_steps", 1000)        
 
     def _create_training_display_content(
         self,
@@ -151,7 +146,7 @@ class GenericTrainer(BaseTrainer):
         # Linha 1: Progresso Epoch/Step
         epoch_str = f"Epoch: {tp.epoch + 1}/{self._num_total_epochs}" if tp else f"Epoch: ?/{self._num_total_epochs}"
         step_str = f"Step: {tp.epoch_step + 1}/{self._steps_per_epoch}" if tp and self._steps_per_epoch > 0 else "Step: ?"
-        global_step_str = f"Global: {tp.global_step + 1}" if tp else "Global: ?"
+        global_step_str = f"Global: {tp.global_step + 1}/{tp.total_steps}" if tp else "Global: ?"
         line1 = Text.assemble((epoch_str, "bold cyan"), " | ", (step_str, "bold cyan"), " | ", (global_step_str, "dim cyan"))
 
         # Linha 2: Losses
@@ -178,7 +173,7 @@ class GenericTrainer(BaseTrainer):
 
         eta_total_disp = "ETATotal: Calc..."
         if tp and self._steps_per_epoch > 0 and effective_avg_step_time > 0:
-            total_steps = self._num_total_epochs * self._steps_per_epoch
+            total_steps = tp.total_steps
             completed_steps = tp.global_step + 1
             remaining_steps_total = total_steps - completed_steps
             if remaining_steps_total >= 0:
@@ -328,9 +323,7 @@ class GenericTrainer(BaseTrainer):
         self.callbacks.on_update_status("creating the data loader/caching")
 
         self.data_loader = self.create_data_loader(self.model, self.model.train_progress)
-        self._steps_per_epoch = self.data_loader.get_data_set().approximate_length() # Pega o total de steps para a epoch atual
-        print("self._steps_per_epoch", self._steps_per_epoch)
-
+        
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -1015,7 +1008,8 @@ class GenericTrainer(BaseTrainer):
                     )
 
                 gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
-                current_epoch_length = self.data_loader.get_data_set().approximate_length()
+                self._steps_per_epoch = self.data_loader.get_data_set().approximate_length()
+                train_progress.set_total_steps(self._steps_per_epoch * self.config.epochs)
 
                 for batch_idx, batch in enumerate(self.data_loader.get_data_loader()):
                     step_start_time_s = time.monotonic()
@@ -1066,7 +1060,6 @@ class GenericTrainer(BaseTrainer):
                             self.model, batch, self.config, train_progress
                         )
                         
-                        t_used = getattr(self.model_setup, "current_timestep", None)                        
                         predicted_tensor_from_model = model_output_data["predicted"] # Saída bruta do modelo (e.g., bf16)
                         
                         mask_fp32 = None
@@ -1085,29 +1078,18 @@ class GenericTrainer(BaseTrainer):
                             hook_handle = None
 
                         loss = self.model_setup.calculate_loss(
-                            self.model,
-                            batch,
-                            model_output_data,
-                            self.config,
-                            train_progress,
+                            model=self.model,
+                            batch=batch,
+                            data=model_output_data,
+                            config=self.config,
+                            progress=train_progress,
                         )
 
                         loss = loss / self.config.gradient_accumulation_steps
-
+                        
                         if self.config.debugoi:
                             predicted_tensor_from_model.retain_grad()
-
-                        # START update_timestep_perf
-                        if t_used is not None and train_progress.global_step >= 0:
-                            # no batch=1, t_used pode ser um tensor de shape (1,), então faz:
-                            t_idx = t_used.item() if isinstance(t_used, Tensor) else int(t_used)
-                            l_scalar = loss.item()
-                            # EMA de loss por timestep
-                            prev = float(self.timestep_perf[t_idx])
-                            self.timestep_perf[t_idx] = self.ema_alpha * prev + (1 - self.ema_alpha) * l_scalar
-                            self.timestep_count[t_idx] += 1
-                        # END update_timestep_perf
-
+                                                        
                         if scaler:
                             scaler.scale(loss).backward()
                         else:
@@ -1197,49 +1179,7 @@ class GenericTrainer(BaseTrainer):
                         self.__validate(train_progress)
 
                     train_progress.next_step(self.config.batch_size)
-                    self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
-
-                # START adjust_timestep_counts
-                # só atualiza após burn-in (pelo menos uma época completa)
-                if train_progress.global_step >= self.burn_in_steps:
-                    num_timesteps = 1000
-                    steps_per_epoch = self._steps_per_epoch  # já configurado no start
-                    # 1) base_counts: distribuição estratificada pura
-                    base = steps_per_epoch // num_timesteps
-                    rem  = steps_per_epoch % num_timesteps
-                    base_counts = torch.full(
-                        (num_timesteps,), 
-                        base, 
-                        dtype=torch.long, 
-                        device=self.config.train_device
-                    )
-                    if rem > 0:
-                        base_counts[:rem] += 1
-
-                    # 2) calcular adj_factor a partir de perf (norm e clamp)
-                    perf = self.timestep_perf.clone()
-                    # evita dividir por zero
-                    mn, mx = float(perf.min()), float(perf.max())
-                    perf_norm = (perf - mn) / (mx - mn + 1e-8)
-                    scale = getattr(self.config, "timestep_adj_scale", 0.5)
-                    adj_factor = (1.0 + (perf_norm - 0.5) * scale).clamp(0.7, 1.3)
-
-                    # 3) alloc = base_counts * adj_factor; normaliza para steps_per_epoch
-                    alloc = (base_counts.float() * adj_factor).round().to(dtype=torch.long)
-                    total_alloc = int(alloc.sum().item())
-                    # se sobrar, diminui dos maiores
-                    while total_alloc > steps_per_epoch:
-                        idx_max = int(torch.argmax(alloc))
-                        alloc[idx_max] -= 1
-                        total_alloc -= 1
-                    # se faltar, distribui +1 para timesteps com maior adj_factor
-                    while total_alloc < steps_per_epoch:
-                        idx_max = int(torch.argmax(adj_factor))
-                        alloc[idx_max] += 1
-                        total_alloc += 1
-
-                    # 4) finalmente passa esta alloc para o mixin
-                    self.model_setup.set_epoch_timestep_alloc(alloc)
+                    self.callbacks.on_update_train_progress(train_progress, self._steps_per_epoch, self.config.epochs)
 
                 train_progress.next_epoch() # Avança a epoch para a próxima iteração do loop externo
                 

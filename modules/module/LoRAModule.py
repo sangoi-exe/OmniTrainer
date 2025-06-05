@@ -645,7 +645,6 @@ class DoRAModule(LoRAModule):
         self.dora_num_dims = orig_weight.dim() - 1
         # ==== START: usa nova flag ====
         if self.lora_scale_rowwise: # LINHA (out_features)
-            logFun("[LoRA] Usinhg ROW WISE")
             self.dora_scale = nn.Parameter(
                 torch.norm(
                     orig_weight.reshape(orig_weight.shape[0], -1),

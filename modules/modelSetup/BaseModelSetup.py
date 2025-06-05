@@ -10,7 +10,7 @@ from modules.util.TrainProgress import TrainProgress
 import torch
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
-from modules.util.TensorBoardManager import TensorBoardManager
+from torch.utils.tensorboard import SummaryWriter
 
 from modules.sangoi.TrainGPS import TrainGPS
 
@@ -52,7 +52,7 @@ class BaseModelSetup(
         self,
         model: BaseModel,
         config: TrainConfig,
-        tensorboard: Optional[TensorBoardManager] = None
+        tensorboard: Optional[SummaryWriter] = None
     ):
         pass
 

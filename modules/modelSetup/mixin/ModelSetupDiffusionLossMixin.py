@@ -19,11 +19,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from typing import TYPE_CHECKING, Callable, Optional
-if TYPE_CHECKING:
-    from modules.util.TensorBoardManager import TensorBoardManager
-
-from modules.util.TensorBoardManager import TensorBoardManager
+from typing import Callable, Optional
+from torch.utils.tensorboard import SummaryWriter
 from modules.sangoi.DynamicLossControl import LossTracker, DynamicLossControl
 from modules.sangoi.TrainGPS import TrainGPS
 
@@ -33,7 +30,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     __sigmas: Tensor | None
     config: TrainConfig | None
     progress: TrainProgress | None
-    tensorboard: TensorBoardManager | None
+    tensorboard: SummaryWriter | None
 
     def __init__(self):
         super().__init__()
@@ -46,7 +43,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.blend_window = None
         self.loss_tracker = LossTracker(window_size=500, use_mad=True)
         self.dynamic_loss_strengthing = DynamicLossControl()
-        self.tensorboard: Optional[TensorBoardManager] = None,
+        self.tensorboard: Optional[SummaryWriter] = None,
 
     def __sangoi_loss_schedule(self, batch, data, config, progress):
         pred, tgt = data["predicted"], data["target"]
@@ -64,23 +61,23 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         w_mse, w_mae, w_log = self.dynamic_loss_strengthing.adjust_weights(mse_z, mae_z, log_z, config, progress)
 
         base_loss = (
-            mse  * w_mse * config.mse_strength +
-            mae  * w_mae * config.mae_strength +
-            logc * w_log * config.log_cosh_strength
-        )
+            mse  * w_mse +
+            mae  * w_mae +
+            logc * w_log
+          )
 
         self.tensorboard.add_scalar(
-            "sangoi/7mse",
+            "SangoiS/MSE_Loss",
             w_mse,
             progress.global_step,
         )
         self.tensorboard.add_scalar(
-            "sangoi/8mae",
+            "SangoiS/MAE_Loss",
             w_mae,
             progress.global_step,
         )
         self.tensorboard.add_scalar(
-            "sangoi/9log_cosh",
+            "SangoiS/Log_Cosh_Loss",
             w_log,
             progress.global_step,
         )
@@ -299,110 +296,68 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     # START v2025-05-27c – __sangoi_loss_weighting refeito
     # VOLTANDO ÀS ORIGENS 04-06-2025
+    # PROPOSTA DE REFAÇÃO - __sangoi_loss_weighting
     def __sangoi_loss_weighting(
       self,
       timesteps: Tensor,
       predicted: Tensor,
       target: Tensor,
       device: torch.device,
-      gamma: float,
+      gamma: float, # Renomeado para 'focus_strength' seria mais claro, mas mantendo 'gamma' por consistência.
     ):
       """
-      Função Sangoi Loss Weighting com reescalonamento [0,1] -> [gamma, 1].
-      Se combined_weight_raw > 1, fica 1. Se < 0 (em teoria não deveria), fica 0.
+      Calcula um peso de loss por amostra baseado nos princípios de Online Hard Example Mining (OHEM).
+      Amostras fáceis (erro baixo) recebem um peso menor (loss reduzida), especialmente em
+      cenários considerados difíceis (SNR alto), para focar o treino nas amostras que o modelo ainda erra.
+
+      Args:
+          timesteps: Tensor com os timesteps de cada amostra no batch.
+          predicted: Tensor com a predição do modelo.
+          target: Tensor com o alvo da predição (ruído).
+          device: Dispositivo para os tensores.
+          gamma: Hiperparâmetro que controla a força do OHEM. Valores maiores
+                reduzem mais agressivamente a loss de amostras fáceis.
+
+      Returns:
+          Um tensor de pesos no formato (batch_size,), com valores no intervalo [0, 1].
       """
+      with torch.no_grad():
+        # 1. Métrica de Qualidade da Predição (quão "fácil" foi o exemplo?)
+        # Usamos MAE (L1 loss) por ser mais robusto que MAPE.
+        # torch.tanh mapeia o erro para o intervalo [0, 1], agindo como uma normalização suave.
+        mae_per_sample = torch.abs(target - predicted).mean(dim=[1, 2, 3])
+        # prediction_quality: 1.0 para erro zero (muito fácil), próximo de 0.0 para erro alto (difícil).
+        prediction_quality = 1.0 - torch.tanh(mae_per_sample)
 
-      progress = self.progress
-      config = self.config
+        # 2. Métrica de Dificuldade do Cenário
+        # Com base na análise, SNR alto (timesteps baixos) é mais difícil.
+        # log1p(x) = log(1+x) é numericamente mais estável para x pequeno.
+        snr = self.__snr(timesteps, device)
+        scenario_difficulty = torch.log1p(snr) # Aumenta com a dificuldade (SNR alto).
 
-      # 1) Cálculo do snr "padrão"
-      snr = self.__snr(timesteps, device)        # (batch, ...)
-      epsilon = 1e-8
+        # 3. Calcular o "potencial de redução de loss"
+        # A maior redução ocorre para predições de alta qualidade em cenários de alta dificuldade.
+        # Isso significa que o modelo acertou algo difícil e podemos "premiá-lo" ignorando essa loss.
+        reduction_potential = prediction_quality * scenario_difficulty
 
-      # 2) Cálculo do MAPE (já presente)
-      mape = torch.abs((target - predicted) / (target + epsilon))
-      mape = torch.clamp(mape, min=0, max=1).mean(dim=[1, 2, 3])
+        # 4. Calcular o peso final da loss
+        # O 'gamma' agora age como um fator de força.
+        # Subtraímos o potencial de redução de 1.0 para obter o peso final.
+        # torch.clamp garante que o peso final esteja estritamente entre 0.0 e 1.0.
+        final_weight = torch.clamp(1.0 - (reduction_potential * gamma), min=0.0, max=1.0)
 
-      # -----------------------------------------------------------------------
-      # CÁLCULO DO FATOR DE PROGRESSO
-      # -----------------------------------------------------------------------
-      # Se total_epochs = N, progress.epoch vai de 0 até N-1 (ou 1 até N, depende do trainer).
-      # Ajuste conforme o comportamento real do seu `progress.epoch`.
-      total_epochs = config.epochs
-      current_epoch = progress.epoch  # verifique se vai de 0 a N-1 ou 1 a N
-      # Fazemos um clamp para evitar divisões por zero em caso de 1 época só:
-      if total_epochs <= 1:
-          alpha = 1.0
-      else:
-          alpha = current_epoch / float(total_epochs - 1)  # varia de 0 até 1
+        # Log para monitoramento
+        self.tensorboard.add_scalar(
+          "SangoiW/1_Prediction_Quality_Avg", prediction_quality.mean().item(), self.progress.global_step
+        )
+        self.tensorboard.add_scalar(
+          "SangoiW/2_Scenario_Difficulty_Avg", scenario_difficulty.mean().item(), self.progress.global_step
+        )
+        self.tensorboard.add_scalar(
+          "SangoiW/3_Final_Weight_Avg", final_weight.mean().item(), self.progress.global_step
+        )
 
-      # -----------------------------------------------------------------------
-      # CRIANDO DOIS "EXTREMOS" DE PESO PARA O SNR
-      # -----------------------------------------------------------------------
-      # A ideia é que no início do treino (alpha ~ 0),
-      # queremos enfatizar cenários de SNR baixo como "mais difíceis".
-      # No fim do treino (alpha ~ 1), enfatizamos cenários de SNR alto como "mais difíceis".
-      #
-      # Aqui vai um exemplo de forma de interpolar:
-      # snr_weight_low_first  => enfatiza SNR BAIXO como "mais difícil"
-      # snr_weight_high_first => enfatiza SNR ALTO  como "mais difícil"
-      #
-      # Você pode escolher a fórmula que fizer mais sentido para o seu caso.
-      #
-      # Exemplo de uma forma simples:
-      #  - Se snr estiver alto, snr_weight_low_first deve ser PEQUENO.
-      #  - Se snr estiver baixo, snr_weight_low_first deve ser MAIOR.
-      #
-      # Uma abordagem é usar: snr_weight_low_first = log(1 + 1/(snr+eps)),
-      # pois, para snr grande, 1/(snr+eps) ≈ 0, resultando em log(1)≈0 (cenário "fácil").
-      # E para snr pequeno, 1/(snr+eps) é grande, resultando em log(...) maior (cenário "difícil").
-      #
-      # Por outro lado, snr_weight_high_first = log(1 + snr)
-      # faz o contrário: para snr grande, o log é grande; para snr pequeno, o log é pequeno.
-      #
-      # Depois, interpolamos linearmente entre esses dois extremos pelo fator alpha.
-
-      snr_weight_low_first = torch.log(1.0 + 1.0 / (snr + epsilon))  # enfatiza SNR baixo
-      snr_weight_high_first = torch.log(snr + 1.0)                   # enfatiza SNR alto
-
-      # Interpolação linear:
-      # alpha=0 => weight = snr_weight_low_first
-      # alpha=1 => weight = snr_weight_high_first
-      scenario_snr_weight = (1.0 - alpha) * snr_weight_low_first + alpha * snr_weight_high_first
-      mape_reward = 1 - mape
-      raw_reward = torch.exp(-mape_reward * scenario_snr_weight)
-      # Ex: pode dar valores na casa de 0.08, 0.2, 1.1, etc.
-
-      # 2) Clampar para [0, 1]
-      clamped_reward = torch.clamp(raw_reward, min=0.0, max=1.0)
-
-      # 3) Reescalar [0,1] para [gamma,1]
-      reward = gamma + (1.0 - gamma) * clamped_reward
-
-      # Logging no TensorBoard
-      if self.config.debugoi:
-          self.tensorboard.add_scalar(
-            "sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/2scenario_snr_weight", scenario_snr_weight.mean().item(), progress.global_step
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/4reward", reward.mean().item(), progress.global_step
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/alpha", alpha, progress.global_step
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/scenario_snr_weight_mean",
-            scenario_snr_weight.mean().item(),
-            progress.global_step,
-          )
-
-      return reward
+        return final_weight
 
     def _diffusion_losses(
         self,
@@ -480,13 +435,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         losses.mean().item(),
                         self.progress.global_step,
                     )
+                    
+                    # A nova função já retorna um peso entre [0, 1]
                     losses *= self.__sangoi_loss_weighting(
                       data["timestep"],
                       data["predicted"],
                       data["target"],
                       losses.device,
-                      config.loss_weight_strength,
+                      config.loss_weight_strength, # Este é o seu 'gamma'
                     )
+                    
                     self.tensorboard.add_scalar(
                         "sangoi/loss_after_sangoi",
                         losses.mean().item(),

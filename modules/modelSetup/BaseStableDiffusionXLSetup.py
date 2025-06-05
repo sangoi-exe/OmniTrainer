@@ -20,7 +20,7 @@ from modules.util.dtype_util import create_autocast_context, disable_fp16_autoca
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.TrainProgress import TrainProgress
-from modules.util.TensorBoardManager import TensorBoardManager
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import torch.nn.functional as F
@@ -188,7 +188,7 @@ class BaseStableDiffusionXLSetup(
       batch: dict,
       config: TrainConfig,
       train_progress: TrainProgress,
-      tensorboard: Optional[TensorBoardManager] = None,
+      tensorboard: Optional[SummaryWriter] = None,
       *,
       deterministic: bool = False,
   ) -> dict:
@@ -395,7 +395,7 @@ class BaseStableDiffusionXLSetup(
       model_output_data['prediction_type'] = model.noise_scheduler.config.prediction_type
       
       tensorboard.add_scalar(
-          f"sangoi/timestep",
+          f"SangoiW/Timestep",
           timestep,
           train_progress.global_step,
       )
