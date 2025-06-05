@@ -7,59 +7,60 @@ CUDA_DEV = torch.device("cuda")
 
 class LossTracker:
     """
-    Tracks and generates statistics for the latest N loss values for MSE, MAE, and log-cosh.
-    It can use mean/std or median/MAD for statistics.
+    Tracks and generates statistics using a pre-allocated circular buffer for efficiency.
     """
-
     def __init__(self, window_size: int = 500, use_mad: bool = True) -> None:
-        """
-        Initializes the LossTracker.
-
-        Args:
-            window_size (int): The number of recent loss values to track.
-            use_mad (bool): If True, use median and MAD instead of mean and std.
-        """
         self.window_size: int = window_size
         self.use_mad: bool = use_mad
+        self.device = CUDA_DEV # ou inferir de um tensor na primeira chamada
 
-        self.mse_losses: deque = deque(maxlen=window_size)
-        self.mae_losses: deque = deque(maxlen=window_size)
-        self.log_cosh_losses: deque = deque(maxlen=window_size)
+        # Pré-aloca os buffers. Cada buffer armazena 'window_size' escalares.
+        self.mse_buffer = torch.zeros(window_size, device=self.device)
+        self.mae_buffer = torch.zeros(window_size, device=self.device)
+        self.log_cosh_buffer = torch.zeros(window_size, device=self.device)
+
+        self.next_idx = 0
+        self.is_full = False
 
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
-        """
-        Updates the loss trackers with new loss values.
+        # Insere o novo valor no buffer na posição atual
+        # .detach() é crucial para não guardar o histórico do grafo
+        self.mse_buffer[self.next_idx] = mse_loss.detach()
+        self.mae_buffer[self.next_idx] = mae_loss.detach()
+        self.log_cosh_buffer[self.next_idx] = log_cosh_loss.detach()
 
-        Args:
-            mse_loss (Tensor): The Mean Squared Error loss.
-            mae_loss (Tensor): The Mean Absolute Error loss.
-            log_cosh_loss (Tensor): The log-cosh loss.
-        """
-        self.mse_losses.append(mse_loss.detach().float().view(-1))
-        self.mae_losses.append(mae_loss.detach().float().view(-1))
-        self.log_cosh_losses.append(log_cosh_loss.detach().float().view(-1))
+        self.next_idx += 1
+        if self.next_idx >= self.window_size:
+            self.next_idx = 0
+            self.is_full = True
 
-    def compute_stats(self, values: List[Tensor]) -> Tuple[Tensor, Tensor]:
-        values = list(values)
-        if not values:
-            dev = CUDA_DEV
-            return torch.zeros(1, device=dev), torch.tensor(1e-8, device=dev)
+    def _get_current_values(self, buffer: Tensor) -> Tensor:
+        # Retorna apenas os valores preenchidos do buffer
+        if self.is_full:
+            return buffer
+        return buffer[:self.next_idx]
 
-        arr = torch.cat(values)  # já em FP32 / device correto
+    def compute_stats(self, buffer: Tensor) -> Tuple[Tensor, Tensor]:
+        values = self._get_current_values(buffer)
+        if values.numel() == 0:
+            return torch.zeros(1, device=self.device), torch.tensor(1e-8, device=self.device)
+
         if self.use_mad:
-            med = arr.median()
-            mad = (arr - med).abs().median().clamp_min(1e-8)
+            med = torch.median(values)
+            mad = torch.median(torch.abs(values - med)).clamp_min(1e-8)
             return med, mad
-        mean = arr.mean()
-        std  = arr.std(unbiased=False).clamp_min(1e-8)
-        return mean, std
+        else:
+            mean = torch.mean(values)
+            std = torch.std(values, unbiased=False).clamp_min(1e-8)
+            return mean, std
 
     @torch.no_grad()
     def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        mse_c, mse_s = self.compute_stats(self.mse_losses)
-        mae_c, mae_s = self.compute_stats(self.mae_losses)
-        log_c, log_s = self.compute_stats(self.log_cosh_losses)
+        # Passa o buffer inteiro para compute_stats
+        mse_c, mse_s = self.compute_stats(self.mse_buffer)
+        mae_c, mae_s = self.compute_stats(self.mae_buffer)
+        log_c, log_s = self.compute_stats(self.log_cosh_buffer)
 
         mse_z = (mse_loss - mse_c) / mse_s
         mae_z = (mae_loss - mae_c) / mae_s
@@ -127,20 +128,20 @@ class DynamicLossControl:
     @torch.no_grad()
     def adjust_weights(
         self,
-        mse_z: Tensor, # // CORREÇÃO: Z-scores são tensores
-        mae_z: Tensor, # // CORREÇÃO: Z-scores são tensores
-        log_cosh_z: Tensor, # // CORREÇÃO: Z-scores são tensores
-        config, # // CORREÇÃO: Melhor tipar config se possível
-        progress, # // CORREÇÃO: Melhor tipar progress se possível
-    ) -> Tuple[float, float, float]: # Retorna pesos escalares finais
+        mse_z: Tensor,
+        mae_z: Tensor,
+        log_cosh_z: Tensor,
+        config,
+        progress,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         eps = 1e-8
 
         # START vectorized_adjust
-        loss_vec = torch.stack([mse_z, mae_z, log_cosh_z], dim=0)         # [3, *batch]
-        abs_z    = loss_vec.abs().clamp_max(self.outlier_threshold)       # idem
-        total_z  = abs_z.sum(dim=0, keepdim=True) + eps                   # [1, *batch]
-        inv_z    = (total_z - abs_z) / total_z                            # [3, *batch]
-        weights  = inv_z / inv_z.sum(dim=0, keepdim=True)                 # normaliza
+        loss_vec = torch.stack([mse_z, mae_z, log_cosh_z], dim=0)
+        abs_z    = loss_vec.abs().clamp_max(self.outlier_threshold)
+        total_z  = abs_z.sum(dim=0, keepdim=True) + eps
+        inv_z    = (total_z - abs_z) / total_z
+        weights  = inv_z / inv_z.sum(dim=0, keepdim=True)
 
         # --- EMA inline ---
         if self.use_ema:
@@ -157,5 +158,5 @@ class DynamicLossControl:
         weights.mul_(sched_f)
         weights.div_(weights.sum(dim=0, keepdim=True) + eps)
 
-        w_mse, w_mae, w_log = (w.mean().item() for w in weights)  # escalar para caller
+        w_mse, w_mae, w_log = weights[0], weights[1], weights[2]
         return w_mse, w_mae, w_log

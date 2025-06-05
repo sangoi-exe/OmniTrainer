@@ -1,6 +1,25 @@
 import torch
 from torch import Tensor
 
+# NOVA FUNÇÃO OTIMIZADA
+def addcdiv_stochastic_buffered_(input_bf16: Tensor, buffer_fp32: Tensor, tensor1: Tensor, tensor2: Tensor, value: float = 1.0):
+    """
+    Versão otimizada que usa um buffer float32 pré-alocado.
+    input_bf16 + (tensor1 / tensor2 * value)
+    
+    Args:
+        input_bf16: O tensor de entrada/saída (bfloat16).
+        buffer_fp32: Um buffer pré-alocado com o mesmo shape, mas dtype float32.
+        tensor1, tensor2, value: Argumentos para addcdiv.
+    """
+    # 1. Copia o valor atual de bf16 para o buffer fp32
+    buffer_fp32.copy_(input_bf16)
+    
+    # 2. Realiza a operação em precisão total (float32) no buffer
+    buffer_fp32.addcdiv_(tensor1, tensor2, value=value)
+    
+    # 3. Copia o resultado de volta para o tensor original com arredondamento estocástico
+    copy_stochastic_(input_bf16, buffer_fp32)
 
 def copy_stochastic_(target: Tensor, source: Tensor):
     """

@@ -4,8 +4,7 @@ import torch
 import torch.distributed as dist
 
 from modules.util.bf16_stochastic_rounding import (
-    add_stochastic_,
-    addcdiv_stochastic_,
+    addcdiv_stochastic_buffered_, # <-- MUDANÇA
 )
 
 from prodigyopt.prodigy import Prodigy
@@ -96,6 +95,9 @@ def step_prodigy(self, closure=None):
 
                 # Exponential moving average of squared gradient values
                 state["exp_avg_sq"] = torch.zeros_like(p.data).detach()
+                
+                if p.dtype == torch.bfloat16 and self.stochastic_rounding:
+                    state['fp32_buffer'] = torch.empty_like(p.data, dtype=torch.float32)                
 
             exp_avg_sq = state["exp_avg_sq"]
             s = state["s"]
@@ -194,26 +196,25 @@ def step_prodigy(self, closure=None):
             if beta1 > 0:
                 exp_avg = state["exp_avg"]
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    # <<< CHATGPT ADD STROCHASTIC PROTECT >>>
                     try:
-                        addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
+                        buffer = state['fp32_buffer']
+                        addcdiv_stochastic_buffered_(p.data, buffer, exp_avg, denom, value=-dlr)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
                         p.data.addcdiv_(exp_avg, denom, value=-dlr)
-                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(exp_avg, denom, value=-dlr)
             else:
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    # <<< CHATGPT ADD STROCHASTIC PROTECT <<<
                     try:
-                        addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
+                        buffer = state['fp32_buffer']
+                        # Note que o 'grad' aqui é fp32, então a operação no buffer é direta
+                        addcdiv_stochastic_buffered_(p.data, buffer, grad, denom, value=-dlr * d)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
                         p.data.addcdiv_(grad, denom, value=-dlr * d)
-                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(grad, denom, value=-dlr * d)
 

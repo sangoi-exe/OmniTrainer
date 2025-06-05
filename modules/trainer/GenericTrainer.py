@@ -1034,9 +1034,10 @@ class GenericTrainer(BaseTrainer):
                             return sample_commands_fun
 
                         self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
-
-                    if self.__needs_gc(train_progress):
-                        torch_gc()
+                        
+                    # comentando pra ver se vai estragar algo, se não, é melhor não ter essa bosta
+                    # if self.__needs_gc(train_progress):
+                    #     torch_gc()
 
                     if not has_gradient:
                         self.__execute_sample_during_training()
@@ -1056,27 +1057,33 @@ class GenericTrainer(BaseTrainer):
                             self.model_setup.setup_train_device(self.model, self.config)
 
                     with TorchMemoryRecorder(enabled=False):
-                        model_output_data = self.model_setup.predict(
-                            self.model, batch, self.config, train_progress
-                        )
+                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        predicted_tensor_from_model = model_output_data["predicted"] # bf16
+                        hook_handle = None # Inicializa fora do if
                         
-                        predicted_tensor_from_model = model_output_data["predicted"] # Saída bruta do modelo (e.g., bf16)
-                        
-                        mask_fp32 = None
                         if self.config.masked_training:
-                            mask_bf16  = prepare_mask(batch["latent_mask"], predicted_tensor_from_model)
-                            mask_fp32  = mask_bf16.to(torch.float32)
-                            predicted_tensor_from_model.mul_(mask_bf16)
-                            model_output_data["target"].mul_(mask_bf16)
+                            # 1. PREPARE A MÁSCARA UMA VEZ, COM O DTYPE CORRETO (bf16)
+                            # Esta máscara será usada para o forward pass e para o hook do gradiente.
+                            mask_bf16 = prepare_mask(batch["latent_mask"], predicted_tensor_from_model)
 
-                            def _grad_mask(g):
-                                g.mul_(mask_fp32)
+                            # 2. APLIQUE A MÁSCARA NO FORWARD PASS
+                            # Isso garante que a loss seja calculada apenas na área de interesse.
+                            # Usamos .detach() na máscara para garantir que ela não entre no grafo de computação.
+                            predicted_tensor_from_model.mul_(mask_bf16.detach())
+                            model_output_data["target"].mul_(mask_bf16.detach())
+
+                            # 3. CONFIGURE O HOOK DO GRADIENTE
+                            # O hook agora é simples e consistente em tipo.
+                            def _grad_mask(g: torch.Tensor):
+                                # g é bf16, mask_bf16 é bf16. Tudo certo.
+                                g.mul_(mask_bf16) # Multiplica o gradiente pela mesma máscara binária
                                 return g
 
+                            # predicted_tensor_from_model é a folha do grafo que queremos modificar o gradiente.
                             hook_handle = predicted_tensor_from_model.register_hook(_grad_mask)
-                        else:
-                            hook_handle = None
 
+                        # 4. CALCULE A LOSS E FAÇA O BACKWARD
+                        # O forward pass já está "mascarado", e o backward pass também será.
                         loss = self.model_setup.calculate_loss(
                             model=self.model,
                             batch=batch,
@@ -1084,26 +1091,36 @@ class GenericTrainer(BaseTrainer):
                             config=self.config,
                             progress=train_progress,
                         )
-
                         loss = loss / self.config.gradient_accumulation_steps
-                        
+
                         if self.config.debugoi:
+                            # Para o debug, você pode reter o gradiente e depois verificar o leak.
                             predicted_tensor_from_model.retain_grad()
-                                                        
+
+                        # 5. BACKWARD PASS
                         if scaler:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
-                            
+
+                        # 6. LIMPE O HOOK (MUITO IMPORTANTE!)
                         if hook_handle is not None:
                             hook_handle.remove()
-                        
-                        if self.config.debugoi:
+
+                        # 7. DEBUG (se ativado)
+                        if self.config.debugoi and self.config.masked_training:
                             if predicted_tensor_from_model.grad is not None:
-                                leak = (predicted_tensor_from_model.grad * (1 - mask_fp32)).abs().max()
-                                logFun(f"Leak grad (bf16→FP32) = {leak.item():.2e}")
+                                # Para verificar o leak, podemos criar uma máscara invertida em fp32
+                                # sem poluir a lógica principal.
+                                with torch.no_grad():
+                                    # A máscara invertida (1 - mask) nos diz onde o gradiente deveria ser zero.
+                                    inverted_mask_fp32 = (1 - mask_bf16).to(torch.float32)
+                                    grad_fp32 = predicted_tensor_from_model.grad.to(torch.float32)
+                                    
+                                    leak = (grad_fp32 * inverted_mask_fp32).abs().max()
+                                    logFun(f"Leak grad (bf16→FP32) = {leak.item():.2e}")
                             else:
-                                logFun("WARNING: grad é None — verifique se retain_grad foi chamado antes do backward")
+                                logFun("GRAD É NONE — verifique se retain_grad foi chamado antes do backward.", lvl="warning")
                             
                         has_gradient = True
                         accumulated_loss += loss.item()

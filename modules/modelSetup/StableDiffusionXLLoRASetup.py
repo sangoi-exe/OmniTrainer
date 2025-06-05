@@ -150,9 +150,6 @@ class StableDiffusionXLLoRASetup(
             model.unet_lora.requires_grad_(train_unet)
         
 
-
-
-
     def setup_model(
         self, model: StableDiffusionXLModel, config: TrainConfig, tensorboard: Optional[SummaryWriter] = None
     ):

@@ -838,8 +838,8 @@ class TrainUI(ctk.CTk):
             # A atualização visual (deselect, configure) pode ser feita aqui ou confiar no _reset_training_button
             # Para garantir, vamos fazer aqui também:
             if self.pause_switch_widget:
-                 self.pause_switch_widget.deselect()
-                 self.pause_switch_widget.configure(state="normal")
+                self.pause_switch_widget.deselect()
+                self.pause_switch_widget.configure(state="normal")
             # --- FIM DA CORREÇÃO ---
 
             if self.training_button:  # Verifica se existe

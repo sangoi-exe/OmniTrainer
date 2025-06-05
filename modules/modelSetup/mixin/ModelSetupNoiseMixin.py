@@ -14,13 +14,11 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
     def __init__(self):
         super().__init__()
 
-        self.__weights = None
-        self.__weights_epoch = -1
-        
-				# params pra criar um array DECENTE de timesteps, em vez dessa merda cagada que o OT usa atualmente
+        # Atributos para o novo sistema de amostragem de timestep
         self._timestep_array: Tensor | None = None
-        self._array_epoch: int = -1        
-
+        self._timestep_idx_pointer: int = 0
+        # self.__weights e self.__weights_epoch não são mais necessários com a nova lógica
+        
     def _create_noise(
             self,
             source_tensor: Tensor,
@@ -61,9 +59,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             generator: Generator,
             batch_size: int,
             config: TrainConfig,
-            latent_width: int | None = None,
-            latent_height: int | None = None,
-            train_progress: TrainProgress | None = None,
+            train_progress: TrainProgress, # Removido 'Optional' para garantir que sempre estará presente
     ) -> Tensor:
         if deterministic:
             # -1 é para indexação zero-based
@@ -71,231 +67,98 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 int(num_train_timesteps * 0.5) - 1,
                 dtype=torch.long,
                 device=generator.device,
-            ).unsqueeze(0)
-        else:
+            ).unsqueeze(0).expand(batch_size) # Expande para o batch size
+            
+        # --- NOVA LÓGICA DE CRIAÇÃO E AMOSTRAGEM ---
+
+        # 1. GERA O ARRAY DE TIMESTEPS APENAS UMA VEZ NO INÍCIO DO TREINO
+        if self._timestep_array is None:
+            print("[Timestep Sampler] Creating a globally balanced timestep array for the entire training...")
+            total_steps = train_progress.total_steps
+            
+            # Se total_steps não for válido, usa fallback
+            if not total_steps or total_steps <= 0:
+                print("[Timestep Sampler] Warning: total_steps is invalid. Using fallback random sampling.")
+                return self._fallback_random_timestep(num_train_timesteps, generator, batch_size, config)
+
             min_timestep = int(num_train_timesteps * config.min_noising_strength)
             max_timestep = int(num_train_timesteps * config.max_noising_strength)
-            num_timestep = max_timestep - min_timestep
 
-            # Se não houver train_progress ou total_steps, fallback para lógica aleatória original
-            if train_progress is None or not getattr(train_progress, "total_steps", None):
-                return self._fallback_random_timestep(
-                    num_train_timesteps=num_train_timesteps,
-                    generator=generator,
-                    batch_size=batch_size,
-										config=config,
-										deterministic=deterministic
-                )
+            # Lista de timesteps possíveis
+            possible_timesteps = torch.arange(min_timestep, max_timestep, device=generator.device)
 
-            # Gera array balanceado se ainda não existir ou se houver nova época
-            current_epoch = getattr(train_progress, "epoch", 0)
-            if self._timestep_array is None or self._array_epoch != current_epoch:
-                total_steps = train_progress.total_steps
+            # --- LÓGICA DE VIÉS COM SIGMOID ---
+            # Normaliza os timesteps para [0, 1] para a sigmoid
+            normalized_timesteps = (possible_timesteps.float() - min_timestep) / (max_timestep - min_timestep)
+            
+            # Hiperparâmetros para controlar a curva sigmoid
+            # Podem ser movidos para TrainConfig para fácil ajuste
+            sigmoid_bias = config.noising_bias + 0.5
+            sigmoid_weight = config.noising_weight
+            
+            # A sigmoid(x) cresce. Para dar mais peso a valores baixos, usamos sigmoid(-x).
+            # Um valor negativo no weight inverte a curva, dando peso a timesteps menores.
+            # `(normalized_timesteps - sigmoid_bias)` centraliza a curva antes de aplicar o peso.
+            weights = 1 / (1 + torch.exp(sigmoid_weight * (normalized_timesteps - sigmoid_bias)))
+            
+            # Adiciona um pequeno epsilon para garantir que nenhum peso seja zero
+            weights += 1e-8
 
-                possible_timesteps = list(range(min_timestep, max_timestep))
-                t_count = len(possible_timesteps)
-                if t_count == 0:
-                    # Intervalo inválido, fallback
-                    return self._fallback_random_timestep(
-                        num_train_timesteps=num_train_timesteps,
-                        generator=generator,
-                        batch_size=batch_size,
-                        config=config,
-                        deterministic=deterministic
-                    )
+            # Amostra 'total_steps' índices da distribuição de pesos
+            sampled_indices = torch.multinomial(
+                weights, 
+                num_samples=total_steps, 
+                replacement=True, 
+                generator=generator
+            )
+            
+            # Cria o array de timesteps com base nos índices amostrados
+            arr_tensor = possible_timesteps[sampled_indices]
+            
+            # Embaralha o array final para garantir aleatoriedade na ordem de aparição
+            perm = torch.randperm(total_steps, generator=generator, device=generator.device)
+            self._timestep_array = arr_tensor[perm]
+            
+            # Inicializa o ponteiro
+            self._timestep_idx_pointer = 0
 
-                base_count = total_steps // t_count
-                remainder = total_steps - base_count * t_count
+            print(f"[Timestep Sampler] Successfully created a biased, globally balanced array of {self._timestep_array.numel()} timesteps.")
 
-                arr: list[int] = []
-                for i, t in enumerate(possible_timesteps):
-                    count = base_count + (1 if i < remainder else 0)
-                    arr.extend([t] * count)
-                # Se array menor que total_steps, fallback
-                if len(arr) < total_steps:
-                    return self._fallback_random_timestep(
-                        num_train_timesteps=num_train_timesteps,
-                        generator=generator,
-                        batch_size=batch_size,
-                        config=config,
-                        deterministic=deterministic
-                        
-                    )
 
-                arr = arr[:total_steps]
-                arr_tensor = torch.tensor(arr, device=generator.device, dtype=torch.long)
-                perm = torch.randperm(total_steps, generator=generator, device=generator.device)
-                self._timestep_array = arr_tensor[perm]
-                self._array_epoch = current_epoch
+        # 2. SELECIONA O PRÓXIMO TIMESTEP USANDO O PONTEIRO
+        if self._timestep_array is not None and self._timestep_idx_pointer < self._timestep_array.numel():
+            sel_timestep = self._timestep_array[self._timestep_idx_pointer]
+            self._timestep_idx_pointer += 1
 
-            # START: Seleção de um timestep aleatório do array e remoção
-            if self._timestep_array is not None:
-                if self._timestep_array.numel() > 0:
-                    rand_idx = torch.randint(
-                        low=0,
-                        high=self._timestep_array.numel(),
-                        size=(1,),
-                        generator=generator,
-                        device=generator.device
-                    ).item()
-                    sel_timestep = self._timestep_array[rand_idx]
+            # Retorna o mesmo timestep para todas as amostras no batch (se bs > 1)
+            return sel_timestep.expand(batch_size)
+        
+        # 3. FALLBACK: Se o array acabar ou falhar na criação
+        print("[Timestep Sampler] Warning: Timestep array exhausted or not created. Using fallback random sampling.")
+        return self._fallback_random_timestep(num_train_timesteps, generator, batch_size, config)
 
-                    if self._timestep_array.numel() == 1:
-                        self._timestep_array = torch.empty(
-                            (0,),
-                            dtype=torch.long,
-                            device=generator.device
-                        )
-                    else:
-                        self._timestep_array = torch.cat([
-                            self._timestep_array[:rand_idx],
-                            self._timestep_array[rand_idx + 1:]
-                        ])
-
-                    return torch.full(
-                        (batch_size,),
-                        sel_timestep,
-                        dtype=torch.long,
-                        device=generator.device,
-                    )
-                else:
-                    # Array vazio: fallback para lógica aleatória original
-                    return self._fallback_random_timestep(
-                        num_train_timesteps=num_train_timesteps,
-                        generator=generator,
-                        batch_size=batch_size,
-                        config=config,
-                        deterministic=deterministic
-                    )
-            # Fim da lógica de remoção do array
 
     def _fallback_random_timestep(
             self,
             num_train_timesteps: int,
-            deterministic: bool,
             generator: Generator,
             batch_size: int,
             config: TrainConfig,
-            latent_width: int | None = None,
-            latent_height: int | None = None,
-            train_progress: TrainProgress | None = None,
     ) -> Tensor:
-        if deterministic:
-            # -1 is for zero-based indexing
-            return torch.tensor(
-                int(num_train_timesteps * 0.5) - 1,
-                dtype=torch.long,
-                device=generator.device,
-            ).unsqueeze(0)
-        else:
-            min_timestep = int(num_train_timesteps * config.min_noising_strength)
-            max_timestep = int(num_train_timesteps * config.max_noising_strength)
-            num_timestep = max_timestep - min_timestep
-
-            shift = config.timestep_shift
-            if config.dynamic_timestep_shifting:
-                if not latent_width or not latent_height:
-                    raise NotImplementedError("Dynamic timestep shifting not support by this model")
-
-                base_seq_len = 256
-                max_seq_len = 4096
-                base_shift = 0.5
-                max_shift = 1.15
-                patch_size = 2
-
-                image_seq_len = (latent_width // patch_size) * (latent_height // patch_size)
-                m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-                b = base_shift - m * base_seq_len
-                mu = image_seq_len * m + b
-
-                shift = math.exp(mu)
-
-            if config.timestep_distribution in [
-                TimestepDistribution.UNIFORM,
-                TimestepDistribution.LOGIT_NORMAL,
-                TimestepDistribution.HEAVY_TAIL
-            ]:
-                # continuous implementations
-                if config.timestep_distribution == TimestepDistribution.UNIFORM:
-                    timestep = min_timestep + (max_timestep - min_timestep) \
-                               * torch.rand(batch_size, generator=generator, device=generator.device)
-                elif config.timestep_distribution == TimestepDistribution.LOGIT_NORMAL:
-                    bias = config.noising_bias
-                    scale = config.noising_weight + 1.0
-
-                    normal = torch.normal(bias, scale, size=(batch_size,), generator=generator, device=generator.device)
-                    logit_normal = normal.sigmoid()
-                    timestep = logit_normal * num_timestep + min_timestep
-                elif config.timestep_distribution == TimestepDistribution.HEAVY_TAIL:
-                    scale = config.noising_weight
-
-                    u = torch.rand(
-                        size=(batch_size,),
-                        generator=generator,
-                        device=generator.device,
-                    )
-                    u = 1.0 - u - scale * (torch.cos(math.pi / 2.0 * u) ** 2.0 - 1.0 + u)
-                    timestep = u * num_timestep + min_timestep
-
-                timestep = num_train_timesteps * shift * timestep / ((shift - 1) * timestep + num_train_timesteps)
-            else:
-                # Shifting a discrete distribution is done in two steps:
-                # 1. Apply the inverse shift to the linspace.
-                #    This moves the sample points of the function to their shifted place.
-                # 2. Multiply the result with the derivative of the inverse shift function.
-                #    The derivative is an approximation of the distance between sample points.
-                #    Or in other words, the size of a shifted bucket in the original function.
-                linspace = torch.linspace(0, 1, num_timestep)
-                linspace = linspace / (shift - shift * linspace + linspace)
-
-                linspace_derivative = torch.linspace(0, 1, num_timestep)
-                linspace_derivative = shift / (shift + linspace_derivative - (linspace_derivative * shift)).pow(2)
-
-                # continuous implementations
-                if config.timestep_distribution == TimestepDistribution.COS_MAP:
-                    if self.__weights is None:
-
-                        weights = 2.0 / (math.pi - 2.0 * math.pi * linspace + 2.0 * math.pi * linspace ** 2.0)
-                        weights *= linspace_derivative
-                        self.__weights = weights
-
-                    samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True) + min_timestep
-                    timestep = samples.to(dtype=torch.long, device=generator.device)
-                elif config.timestep_distribution == TimestepDistribution.SIGMOID:
-                    # if self.__weights is None:
-                    #     bias = config.noising_bias + 0.5
-                    #     weight = config.noising_weight
-
-                    #     weights = linspace / (shift - shift * linspace + linspace)
-                    #     weights = 1 / (1 + torch.exp(-weight * (weights - bias)))  # Sigmoid
-                    #     weights *= linspace_derivative
-                    #     self.__weights = weights
-
-                    # testando um schedule pra sigmoid dos timesteps, começa em 0 e fecha no valor definido na UI
-                    current_epoch = getattr(train_progress, "epoch", 1)
-                    total_epochs = config.epochs
-                    
-                    if self.__weights is None or self.__weights_epoch != current_epoch:
-                        bias = config.noising_bias + 0.5
-                        weight = config.noising_weight
-
-                        # Recalcula somente uma vez por época
-                        scaled = linspace / (shift - shift * linspace + linspace)
-                        
-                        # Ajusta 'weight' de 0 até config.noising_weight linearmente
-                        prog = float(current_epoch) / float(total_epochs)
-                        scheduled_weight = weight * prog
-
-                        weights = 1 / (1 + torch.exp(-scheduled_weight * (scaled - bias)))  # Sigmoid
-                        weights *= linspace_derivative
-
-                        self.__weights = weights
-                        self.__weights_epoch = current_epoch
-
-                    samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True) + min_timestep
-                    timestep = samples.to(dtype=torch.long, device=generator.device)
-
-            return timestep.int()
+        # Lógica original como um método de segurança
+        min_timestep = int(num_train_timesteps * config.min_noising_strength)
+        max_timestep = int(num_train_timesteps * config.max_noising_strength)
+        
+        # Amostragem aleatória simples como fallback
+        timesteps = torch.randint(
+            min_timestep,
+            max_timestep,
+            (batch_size,),
+            generator=generator,
+            device=generator.device,
+            dtype=torch.long
+        )
+        return timesteps
 
     def _get_timestep_continuous(
             self,
