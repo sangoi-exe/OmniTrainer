@@ -1224,6 +1224,18 @@ class GenericTrainer(BaseTrainer):
                     train_progress.next_step(self.config.batch_size)
                     self.callbacks.on_update_train_progress(train_progress, self._steps_per_epoch, self.config.epochs)
 
+                if self.recorder:
+                    try:
+                        # Construir um caminho de arquivo consistente que será sobrescrito
+                        output_dir = os.path.join(self.config.workspace_dir, "data_recorder")
+                        os.makedirs(output_dir, exist_ok=True)
+                        # Use um nome de arquivo fixo para o dump intermediário
+                        intermediate_path = os.path.join(output_dir, f"{self.config.save_filename_prefix}_Profile_INTERMEDIATE.json.gz")
+                        self.recorder.dump(intermediate_path)
+                        # O logFun dentro do dump já é suficiente, não precisa de mais um aqui.
+                    except Exception as e:
+                        logFun(f"[DataRecorder] Erro ao salvar dump intermediário: {e}", lvl="error")
+
                 train_progress.next_epoch() # Avança a epoch para a próxima iteração do loop externo
                 
                 # Log de final de epoch no console Rich

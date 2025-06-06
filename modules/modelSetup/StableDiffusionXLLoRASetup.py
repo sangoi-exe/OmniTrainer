@@ -209,41 +209,42 @@ class StableDiffusionXLLoRASetup(
 
         model.parameters = parameter_collection
 
-        # NOVO BLOCO DE CONFIGURAÇÃO DO TrainGPS
         model.train_gps = None
         run_1_save = getattr(config, "train_gps_save_it", False)
         run_2_use = getattr(config, "train_gps_use_it", False)
 
-        if run_1_save and run_2_use:
-            logFun("ERRO CRÍTICO: 'train_gps_save_it' e 'train_gps_use_it' não podem ser ambos True.", lvl="error")
-            # Ou levante um ValueError para parar o treino imediatamente.
-
-        elif run_1_save:
-            logFun("TrainGPS: Modo RUN 1 (Salvar Deltas) ativado.", lvl="info")
+        if run_1_save or run_2_use:
+            logFun("TrainGPS: Funcionalidade ativada.", lvl="info")
             try:
                 param_collection = getattr(model, "parameters")
-                model.train_gps = TrainGPS(model=model, param_collection=param_collection)
-                model.train_gps.capture_weights() # Captura pesos iniciais para cálculo do delta.
-                logFun("TrainGPS (Run 1) inicializado e pesos capturados.", lvl="success")
-            except Exception as e:
-                logFun(f"Falha ao inicializar TrainGPS para Run 1: {e}", lvl="error")
-                traceback.print_exc()
+                if not list(param_collection.parameters()):
+                    raise ValueError("Coleção de parâmetros está vazia. TrainGPS não pode ser inicializado.")
 
-        elif run_2_use:
-            logFun("TrainGPS: Modo RUN 2 (Usar Deltas) ativado.", lvl="info")
-            try:
-                delta_path = getattr(config, "train_gps_path", None)
-                if not delta_path or not os.path.exists(delta_path):
-                    raise FileNotFoundError(f"Caminho do padrão de delta '{delta_path}' não encontrado.")
-                
-                param_collection = getattr(model, "parameters")
-                model.train_gps = TrainGPS(model=model, param_collection=param_collection, penalty_metric=getattr(config, "delta_pattern_metric", "cosine"))
-                model.train_gps.load_reference_pattern(delta_path)
-                model.train_gps.capture_initial_weights_run2()
-                logFun("TrainGPS (Run 2) inicializado e padrão carregado.", lvl="success")
+                # Instancia o TrainGPS em todos os casos em que ele é ativo
+                model.train_gps = TrainGPS(
+                    model=model,
+                    param_collection=param_collection,
+                    penalty_metric=getattr(config, "delta_pattern_metric", "cosine")
+                )
+
+                # Configura para o modo de salvamento (Run 1 ou Run N)
+                if run_1_save:
+                    model.train_gps.setup_for_save()
+
+                # Configura para o modo de uso (Run 2 ou Run N)
+                if run_2_use:
+                    delta_path = getattr(config, "train_gps_path", None)
+                    model.train_gps.setup_for_use(delta_path)
+
+                logFun("TrainGPS inicializado com sucesso.", lvl="success")
+
             except Exception as e:
-                logFun(f"Falha ao inicializar TrainGPS para Run 2: {e}", lvl="error")
+                logFun(f"Falha CRÍTICA ao inicializar TrainGPS: {e}", lvl="error")
                 traceback.print_exc()
+                model.train_gps = None  # Garante None se falhar
+
+        else:
+            logFun("TrainGPS não será usado (configurações desativadas).", lvl="warning")
 
     def setup_train_device(
         self,
