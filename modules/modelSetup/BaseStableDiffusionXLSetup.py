@@ -28,6 +28,13 @@ from torch import Tensor
 
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
 
+def apply_channels_last_to_lora_conv(lora_module):
+    """
+    Percorre um módulo LoRA e aplica `channels_last` a qualquer camada Conv2d encontrada.
+    """
+    for module in lora_module.modules():
+        if isinstance(module, torch.nn.Conv2d):
+            module.to(memory_format=torch.channels_last)
 
 class BaseStableDiffusionXLSetup(
   BaseModelSetup,
@@ -55,6 +62,25 @@ class BaseStableDiffusionXLSetup(
           apply_circular_padding_to_conv2d(model.unet)
           if model.unet_lora is not None:
               apply_circular_padding_to_conv2d(model.unet_lora)
+
+      from modules.sangoi.logFun import logFun
+      logFun("Otimização 'channels_last' ativada. Convertendo modelos...", lvl="INFO")
+      try:
+          # Converte os componentes principais que usam convoluções 4D
+          if hasattr(model, 'unet'):
+              model.unet.to(memory_format=torch.channels_last)
+          if hasattr(model, 'vae'):
+              model.vae.to(memory_format=torch.channels_last)
+          
+          # Se você treina um LoRA, a camada de convolução dele também precisa ser convertida
+          if hasattr(model, 'unet_lora'):
+              # LoRA pode não ter sido criado ainda, então verificamos se não é None
+              if model.unet_lora is not None:
+                  apply_channels_last_to_lora_conv(model.unet_lora)
+
+          logFun("Modelos convertidos para 'channels_last' com sucesso.", lvl="SUCCESS")
+      except Exception as e:
+          logFun(f"Falha ao converter modelos para 'channels_last': {e}", lvl="ERROR")
 
       model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
           config.weight_dtypes().unet,

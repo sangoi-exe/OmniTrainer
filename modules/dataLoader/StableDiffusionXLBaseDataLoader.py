@@ -22,8 +22,42 @@ from mgds.pipelineModules.SaveText import SaveText
 from mgds.pipelineModules.ScaleImage import ScaleImage
 from mgds.pipelineModules.Tokenize import Tokenize
 from mgds.pipelineModules.VariationSorting import VariationSorting
+from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 import torch
+
+class ConvertToChannelsLast(RandomAccessPipelineModule):
+    """
+    Um módulo de pipeline MGDS para converter tensores 4D para o formato de memória 'channels_last'.
+    """
+    def __init__(self, in_name_list: list[str], out_name_list: list[str] | None = None):
+        super(ConvertToChannelsLast, self).__init__()
+        self.in_name_list = in_name_list
+        # Se out_name_list não for fornecido, a operação é in-place
+        self.out_name_list = out_name_list if out_name_list is not None else in_name_list
+
+    def length(self) -> int:
+        return self._get_previous_length(self.in_name_list[0])
+
+    def get_inputs(self) -> list[str]:
+        return self.in_name_list
+
+    def get_outputs(self) -> list[str]:
+        return self.out_name_list
+
+    def get_item(self, index: int, requested_name: str = '') -> dict:
+        # Pega todos os itens de entrada de uma vez
+        data = self._get_previous_item(self.in_name_list, index)
+
+        for in_name, out_name in zip(self.in_name_list, self.out_name_list):
+            tensor = data[in_name]
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 4:
+                data[out_name] = tensor.to(memory_format=torch.channels_last)
+            else:
+                # Se não for um tensor 4D, apenas passa adiante
+                data[out_name] = tensor
+        
+        return data
 
 class StableDiffusionXLBaseDataLoader(
     BaseDataLoader,
@@ -300,6 +334,23 @@ class StableDiffusionXLBaseDataLoader(
         augmentation_modules = self._augmentation_modules(config)
         inpainting_modules = self._inpainting_modules(config)
         preparation_modules = self._preparation_modules(config, model)
+        
+        # --- INÍCIO DA MODIFICAÇÃO CHANNELS_LAST ---
+        # Bloco para adicionar nosso módulo de conversão condicionalmente
+        channels_last_conversion_modules = []
+        # Lista dos tensores que são 4D e precisam de conversão.
+        # Estes são os 'outputs' dos módulos de preparação.
+        tensors_to_convert = ['latent_image', 'latent_mask']
+        
+        # Adiciona 'latent_conditioning_image' se for usado
+        if config.model_type.has_conditioning_image_input():
+            tensors_to_convert.append('latent_conditioning_image')
+
+        # Cria a instância do nosso módulo
+        convert_to_channels_last = ConvertToChannelsLast(in_name_list=tensors_to_convert)
+        channels_last_conversion_modules.append(convert_to_channels_last)
+        # --- FIM DA MODIFICAÇÃO CHANNELS_LAST ---
+
         cache_modules = self._cache_modules(config, model)
         output_modules = self._output_modules(config, model)
 

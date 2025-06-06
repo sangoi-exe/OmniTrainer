@@ -110,13 +110,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         losses = 0
 
         # teste de vetorização
-        diff = data["predicted"] - data["target"]           # ← cálculo único
+        diff = data["predicted"] - data["target"]
 
-        mse_loss = mae_loss = log_cosh_loss = torch.tensor(0., device=diff.device)
+        mse_loss = mae_loss = log_cosh_loss = torch.tensor(0.0, device=diff.device)
 
         if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
             mse_loss = masked_losses(
-                losses=diff.pow(2),                         # MSE sem 2ª subtração
+                losses=diff.pow(2),
                 mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -124,7 +124,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
             mae_loss = masked_losses(
-                losses=diff.abs(),                          # MAE idem
+                losses=diff.abs(),
                 mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -133,7 +133,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
             log_cosh_tensor = diff + torch.nn.functional.softplus(-2.0 * diff) - math.log(2.0)
             log_cosh_loss = masked_losses(
-                losses=log_cosh_tensor,                     # log-cosh reaproveitando diff
+                losses=log_cosh_tensor,
                 mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,

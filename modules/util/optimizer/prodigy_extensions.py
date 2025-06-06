@@ -4,7 +4,8 @@ import torch
 import torch.distributed as dist
 
 from modules.util.bf16_stochastic_rounding import (
-    addcdiv_stochastic_buffered_, # <-- MUDANÇA
+    add_stochastic_,
+    addcdiv_stochastic_,
 )
 
 from prodigyopt.prodigy import Prodigy
@@ -95,9 +96,6 @@ def step_prodigy(self, closure=None):
 
                 # Exponential moving average of squared gradient values
                 state["exp_avg_sq"] = torch.zeros_like(p.data).detach()
-                
-                if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    state['fp32_buffer'] = torch.empty_like(p.data, dtype=torch.float32)                
 
             exp_avg_sq = state["exp_avg_sq"]
             s = state["s"]
@@ -197,8 +195,7 @@ def step_prodigy(self, closure=None):
                 exp_avg = state["exp_avg"]
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                     try:
-                        buffer = state['fp32_buffer']
-                        addcdiv_stochastic_buffered_(p.data, buffer, exp_avg, denom, value=-dlr)
+                        addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
@@ -208,9 +205,7 @@ def step_prodigy(self, closure=None):
             else:
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                     try:
-                        buffer = state['fp32_buffer']
-                        # Note que o 'grad' aqui é fp32, então a operação no buffer é direta
-                        addcdiv_stochastic_buffered_(p.data, buffer, grad, denom, value=-dlr * d)
+                        addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()

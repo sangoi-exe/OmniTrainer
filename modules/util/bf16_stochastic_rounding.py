@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 
-# NOVA FUNÇÃO OTIMIZADA
+# supostamente pode ser melhor usar essa do que addcdiv e etc
 def addcdiv_stochastic_buffered_(input_bf16: Tensor, buffer_fp32: Tensor, tensor1: Tensor, tensor2: Tensor, value: float = 1.0):
     """
     Versão otimizada que usa um buffer float32 pré-alocado.
