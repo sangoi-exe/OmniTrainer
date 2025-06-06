@@ -369,9 +369,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.progress = progress
         self.tensorboard = model.tensorboard
         
-        gps_instance: TrainGPS | None = getattr(model, 'deltas', None)
-
-        loss_weight = batch["loss_weight"]
+        train_gps: TrainGPS | None = getattr(model, 'train_gps', None)
 
         batch_size_scale = (
             1 if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION] else config.batch_size
@@ -443,11 +441,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         self.progress.global_step,
                     )
 
-            if config.train_gps_use_it and gps_instance is not None and gps_instance.reference_deltas:
+            if config.train_gps_use_it and train_gps is not None and train_gps.reference_deltas:
               try:
                 # Calcula a penalidade usando os pesos *atuais* do modelo
                 # e comparando o delta *acumulado atual* com o delta de referência
-                penalty = gps_instance.compute_penalty(lambda_weight=config.train_gps_weight)
+                penalty = train_gps.compute_penalty(lambda_weight=config.train_gps_weight)
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto

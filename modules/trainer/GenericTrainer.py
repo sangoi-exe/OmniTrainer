@@ -92,16 +92,15 @@ class GenericTrainer(BaseTrainer):
     pause_request_locked: bool  # Para travar o switch da UI
     pause_requested_at_epoch_end: bool
 
-
     _training_live: Optional[Live] = None # A única instância Live para todo o display
     _global_progress_instance: Optional['Progress'] = None # Referência ao objeto Progress global do logFun
 
     _current_step_duration_s: float = 0.0
     _epoch_time_elapsed_s: float = 0.0
     _avg_step_time_epoch_s: float = 0.0
+    _total_training_time_start_s: Optional[float] = None  # Para tempo total de treino
     _ema_step_time_s: Optional[float] = None  # Para média móvel exponencial
     _ema_alpha: float = 0.05  # Ajuste para mais ou menos suavização (menor = mais suave)
-    _total_training_time_start_s: Optional[float] = None  # Para tempo total de treino
 
     _epoch_start_time_s: Optional[float] = None  # Para calcular tempo da epoch e ETA
     _num_total_epochs: int = 0
@@ -134,6 +133,15 @@ class GenericTrainer(BaseTrainer):
         set_logfun_console(self.console)
 
         self._num_total_epochs = config.epochs
+
+        if getattr(self.config, "data_recorder", False):
+            # Recorder is active based on its flag. Its behavior (recording) is mainly for Run 1,
+            # but it might be optionally used in Run 2 for analysis if needed.
+            # No specific check for run_number needed here for activation, just for the 'purpose' log maybe.
+            self.recorder = DataRecorder()
+            logFun(f"[DataRecorder] Os dados dessa run serão armazenados.", lvl="debug")
+        else:
+            logFun("[DataRecorder] Desativado.", lvl="debug")        
 
     def _create_training_display_content(
         self,
@@ -1007,7 +1015,7 @@ class GenericTrainer(BaseTrainer):
                         global_step=train_progress.global_step,
                     )
 
-                gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
+                train_gps: TrainGPS | None = getattr(self.model, "train_gps", None)
                 self._steps_per_epoch = self.data_loader.get_data_set().approximate_length()
                 train_progress.set_total_steps(self._steps_per_epoch * self.config.epochs)
 
@@ -1101,12 +1109,47 @@ class GenericTrainer(BaseTrainer):
                         if self.config.debugoi:
                             if predicted_tensor_from_model.grad is not None:
                                 leak = (predicted_tensor_from_model.grad * (1 - mask_fp32)).abs().max()
-                                logFun(f"Leak grad (bf16→FP32) = {leak.item():.2e}")
+                                logFun(f"Leak grad (bf16→FP32) = {leak.item():.2e}", lvl="warning")
                             else:
-                                logFun("WARNING: grad é None — verifique se retain_grad foi chamado antes do backward")
+                                logFun("WARNING: grad é None — verifique se retain_grad foi chamado antes do backward", lvl="warning")
                             
                         has_gradient = True
                         accumulated_loss += loss.item()
+
+                        try:
+                            # puxar as stats do Prodigy
+                            prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
+
+                            if prodigy_current_data and hasattr(self.model, "param_group_mapping"):
+                                for stat_data in prodigy_current_data:
+                                    group_idx = stat_data.get("group_idx")
+                                    # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
+                                    name = stat_data.get("name") 
+                                    
+                                    if name is not None:
+                                        # Obter o d_num e d_denom
+                                        d_num_pdgy_raw = stat_data.get("d_num")
+                                        d_den_pdgy_raw = stat_data.get("d_den")
+                                    else:
+                                        logFun("Deu pau aqui na parte de extrair d_num e d_den.", lvl="warning")
+
+                                    d_num_pdgy = None
+                                    if d_num_pdgy_raw is not None:
+                                        d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
+                                        
+                                    d_den_pdgy = None
+                                    if d_den_pdgy_raw is not None:
+                                        d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)                                        
+
+                                    self.recorder.log_metrics_step(
+                                        name=name,
+                                        d_num_pdgy=d_num_pdgy,
+                                        d_den_pdgy=d_den_pdgy,
+                                    )
+                        except Exception as e:
+                            logFun(f"Deu merda no first loop: {e}", lvl="error")
+                            traceback.print_exc()
+
                         if self.__is_update_step(train_progress):
                             if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
                                     self.config.optimizer.fused_back_pass):
@@ -1213,11 +1256,11 @@ class GenericTrainer(BaseTrainer):
                     break  # Sai do loop de épocas
 
                 # 1. TrainGPS salva os deltas da epoch
-                if gps_instance is not None:
+                if train_gps is not None:
                     if self.config.train_gps_save_it:
                         try:
                             epoch_idx = train_progress.epoch - 1
-                            gps_instance.log_group_deltas(epoch_idx)
+                            train_gps.log_group_deltas(epoch_idx)
                         except Exception as e:
                             logFun(f"[TrainGPS] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}", lvl="error")
                             traceback.print_exc()
@@ -1296,9 +1339,9 @@ class GenericTrainer(BaseTrainer):
         model_name, _ = os.path.splitext(model_filename)  # Get model name without extension
 
         # --- Save Delta Pattern (If train_gps_save_it is True AND instance exists) ---
-        gps_instance: TrainGPS | None = getattr(self.model, "deltas", None)
+        train_gps: TrainGPS | None = getattr(self.model, "train_gps", None)
         # A condição agora é apenas checar a flag de salvar e se o módulo foi inicializado
-        if getattr(self.config, "train_gps_save_it", False) and gps_instance is not None:
+        if getattr(self.config, "train_gps_save_it", False) and train_gps is not None:
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 # Incluir o número da Run no nome do arquivo para clareza
@@ -1310,7 +1353,7 @@ class GenericTrainer(BaseTrainer):
                 logFun(f"[TrainGPS] Salvando deltas (Run {self.run_number}) em: {delta_save_path}", lvl="info")
                 # A função save_group_deltas salva o estado atual do delta_log_by_module
                 # que foi acumulado durante esta run específica.
-                gps_instance.save_group_deltas(delta_save_path)
+                train_gps.save_group_deltas(delta_save_path)
             except Exception as e:
                 logFun(f"[TrainGPS] Erro ao salvar deltas (Run {self.run_number}): {e}", lvl="error")
                 traceback.print_exc()

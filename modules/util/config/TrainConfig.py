@@ -270,37 +270,24 @@ class TrainConfig(BaseConfig):
     force_circular_padding: bool
     
     # sangoi settings
+    debugoi: bool
+    
     lora_layers_blacklist: list[str]
     lora_modules_rank_rules: list[dict[str, int]] = []
     lora_modules_alpha_rules: list[dict[str, int]] = []
     save_predictions: bool
     gen_lora_keys: bool
     bucket_ratio: int
-    debugoi: bool
-    full_vae_mf: bool
-    sangoi_use_huber: bool
-    sangoi_use_loss_schedule: bool
-    sangoi_schedule: bool
-    alpha_sangoi: float
-    enable_tf: bool
-    sangoi_loss_blend_window: float
     
-    # delta pattern settings
+    # traingps settings
     train_gps_save_it: bool
     train_gps_use_it: bool
     train_gps_path: str
     train_gps_weight: float
-    delta_pattern_save_every: int = 0
-    delta_pattern_save_every_unit: TimeUnit = TimeUnit.EPOCH
+    train_gps_save_every: int = 0
+    train_gps_save_every_unit: TimeUnit = TimeUnit.EPOCH
     
-    # dcoef pattern settings
-    adpt_dcoef_path: str
-    adpt_dcoef_use_it: bool
-    
-    # convctrl settings
-    convctrl_use_it: bool
-    
-    # dynrecorder settings
+    # datarecorder settings
     data_recorder: bool
     
     # which run
@@ -316,6 +303,7 @@ class TrainConfig(BaseConfig):
     # training settings
     learning_rate_scheduler: LearningRateScheduler
     custom_learning_rate_scheduler: str | None
+    
     # Dict keys are literally called "key" and "value"; not a tuple because
     # of restrictions with ConfigList.
     scheduler_params: list[dict[str, str]]

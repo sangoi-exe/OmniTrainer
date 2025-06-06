@@ -1,8 +1,8 @@
 import os
 import traceback
+import torch
 from typing import Optional
 
-import inspect
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
@@ -18,7 +18,8 @@ from modules.util.TrainProgress import TrainProgress
 from modules.module.LoRAModule import PeftBase
 from torch.utils.tensorboard import SummaryWriter
 
-import torch
+
+from modules.sangoi.TrainGPS import TrainGPS
 
 PRESETS = {
     "attn-mlp": ["attentions"],
@@ -208,90 +209,41 @@ class StableDiffusionXLLoRASetup(
 
         model.parameters = parameter_collection
 
-        # testar esse mamute do gemini, cheio de verificações e etc
-        from modules.sangoi.TrainGPS import TrainGPS
-        # Garante que deltas é None por padrão
-        model.deltas = None
+        # NOVO BLOCO DE CONFIGURAÇÃO DO TrainGPS
+        model.train_gps = None
+        run_1_save = getattr(config, "train_gps_save_it", False)
+        run_2_use = getattr(config, "train_gps_use_it", False)
 
-        if config.train_gps_use_it or config.train_gps_save_it:
-            logFun("Tentando inicializar TrainGPS...", lvl="TRAINGPS")
+        if run_1_save and run_2_use:
+            logFun("ERRO CRÍTICO: 'train_gps_save_it' e 'train_gps_use_it' não podem ser ambos True.", lvl="error")
+            # Ou levante um ValueError para parar o treino imediatamente.
+
+        elif run_1_save:
+            logFun("TrainGPS: Modo RUN 1 (Salvar Deltas) ativado.", lvl="info")
             try:
-                # A coleção de parâmetros AGORA existe e foi atribuída
-                param_collection = getattr(model, "parameters", None)
-                if param_collection is None or not isinstance(param_collection, NamedParameterGroupCollection):
-                      raise ValueError("Coleção de parâmetros (model.parameters) inválida ou não encontrada para DeltaPattern.")
-                if not list(param_collection.parameters()):
-                    logFun("Aviso: Coleção de parâmetros está vazia. DeltaPattern não será inicializado.", lvl="error")
-
-                if config.train_gps_save_it:
-                    # Atribui a instância ao modelo
-                    model.deltas = TrainGPS(
-                        model=model, # Passa a instância do modelo completa
-                        param_collection=param_collection, # Passa a coleção de parâmetros
-                        penalty_metric=getattr(config, "delta_pattern_metric", "cosine"), # Usa config ou default
-                    )
-                
-                    logFun("Capturando pesos iniciais para salvar (Run 1)...", lvl="TRAINGPS")
-                    model.deltas.capture_weights() # Usa o cache_device interno
-
-                if config.train_gps_use_it:
-                    delta_path = getattr(config, "train_gps_path", None)
-                    if delta_path and os.path.exists(delta_path):
-                        logFun(f"Carregando padrão de referência de: {delta_path}", lvl="TRAINGPS")
-                        # Determina device/dtype de treino para carregar o padrão corretamente
-                        train_dtype_torch = config.train_dtype.torch_dtype() # Pega do config
-                        train_dev = self.train_device # Usa o train_device da classe setup
-
-                        model.deltas.load_reference_pattern(delta_path)
-                        if model.deltas.reference_deltas:  # Checa se carregou
-                            logFun("Capturando pesos iniciais para cálculo de penalidade (Run 2)...", lvl="TRAINGPS")
-                            model.deltas.capture_initial_weights_run2() # Usa o cache_device interno
-                        else:
-                            logFun(f"Aviso: Falha ao carregar padrão de delta de '{delta_path}'. Penalidade desativada.", lvl="error")
-                            config.train_gps_use_it = False  # Desativa
-                    else:
-                        logFun(f"Aviso: 'train_gps_use_it' True, mas caminho '{delta_path}' inválido ou não especificado. Penalidade desativada.", lvl="warning")
-                        config.train_gps_use_it = False  # Desativa
-
-                logFun("Configuração do TrainGPS concluída.", lvl="TRAINGPS")
-
+                param_collection = getattr(model, "parameters")
+                model.train_gps = TrainGPS(model=model, param_collection=param_collection)
+                model.train_gps.capture_weights() # Captura pesos iniciais para cálculo do delta.
+                logFun("TrainGPS (Run 1) inicializado e pesos capturados.", lvl="success")
             except Exception as e:
-                logFun(f"Falha CRÍTICA ao inicializar TrainGPS: {e}", lvl="error")
+                logFun(f"Falha ao inicializar TrainGPS para Run 1: {e}", lvl="error")
                 traceback.print_exc()
-                model.deltas = None  # Garante None se falhar
-                config.train_gps_use_it = False # Desativa a funcionalidade se a inicialização falhar
-        else:
-            logFun("TrainGPS não será usado (configurações desativadas).", lvl="warning")
-            model.deltas = None # Garante None se não for usado
-        # END: Modificação solicitada - Refined TrainGPS initialization
 
-        # # Código original comentado para referência
-        # model.deltas = TrainGPS(model, model.parameters)
-        # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
-
-        # model.deltas = TrainGPS(model, model.parameters)
-        # # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
-        # if config.train_gps_save_it:
-        #     print("Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
-        #     model.deltas.capture_weights()
-
-        # if config.train_gps_use_it:
-        #     if config.train_gps_path and os.path.exists(config.train_gps_path):
-        #         print(f"Carregando padrão de delta de referência de: {config.train_gps_path}")
-        #         model.deltas.load_reference_pattern(config.train_gps_path)
-        #         if model.deltas.reference_deltas:  # Verifica se carregou com sucesso
-        #             print("Capturando pesos iniciais para cálculo da penalidade (Run 2).")
-        #             model.deltas.capture_initial_weights_run2()
-        #         else:
-        #             print(
-        #                 f"Aviso: Falha ao carregar o padrão de delta de '{config.train_gps_path}'. A penalidade será desativada."
-        #             )
-        #             config.train_gps_use_it = False  # Desativa se não conseguiu carregar
-        #     else:
-        #         print(
-        #             f"Aviso: 'train_gps_use_it' é True, mas o caminho '{config.train_gps_path}' não foi encontrado ou não especificado. A penalidade será desativada."
-        #         )
-        #         config.train_gps_use_it = False  # Desativa se o caminho não existe
+        elif run_2_use:
+            logFun("TrainGPS: Modo RUN 2 (Usar Deltas) ativado.", lvl="info")
+            try:
+                delta_path = getattr(config, "train_gps_path", None)
+                if not delta_path or not os.path.exists(delta_path):
+                    raise FileNotFoundError(f"Caminho do padrão de delta '{delta_path}' não encontrado.")
+                
+                param_collection = getattr(model, "parameters")
+                model.train_gps = TrainGPS(model=model, param_collection=param_collection, penalty_metric=getattr(config, "delta_pattern_metric", "cosine"))
+                model.train_gps.load_reference_pattern(delta_path)
+                model.train_gps.capture_initial_weights_run2()
+                logFun("TrainGPS (Run 2) inicializado e padrão carregado.", lvl="success")
+            except Exception as e:
+                logFun(f"Falha ao inicializar TrainGPS para Run 2: {e}", lvl="error")
+                traceback.print_exc()
 
     def setup_train_device(
         self,
