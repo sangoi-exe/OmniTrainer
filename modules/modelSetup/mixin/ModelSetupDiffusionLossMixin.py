@@ -103,69 +103,45 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         data: dict,
         config: TrainConfig,
     ):
-
         progress = self.progress
+        diff = data["predicted"] - data["target"]
+        losses = torch.tensor(0.0, device=diff.device)
+
+        pred, tgt = data["predicted"], data["target"]
+        if pred.dtype != tgt.dtype:
+            tgt = tgt.to(dtype=pred.dtype)
+            
         if getattr(config, "sangoi_schedule", False):
             return self.__sangoi_loss_schedule(batch, data, config, progress)        
-        losses = 0
-
+        
         # teste de vetorização
-        diff = data["predicted"] - data["target"]
+        if config.mse_strength != 0:
+            losses += F.mse_loss(pred, tgt, reduction="none") * config.mse_strength
 
-        mse_loss = mae_loss = log_cosh_loss = torch.tensor(0.0, device=diff.device)
+        if config.mae_strength != 0:
+            losses += F.l1_loss(pred, tgt, reduction="none") * config.mae_strength
 
-        if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
-            mse_loss = masked_losses(
-                losses=diff.pow(2),
-                mask=batch["latent_mask"],
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean([1, 2, 3])
+        if config.log_cosh_strength != 0:
+            losses += self.__log_cosh_loss(pred, tgt) * config.log_cosh_strength
 
-        if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
-            mae_loss = masked_losses(
-                losses=diff.abs(),
-                mask=batch["latent_mask"],
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean([1, 2, 3])
-
-        if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
-            log_cosh_tensor = diff + torch.nn.functional.softplus(-2.0 * diff) - math.log(2.0)
-            log_cosh_loss = masked_losses(
-                losses=log_cosh_tensor,
-                mask=batch["latent_mask"],
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean([1, 2, 3])
-
-
-        match config.loss_mode_fn:
-            case config.loss_mode_fn.ORIGINAL:
-                losses = (
-                    mse_loss * config.mse_strength
-                    + mae_loss * config.mae_strength
-                    + log_cosh_loss * config.log_cosh_strength
-                )
-
-                # VB loss
-                if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
-                    losses += (
-                        masked_losses(
-                            losses=vb_losses(
-                                coefficients=self.__coefficients,
-                                x_0=data["scaled_latent_image"],
-                                x_t=data["noisy_latent_image"],
-                                t=data["timestep"],
-                                predicted_eps=data["predicted"],
-                                predicted_var_values=data["predicted_var_values"],
-                            ),
-                            mask=batch["latent_mask"],
-                            unmasked_weight=config.unmasked_weight,
-                            normalize_masked_area_loss=config.normalize_masked_area_loss,
-                        ).mean([1, 2, 3])
-                        * config.vb_loss_strength
-                    )
+        # VB loss
+        if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
+            losses += (
+                masked_losses(
+                    losses=vb_losses(
+                        coefficients=self.__coefficients,
+                        x_0=data["scaled_latent_image"],
+                        x_t=data["noisy_latent_image"],
+                        t=data["timestep"],
+                        predicted_eps=data["predicted"],
+                        predicted_var_values=data["predicted_var_values"],
+                    ),
+                    mask=batch["latent_mask"],
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss,
+                ).mean([1, 2, 3])
+                * config.vb_loss_strength
+            )
 
         return losses
 
@@ -175,65 +151,54 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         data: dict,
         config: TrainConfig,
     ):
+        diff = data["predicted"] - data["target"]
+        losses = torch.tensor(0.0, device=diff.device)
 
-        progress = self.progress
-        if getattr(config, "sangoi_schedule", False):
-            return self.__sangoi_loss_schedule(batch, data, config, progress)
-        losses = 0
-
-        mse_loss = torch.tensor(0.0, device=data["predicted"].device)
-        mae_loss = torch.tensor(0.0, device=data["predicted"].device)
-        log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
+        pred, tgt = data["predicted"], data["target"]
+        if pred.dtype != tgt.dtype:
+            tgt = tgt.to(dtype=pred.dtype)
 
         # MSE/L2 Loss
-        if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
-            mse_loss = F.mse_loss(
+        if config.mse_strength != 0:
+            losses += F.mse_loss(
                 data["predicted"],
                 data["target"],
                 reduction="none",
-            ).mean([1, 2, 3])
+            ).mean([1, 2, 3]) * config.mse_strength
 
         # MAE/L1 Loss
-        if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
-            mae_loss = F.l1_loss(
+        if config.mae_strength != 0:
+            losses += F.l1_loss(
                 data["predicted"],
                 data["target"],
                 reduction="none",
-            ).mean([1, 2, 3])
+            ).mean([1, 2, 3]) * config.mae_strength
 
         # log-cosh Loss
-        if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
-            log_cosh_loss = self.__log_cosh_loss(
+        if config.log_cosh_strength != 0:
+            losses += self.__log_cosh_loss(
                 data["predicted"],
                 data["target"],
-            ).mean([1, 2, 3])
+            ).mean([1, 2, 3]) * config.log_cosh_strength
 
-        match config.loss_mode_fn:
-            case config.loss_mode_fn.ORIGINAL:
-                losses = (
-                    mse_loss * config.mse_strength
-                    + mae_loss * config.mae_strength
-                    + log_cosh_loss * config.log_cosh_strength
-                )
-
-                # VB loss
-                if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
-                    losses += (
-                        masked_losses(
-                            losses=vb_losses(
-                                coefficients=self.__coefficients,
-                                x_0=data["scaled_latent_image"],
-                                x_t=data["noisy_latent_image"],
-                                t=data["timestep"],
-                                predicted_eps=data["predicted"],
-                                predicted_var_values=data["predicted_var_values"],
-                            ),
-                            mask=batch["latent_mask"],
-                            unmasked_weight=config.unmasked_weight,
-                            normalize_masked_area_loss=config.normalize_masked_area_loss,
-                        ).mean([1, 2, 3])
-                        * config.vb_loss_strength
-                    )
+        # VB loss
+        if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
+            losses += (
+                masked_losses(
+                    losses=vb_losses(
+                        coefficients=self.__coefficients,
+                        x_0=data["scaled_latent_image"],
+                        x_t=data["noisy_latent_image"],
+                        t=data["timestep"],
+                        predicted_eps=data["predicted"],
+                        predicted_var_values=data["predicted_var_values"],
+                    ),
+                    mask=batch["latent_mask"],
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss,
+                ).mean([1, 2, 3])
+                * config.vb_loss_strength
+            )
 
         return losses
 
