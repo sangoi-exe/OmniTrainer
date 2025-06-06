@@ -82,13 +82,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             progress.global_step,
         )
 
-        masked = masked_losses(
-            losses=base_loss,
-            mask=batch["latent_mask"],
-            unmasked_weight=config.unmasked_weight,
-            normalize_masked_area_loss=config.normalize_masked_area_loss,
-        )
-        return masked.mean([1, 2, 3])
+        return base_loss
 
     def __log_cosh_loss(
         self,
