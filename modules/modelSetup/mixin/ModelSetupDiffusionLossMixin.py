@@ -177,8 +177,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     ):
 
         progress = self.progress
-        if getattr(config, "sangoi_loss", False):
-            return self.__sangoi_loss_schedule(batch, data, config)        
+        if getattr(config, "sangoi_schedule", False):
+            return self.__sangoi_loss_schedule(batch, data, config, progress)
         losses = 0
 
         mse_loss = torch.tensor(0.0, device=data["predicted"].device)
@@ -297,7 +297,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
       predicted: Tensor,
       target: Tensor,
       device: torch.device,
-      gamma: float, # Renomeado para 'focus_strength' seria mais claro, mas mantendo 'gamma' por consistência.
+      gamma: float,
     ):
       """
       Calcula um peso de loss por amostra baseado nos princípios de Online Hard Example Mining (OHEM).
@@ -392,7 +392,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             )  # Adicionado para clareza
         else:
             # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
-            #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
+            # This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
             if config.masked_training and not config.model_type.has_conditioning_image_input():
                 losses = self.__masked_losses(batch, data, config)
             else:
@@ -400,8 +400,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         # Scale Losses by Batch and/or GA (if enabled)
         losses = losses * batch_size_scale * gradient_accumulation_steps_scale
-
-        losses *= loss_weight.to(device=losses.device, dtype=losses.dtype)
 
         # Apply timestep based loss weighting.
         if "timestep" in data and data["loss_type"] != "align_prop":
