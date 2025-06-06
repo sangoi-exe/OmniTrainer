@@ -21,7 +21,6 @@ from torch import Tensor
 
 from typing import Callable, Optional
 from torch.utils.tensorboard import SummaryWriter
-from modules.sangoi.DynamicLossControl import LossTracker, DynamicLossControl
 from modules.sangoi.TrainGPS import TrainGPS
 
 class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
@@ -41,48 +40,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.config = None
         self.loaded_pattern_deltas = None
         self.blend_window = None
-        self.loss_tracker = LossTracker(window_size=500, use_mad=True)
-        self.dynamic_loss_strengthing = DynamicLossControl()
         self.tensorboard: Optional[SummaryWriter] = None,
-
-    def __sangoi_loss_schedule(self, batch, data, config, progress):
-        pred, tgt = data["predicted"], data["target"]
-        if pred.dtype != tgt.dtype:
-            tgt = tgt.to(dtype=pred.dtype)
-
-        # componentes sempre disponíveis
-        mae = F.l1_loss(pred, tgt, reduction="none")
-        logc = self.__log_cosh_loss(pred, tgt)
-        mse  = F.mse_loss(pred, tgt, reduction="none")
-
-        # z-scores + pesos
-        self.loss_tracker.update(mse.mean(), mae.mean(), logc.mean())
-        mse_z, mae_z, log_z = self.loss_tracker.compute_z_scores(mse.mean(), mae.mean(), logc.mean())
-        w_mse, w_mae, w_log = self.dynamic_loss_strengthing.adjust_weights(mse_z, mae_z, log_z, config, progress)
-
-        base_loss = (
-            mse  * w_mse +
-            mae  * w_mae +
-            logc * w_log
-          )
-
-        self.tensorboard.add_scalar(
-            "SangoiS/MSE_Loss",
-            w_mse,
-            progress.global_step,
-        )
-        self.tensorboard.add_scalar(
-            "SangoiS/MAE_Loss",
-            w_mae,
-            progress.global_step,
-        )
-        self.tensorboard.add_scalar(
-            "SangoiS/Log_Cosh_Loss",
-            w_log,
-            progress.global_step,
-        )
-
-        return base_loss
 
     def __log_cosh_loss(
         self,
@@ -103,7 +61,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         data: dict,
         config: TrainConfig,
     ):
-        progress = self.progress
         diff = data["predicted"] - data["target"]
         losses = torch.tensor(0.0, device=diff.device)
 
@@ -111,9 +68,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if pred.dtype != tgt.dtype:
             tgt = tgt.to(dtype=pred.dtype)
             
-        if getattr(config, "sangoi_schedule", False):
-            return self.__sangoi_loss_schedule(batch, data, config, progress)        
-        
         # teste de vetorização
         if config.mse_strength != 0:
             losses += F.mse_loss(pred, tgt, reduction="none") * config.mse_strength
@@ -121,8 +75,12 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.mae_strength != 0:
             losses += F.l1_loss(pred, tgt, reduction="none") * config.mae_strength
 
+        # log-cosh Loss
         if config.log_cosh_strength != 0:
-            losses += self.__log_cosh_loss(pred, tgt) * config.log_cosh_strength
+            log_cosh_loss= self.__log_cosh_loss(
+                data["predicted"],
+                data["target"],
+            ).mean([1, 2, 3]) * config.log_cosh_strength
 
         # VB loss
         if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
@@ -143,7 +101,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 * config.vb_loss_strength
             )
 
-        return losses
+        return log_cosh_loss
 
     def __unmasked_losses(
         self,

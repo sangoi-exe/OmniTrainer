@@ -105,6 +105,7 @@ class GenericTrainer(BaseTrainer):
     _epoch_start_time_s: Optional[float] = None  # Para calcular tempo da epoch e ETA
     _num_total_epochs: int = 0
     _steps_per_epoch: int = 0
+    run_number: int = 1
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
@@ -133,6 +134,7 @@ class GenericTrainer(BaseTrainer):
         set_logfun_console(self.console)
 
         self._num_total_epochs = config.epochs
+        self.run_number = getattr(self.config, "run_number", 1)
 
         if getattr(self.config, "data_recorder", False):
             # Recorder is active based on its flag. Its behavior (recording) is mainly for Run 1,
@@ -1116,10 +1118,24 @@ class GenericTrainer(BaseTrainer):
                         has_gradient = True
                         accumulated_loss += loss.item()
 
-                        try:
-                            # puxar as stats do Prodigy
-                            prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
+                        if self.__is_update_step(train_progress):
+                            if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
+                                    self.config.optimizer.fused_back_pass):
+                                scaler.step_after_unscale_parameter_(self.model.optimizer)
+                                scaler.update()
+                            elif scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                scaler.step(self.model.optimizer)
+                                scaler.update()
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                self.model.optimizer.step()
 
+                            # puxar as stats do Prodigy após o opt step
+                            prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
                             if prodigy_current_data and hasattr(self.model, "param_group_mapping"):
                                 for stat_data in prodigy_current_data:
                                     group_idx = stat_data.get("group_idx")
@@ -1146,25 +1162,6 @@ class GenericTrainer(BaseTrainer):
                                         d_num_pdgy=d_num_pdgy,
                                         d_den_pdgy=d_den_pdgy,
                                     )
-                        except Exception as e:
-                            logFun(f"Deu merda no first loop: {e}", lvl="error")
-                            traceback.print_exc()
-
-                        if self.__is_update_step(train_progress):
-                            if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
-                                    self.config.optimizer.fused_back_pass):
-                                scaler.step_after_unscale_parameter_(self.model.optimizer)
-                                scaler.update()
-                            elif scaler:
-                                scaler.unscale_(self.model.optimizer)
-                                if self.config.clip_grad_norm is not None:
-                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
-                                scaler.step(self.model.optimizer)
-                                scaler.update()
-                            else:
-                                if self.config.clip_grad_norm is not None:
-                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
-                                self.model.optimizer.step()
 
                             # Scheduler de learning rate
                             lr_scheduler.step()

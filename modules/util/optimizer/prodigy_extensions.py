@@ -194,22 +194,26 @@ def step_prodigy(self, closure=None):
             if beta1 > 0:
                 exp_avg = state["exp_avg"]
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
+                    # <<< CHATGPT ADD STROCHASTIC PROTECT >>>
                     try:
                         addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
                         p.data.addcdiv_(exp_avg, denom, value=-dlr)
+                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(exp_avg, denom, value=-dlr)
             else:
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
+                    # <<< CHATGPT ADD STROCHASTIC PROTECT <<<
                     try:
                         addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
                         p.data.addcdiv_(grad, denom, value=-dlr * d)
+                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(grad, denom, value=-dlr * d)
 
