@@ -1146,6 +1146,7 @@ class GenericTrainer(BaseTrainer):
                                         # Obter o d_num e d_denom
                                         d_num_pdgy_raw = stat_data.get("d_num")
                                         d_den_pdgy_raw = stat_data.get("d_den")
+                                        dlr_pdgy_raw = stat_data.get("dlr")
                                     else:
                                         logFun("Deu pau aqui na parte de extrair d_num e d_den.", lvl="warning")
 
@@ -1156,11 +1157,16 @@ class GenericTrainer(BaseTrainer):
                                     d_den_pdgy = None
                                     if d_den_pdgy_raw is not None:
                                         d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)                                        
+                                    
+                                    dlr_pdgy = None
+                                    if dlr_pdgy_raw is not None:
+                                        dlr_pdgy = float(d_den_pdgy_raw.item() if isinstance(dlr_pdgy_raw, torch.Tensor) else dlr_pdgy_raw)                                        
 
                                     self.recorder.log_metrics_step(
                                         name=name,
                                         d_num_pdgy=d_num_pdgy,
                                         d_den_pdgy=d_den_pdgy,
+                                        dlr_pdgy=dlr_pdgy,
                                     )
 
                             # Scheduler de learning rate
