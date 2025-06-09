@@ -57,32 +57,6 @@ class SangoiTab:
         components.switch(self.main_frame, row_index, 5, self.ui_state, "debugoi")
         row_index += 1
 
-        # Slot 3 (cols 4, 5) fica em branco
-        components.label(self.main_frame, row_index, 0, "Full VAE",
-                         tooltip="Use full vae on sangoi loss fun, WILL FALLBACK TO SYSTEM RAM (6gb for VAE)")
-        components.switch(self.main_frame, row_index, 1, self.ui_state, "full_vae_mf")
-        
-        components.label(self.main_frame, row_index, 2, "Alpha Sangoi",
-                         tooltip="Scale for sangoi loss function. Suggested 0.3")
-        components.entry(self.main_frame, row_index, 3, self.ui_state, "alpha_sangoi")
-        row_index += 1
-
-        # Slot 3 (cols 4, 5) fica em branco
-        components.label(self.main_frame, row_index, 0, "Use Sangoi Schedule",
-                         tooltip="Use sangoi loss schedule (includes huber).")
-        components.switch(self.main_frame, row_index, 1, self.ui_state, "sangoi_schedule")
-        
-        # Slot 3 (cols 4, 5) fica em branco
-        components.label(self.main_frame, row_index, 2, "Use Uber Loss",
-                         tooltip="Use huber loss style from kohya scripts")
-        components.switch(self.main_frame, row_index, 3, self.ui_state, "sangoi_use_huber")
-        
-        components.label(self.main_frame, row_index, 4, "Huber Factor",
-                         tooltip="Huber factor. Default 0.1.")
-        components.entry(self.main_frame, row_index, 5, self.ui_state, "sangoi_huber_factor")
-        row_index += 1
-        
-        # --- Row 2: Use Delta Pattern & Save Delta Pattern ---
         # Slot 1
         components.label(self.main_frame, row_index, 0, "Use Delta Pattern",
                          tooltip="Apply a pre-defined delta pattern during training.")

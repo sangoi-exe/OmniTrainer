@@ -279,6 +279,7 @@ class TrainConfig(BaseConfig):
     gen_lora_keys: bool
     bucket_ratio: int
     huber_strength: float
+    charbonnier_strength: float
     
     # traingps settings
     train_gps_save_it: bool
@@ -808,6 +809,7 @@ class TrainConfig(BaseConfig):
         data.append(("convctrl_use_it", False, bool, False))
         data.append(("run_number", 1, int, False))
         data.append(("huber_strength", 0.0, float, False))
+        data.append(("charbonnier_strength", 0.0, float, False))
     
         
         # data settings

@@ -141,6 +141,34 @@ def step_prodigy(self, closure=None):
                 global_d_numerator = d_numerator
                 global_d_denom = d_denom
 
+            # 1. Gradiente médio do grupo (|g|) -> escalar
+            # Usamos tensor para evitar problemas de device e permitir detach()
+            device_param = next(p for p in group["params"] if p.grad is not None).device
+            grad_abs_sum = torch.tensor(0.0, device=device_param)
+            grad_elem_cnt = 0
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                grad_abs_sum += g.abs().sum().item()
+                grad_elem_cnt += g.numel()
+            grad_mean = grad_abs_sum / (grad_elem_cnt + 1e-8)
+
+            # 2. Estado por grupo para EMA
+            dstate     = self.state.setdefault("_dcoef_state", {})
+            ema_prev   = dstate.get(group_idx, grad_mean.detach())
+            beta_dc    = group.get("dcoef_beta", 0.9)
+            ema_curr   = beta_dc * ema_prev + (1 - beta_dc) * grad_mean
+            dstate[group_idx] = ema_curr
+
+            # 3. Novo d_coef
+            target     = group.get("dcoef_target", 0.05)
+            dc_min     = group.get("dcoef_min", 0.25)
+            dc_max     = group.get("dcoef_max", 4.0)
+
+            new_dcoef = torch.clamp(target / (ema_curr + 1e-8), dc_min, dc_max).item()
+            group["d_coef"] = new_dcoef  # overwrite para o passo atual
+
             # compute d_hat and d_max for the current group
             d_hat = d_coef * global_d_numerator / global_d_denom
 
@@ -220,6 +248,59 @@ def step_prodigy(self, closure=None):
         # Increment the group's k
         #print(f"[PRODIGY DEBUG] Group {group_idx} d={group['d']} d_numerator={group['d_numerator']} d_denom={group['d_denom']}")
         group["k"] = k + 1
+
+    # --- INÍCIO DA LÓGICA DE ATUALIZAÇÃO COM WARMUP ---
+    # Esta seção prepara os hiperparâmetros para a PRÓXIMA chamada.
+
+    # Usaremos o contador do primeiro grupo como referência global para o warmup.
+    # Isso assume que todos os grupos avançam juntos.
+    # global_step = self.param_groups[0].get('k', 0) 
+    # warmup_steps = getattr(self, 'dcoef_warmup_steps', 100) # Pega o valor do objeto optimizer
+
+    # for group_idx, group in enumerate(self.param_groups):
+    #     if not group['params'] or group['lr'] == 0.0:
+    #         continue
+
+    #     # 1. Medir a norma do gradiente (sempre)
+    #     device = next((p.device for p in group['params'] if p.grad is not None), torch.device('cpu'))
+    #     total_norm = torch.tensor(0.0, device=device)
+    #     num_elements = 0
+    #     for p in group['params']:
+    #         if p.grad is not None:
+    #             total_norm += p.grad.detach().abs().sum()
+    #             num_elements += p.grad.numel()
+        
+    #     avg_grad_norm = (total_norm / (num_elements + 1e-9))
+        
+    #     # 2. Gerenciar o estado da EMA (sempre)
+    #     dcoef_state = self.state.setdefault('_dcoef_state', {})
+    #     ema_state_key = f'group_{group_idx}_ema_norm'
+        
+    #     # Se a EMA não existe, inicialize-a com a primeira medição.
+    #     if ema_state_key not in dcoef_state:
+    #         dcoef_state[ema_state_key] = avg_grad_norm
+        
+    #     ema_prev = dcoef_state[ema_state_key]
+    #     beta_dc = group.get("dcoef_beta", 0.9)
+    #     ema_curr = beta_dc * ema_prev + (1 - beta_dc) * avg_grad_norm
+    #     dcoef_state[ema_state_key] = ema_curr # Sempre atualiza a EMA para mantê-la aquecida
+
+    #     # 3. DECIDIR se vamos ATUALIZAR o d_coef
+    #     if global_step > warmup_steps:
+    #         # Warmup concluído. Agora podemos agir.
+    #         target = group.get("dcoef_target", 0.05)
+    #         dc_min = group.get("dcoef_min", 0.25)
+    #         dc_max = group.get("dcoef_max", 4.0)
+
+    #         new_dcoef = target / (ema_curr.item() + 1e-9)
+    #         clamped_dcoef = torch.clamp(torch.tensor(new_dcoef), dc_min, dc_max).item()
+            
+    #         # ATUALIZA O VALOR NO GRUPO PARA A PRÓXIMA ITERAÇÃO
+    #         group['d_coef'] = clamped_dcoef
+            
+    #         # Opcional: Logar quando a adaptação começa
+    #         if global_step == warmup_steps + 1:
+    #             print(f"INFO: DCoeff adaptation started for group {group_idx} at step {global_step}.")
 
     return loss
 

@@ -79,24 +79,39 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             0.5 * abs_diff.square() / beta_det,
             abs_diff - 0.5 * beta_det,
         )
-
-        if mask is not None:
-            huber_raw = sangoi_masked_loss(
-                huber_raw, mask,
-                unmasked_weight=unmasked_weight,
-                normalize=normalize_masked_area_loss,
-            )
-
         # redução final: média sobre (C, H, W)
-        return huber_raw.mean(dim=(1, 2, 3))
+        return huber_raw
+
+    def charbonnier_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        eps: float = 1e-3,
+        alpha: float = 0.5,      # 0.5 = raiz -> Charbonnier clássico
+        scale: bool = False
+        ):
+        """
+        Charbonnier/pseudo-Huber generalizado.
+        alpha=0.5 -> clássico; alpha<0.5 deixa não-convexo (GC-0.45 etc.)
+        """
+        diff = pred - target
+        loss = torch.pow(diff * diff + eps * eps, alpha)
+
+        # opcional: normalizar para não inflar a escala média do loss
+        if scale:
+            loss = loss / (eps ** (2*alpha))       # mantém compatível c/ outras losses
+        
+        return loss
 
     def __masked_losses(
         self,
         batch: dict,
         data: dict,
         config: TrainConfig,
-    ):
+        ):
+
         losses = 0
+        mean_dim = list(range(1, data['predicted'].ndim))
 
         pred, tgt = data["predicted"], data["target"]
         if pred.dtype != tgt.dtype:
@@ -114,12 +129,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             snr  = self.__snr(data["timestep"], pred.device)
             losses += self.sangoi_huber_loss(diff=diff, snr=snr) * config.huber_strength # considerando que o hook de grad está ativo
 
-        # log-cosh Loss
+        # huber Loss
         if config.log_cosh_strength != 0:
-            losses += self.__log_cosh_loss(
-                data["predicted"],
-                data["target"],
-            ).mean([1, 2, 3]) * config.log_cosh_strength
+            losses += self.__log_cosh_loss(pred, tgt) * config.log_cosh_strength
+        
+        # Charbonnier Loss
+        if config.charbonnier_strength != 0:
+            losses += self.charbonnier_loss(pred, tgt) * config.charbonnier_strength
             
         # VB loss
         if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
@@ -136,20 +152,26 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     mask=batch["latent_mask"],
                     unmasked_weight=config.unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
-                ).mean([1, 2, 3])
+                ).mean(mean_dim)
                 * config.vb_loss_strength
             )
 
-        return losses
+        losses = sangoi_masked_loss(
+            losses, batch["latent_mask"],
+            unmasked_weight=config.unmasked_weight,
+            normalize=config.normalize_masked_area_loss,
+        )
+
+        return losses.mean(mean_dim)
 
     def __unmasked_losses(
         self,
         batch: dict,
         data: dict,
         config: TrainConfig,
-    ):
-        diff = data["predicted"] - data["target"]
-        losses = torch.tensor(0.0, device=diff.device)
+    ):        
+        losses = 0
+        mean_dim = list(range(1, data['predicted'].ndim))
 
         pred, tgt = data["predicted"], data["target"]
         if pred.dtype != tgt.dtype:
@@ -161,7 +183,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 data["predicted"],
                 data["target"],
                 reduction="none",
-            ).mean([1, 2, 3]) * config.mse_strength
+            ).mean(mean_dim) * config.mse_strength
 
         # MAE/L1 Loss
         if config.mae_strength != 0:
@@ -169,14 +191,23 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 data["predicted"],
                 data["target"],
                 reduction="none",
-            ).mean([1, 2, 3]) * config.mae_strength
+            ).mean(mean_dim) * config.mae_strength
 
         # log-cosh Loss
         if config.log_cosh_strength != 0:
             losses += self.__log_cosh_loss(
                 data["predicted"],
                 data["target"],
-            ).mean([1, 2, 3]) * config.log_cosh_strength
+            ).mean(mean_dim) * config.log_cosh_strength
+
+        if config.huber_strength != 0:
+            diff = pred - tgt
+            snr  = self.__snr(data["timestep"], pred.device)
+            losses += self.sangoi_huber_loss(diff=diff, snr=snr).mean(mean_dim) * config.huber_strength # considerando que o hook de grad está ativo
+        
+        # Charbonnier Loss
+        if config.charbonnier_strength != 0:
+            losses += self.charbonnier_loss(pred, tgt).mean(mean_dim) * config.charbonnier_strength
 
         # VB loss
         if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
@@ -193,7 +224,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     mask=batch["latent_mask"],
                     unmasked_weight=config.unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
-                ).mean([1, 2, 3])
+                ).mean(mean_dim)
                 * config.vb_loss_strength
             )
 
