@@ -13,11 +13,14 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
     def __init__(self):
         super().__init__()
+        self._priority:  torch.Tensor | None = None
+        self._visited:   torch.Tensor | None = None
+        self._unseen:    torch.Tensor | None = None
+        self._steps_seen: int = 0
 
         # Atributos para o novo sistema de amostragem de timestep
         self._timestep_array: Tensor | None = None
         self._timestep_idx_pointer: int = 0
-        # self.__weights e self.__weights_epoch não são mais necessários com a nova lógica
         
     def _create_noise(
             self,
@@ -56,87 +59,72 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             self,
             num_train_timesteps: int,
             deterministic: bool,
-            generator: Generator,
+            generator: torch.Generator,
             batch_size: int,
             config: TrainConfig,
-            train_progress: TrainProgress, # Removido 'Optional' para garantir que sempre estará presente
-    ) -> Tensor:
+            train_progress: TrainProgress,
+    ) -> torch.Tensor:
+        """
+        Seleciona timesteps:
+            1. Boot-strap (sem replacement) até visitar todos.
+            2. Depois, amostra com prioridade (softmax+temperatura) corrigida.
+        """
+
+        device = generator.device
+
+        # --- Fase determinística -------------------------------------------------
         if deterministic:
-            # -1 é para indexação zero-based
-            return torch.tensor(
-                int(num_train_timesteps * 0.5) - 1,
-                dtype=torch.long,
-                device=generator.device,
-            ).unsqueeze(0).expand(batch_size) # Expande para o batch size
-            
-        # --- NOVA LÓGICA DE CRIAÇÃO E AMOSTRAGEM ---
+            centre = (num_train_timesteps // 2) - 1
+            return torch.full((batch_size,), centre, dtype=torch.long, device=device)
 
-        # 1. GERA O ARRAY DE TIMESTEPS APENAS UMA VEZ NO INÍCIO DO TREINO
-        if self._timestep_array is None:
-            print("[Timestep Sampler] Creating a globally balanced timestep array for the entire training...")
-            total_steps = train_progress.total_steps
-            
-            # Se total_steps não for válido, usa fallback
-            if not total_steps or total_steps <= 0:
-                print("[Timestep Sampler] Warning: total_steps is invalid. Using fallback random sampling.")
-                return self._fallback_random_timestep(num_train_timesteps, generator, batch_size, config)
+        # --- Inicialização -------------------------------------------------------
+        if self._priority is None:
+            self._priority = torch.ones(num_train_timesteps, device=device)
+            self._visited  = torch.zeros(num_train_timesteps, dtype=torch.bool, device=device)
+            self._unseen   = torch.arange(num_train_timesteps, device=device)
 
-            min_timestep = int(num_train_timesteps * config.min_noising_strength)
-            max_timestep = int(num_train_timesteps * config.max_noising_strength)
+        # --- Boot-strap sem replacement -----------------------------------------
+        if self._unseen.numel() > 0:
+            # Amostra SEM replacement dos timesteps ainda não vistos
+            perm = torch.randperm(self._unseen.numel(), generator=generator, device=device)
+            selected = self._unseen[perm[:batch_size]]
+            t = selected
 
-            # Lista de timesteps possíveis
-            possible_timesteps = torch.arange(min_timestep, max_timestep, device=generator.device)
+            # Marca visitados e remove da lista
+            self._visited[t] = True
+            mask_unseen      = ~self._visited[self._unseen]
+            self._unseen     = self._unseen[mask_unseen]
 
-            # --- LÓGICA DE VIÉS COM SIGMOID ---
-            # Normaliza os timesteps para [0, 1] para a sigmoid
-            normalized_timesteps = (possible_timesteps.float() - min_timestep) / (max_timestep - min_timestep)
-            
-            # Hiperparâmetros para controlar a curva sigmoid
-            # Podem ser movidos para TrainConfig para fácil ajuste
-            sigmoid_bias = config.noising_bias + 0.5
-            sigmoid_weight = config.noising_weight
-            
-            # A sigmoid(x) cresce. Para dar mais peso a valores baixos, usamos sigmoid(-x).
-            # Um valor negativo no weight inverte a curva, dando peso a timesteps menores.
-            # `(normalized_timesteps - sigmoid_bias)` centraliza a curva antes de aplicar o peso.
-            weights = 1 / (1 + torch.exp(sigmoid_weight * (normalized_timesteps - sigmoid_bias)))
-            
-            # Adiciona um pequeno epsilon para garantir que nenhum peso seja zero
-            weights += 1e-8
+            return t
 
-            # Amostra 'total_steps' índices da distribuição de pesos
-            sampled_indices = torch.multinomial(
-                weights, 
-                num_samples=total_steps, 
-                replacement=True, 
-                generator=generator
-            )
-            
-            # Cria o array de timesteps com base nos índices amostrados
-            arr_tensor = possible_timesteps[sampled_indices]
-            
-            # Embaralha o array final para garantir aleatoriedade na ordem de aparição
-            perm = torch.randperm(total_steps, generator=generator, device=generator.device)
-            self._timestep_array = arr_tensor[perm]
-            
-            # Inicializa o ponteiro
-            self._timestep_idx_pointer = 0
+        # --- Amostragem por prioridade ------------------------------------------
+        pri = self._priority.clone()
 
-            print(f"[Timestep Sampler] Successfully created a biased, globally balanced array of {self._timestep_array.numel()} timesteps.")
+        # Temperatura base (pode subir dinamicamente)
+        temperature = 2.0
 
+        # Limite duro para uma única timestep dominar
+        P_MAX = 0.20              # ≤ 20 % do batch
 
-        # 2. SELECIONA O PRÓXIMO TIMESTEP USANDO O PONTEIRO
-        if self._timestep_array is not None and self._timestep_idx_pointer < self._timestep_array.numel():
-            sel_timestep = self._timestep_array[self._timestep_idx_pointer]
-            self._timestep_idx_pointer += 1
+        # Laço tenta achar uma temperatura que respeite P_MAX
+        for _ in range(8):        # no máximo 8 ajustes (barato)
+            prob = torch.softmax(pri / temperature, dim=0)
+            if prob.max() <= P_MAX:
+                break
+            temperature *= 1.25   # achata mais
 
-            # Retorna o mesmo timestep para todas as amostras no batch (se bs > 1)
-            return sel_timestep.expand(batch_size)
-        
-        # 3. FALLBACK: Se o array acabar ou falhar na criação
-        print("[Timestep Sampler] Warning: Timestep array exhausted or not created. Using fallback random sampling.")
-        return self._fallback_random_timestep(num_train_timesteps, generator, batch_size, config)
+        # Piso mínimo de exploração
+        EPS = 0.05
+        prob = (1 - EPS) * prob + EPS / num_train_timesteps
 
+        t = torch.multinomial(prob, batch_size, replacement=True, generator=generator)
+
+        return t
+
+    # Lembre-se que sua função update_priorities precisa ser chamada no trainer.
+    # A lógica dela parece ok, mas ela acumula loss indefinidamente.
+    # Considere adicionar um fator de decaimento para que as prioridades antigas percam força:
+    # self._priority *= 0.999 # Um decaimento lento a cada step de atualização.
 
     def _fallback_random_timestep(
             self,
@@ -185,3 +173,25 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
             continuous = (discrete.float() / discrete_timesteps)
             return continuous
+
+    @torch.no_grad()
+    def update_priorities(self,
+                          timesteps: torch.Tensor,   # 1-D, shape (bs,)
+                          batch_loss: float,
+                          radius: int = 10):
+        """
+        Soma a loss aos timesteps amostrados e espalha para vizinhos
+        (kernel triangular de raio `radius`).
+        Chamar depois de cada backward.
+        """
+        if self._priority is None:
+            return  # sampler ainda não inicializado
+
+        for t in timesteps.unique():
+            t_int = int(t)
+            lo = max(t_int - radius, 0)
+            hi = min(t_int + radius + 1, self._priority.numel())
+            # peso triangular decresce |Δ|
+            distances = torch.arange(lo, hi, device=t.device) - t_int
+            weights = 1.0 - (distances.abs() / (radius + 1))
+            self._priority[lo:hi] += batch_loss * weights        

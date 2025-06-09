@@ -38,6 +38,7 @@ from modules.util.TrainProgress import TrainProgress
 
 import torch
 import torch.nn.functional as F
+
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.utils.hooks import RemovableHandle
@@ -916,9 +917,18 @@ class GenericTrainer(BaseTrainer):
 
         return ssim32.to(dtype=pred_lat.dtype)
 
+    def stop_grad_outside_mask(self, tensor: torch.Tensor, mask_bf16: torch.Tensor) -> None:
+        """
+        Mantém o forward intacto (contexto total) e zera gradiente fora da máscara.
+        * `tensor`: saída bruta do modelo (bf16/fp16/fp32).
+        * `mask`  : mesma shape espacial, dtype float/bool (1 = região de interesse).
+        """
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            return grad * mask_bf16       # mesmo dtype → sem crash
+        tensor.register_hook(_hook)
+
     def train(self):
         scheduler_step_counter = 0
-        discard_counter = 0
         train_device = torch.device(self.config.train_device)
         train_progress = self.model.train_progress
 
@@ -943,12 +953,8 @@ class GenericTrainer(BaseTrainer):
                 m = m.expand(ref.shape[0], ref.shape[1], *m.shape[2:])
             return m
 
-        # Verificar se é só cache (mantém como está)
         if self.config.only_cache:
-            self._handle_cache_only_mode()
-            return
-
-        if self.config.only_cache:
+            
             self.callbacks.on_update_status("caching")
             
             with ProgressContext("Caching latents", self.config.epochs - train_progress.epoch) as progress:
@@ -1065,28 +1071,20 @@ class GenericTrainer(BaseTrainer):
                         if transferred_to_temp_device:
                             self.model_setup.setup_train_device(self.model, self.config)
 
+                    # START train_step_clean
                     with TorchMemoryRecorder(enabled=False):
                         model_output_data = self.model_setup.predict(
                             self.model, batch, self.config, train_progress
                         )
-                        
-                        predicted_tensor_from_model = model_output_data["predicted"] # Saída bruta do modelo (e.g., bf16)
-                        
-                        mask_fp32 = None
+
+                        predicted = model_output_data["predicted"]      # bf16/fp16
+
                         if self.config.masked_training:
-                            mask_bf16  = prepare_mask(batch["latent_mask"], predicted_tensor_from_model)
-                            mask_fp32  = mask_bf16.to(torch.float32)
-                            predicted_tensor_from_model.mul_(mask_bf16)
-                            model_output_data["target"].mul_(mask_bf16)
+                            mask_bf16 = prepare_mask(batch["latent_mask"], predicted)
+                            # Hook que zera gradiente fora da máscara
+                            self.stop_grad_outside_mask(predicted, mask_bf16)   # função global ou estática
 
-                            def _grad_mask(g):
-                                g.mul_(mask_fp32)
-                                return g
-
-                            hook_handle = predicted_tensor_from_model.register_hook(_grad_mask)
-                        else:
-                            hook_handle = None
-
+                        # ----- LOSS normal (forward com contexto) -----
                         loss = self.model_setup.calculate_loss(
                             model=self.model,
                             batch=batch,
@@ -1095,30 +1093,55 @@ class GenericTrainer(BaseTrainer):
                             progress=train_progress,
                         )
 
+                        # ----- Sampler / scheduler -----
+                        timestep = model_output_data["timestep"]
+                        self.model_setup.update_sampler_priorities(timestep, loss.item())
+
                         loss = loss / self.config.gradient_accumulation_steps
-                        
+
+                        # Debug: reter grad antes do backward
                         if self.config.debugoi:
-                            predicted_tensor_from_model.retain_grad()
-                                                        
+                            predicted.retain_grad()
+
+                        # ----- Backward -----
                         if scaler:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
-                            
-                        if hook_handle is not None:
-                            hook_handle.remove()
-                        
-                        if self.config.debugoi:
-                            if predicted_tensor_from_model.grad is not None:
-                                leak = (predicted_tensor_from_model.grad * (1 - mask_fp32)).abs().max()
-                                logFun(f"Leak grad (bf16→FP32) = {leak.item():.2e}", lvl="warning")
-                            else:
-                                logFun("WARNING: grad é None — verifique se retain_grad foi chamado antes do backward", lvl="warning")
+
+                        # Debug: verificar vazamento
+                        if self.config.debugoi and predicted.grad is not None:
+                            leak = (predicted.grad * (1 - mask_bf16.float())).abs().max()
+                            logFun(f"Leak grad = {leak.item():.2e}", lvl="warning")
                             
                         has_gradient = True
                         accumulated_loss += loss.item()
 
                         if self.__is_update_step(train_progress):
+                            # START grad_norm_logging
+                            if self.recorder:
+                                grad_norms_per_group = {}
+                                for group in self.model.optimizer.param_groups:
+                                    group_name = group.get('name')
+                                    if not group_name:
+                                        continue  # ignora grupos sem nome explícito
+
+                                    # Gradientes em FP32 achatados para evitar underflow/overflow
+                                    grads = [p.grad.detach().float().flatten() for p in group['params'] if p.grad is not None]
+                                    if not grads:
+                                        grad_norms_per_group[group_name] = 0.0
+                                        continue
+
+                                    # Norma L2 sobre o vetor concatenado
+                                    total_norm = torch.linalg.vector_norm(torch.cat(grads), ord=2)
+
+                                    # Falha rápida se sair do domínio dos números reais
+                                    if torch.isnan(total_norm) or torch.isinf(total_norm):
+                                        raise RuntimeError(f"Grad norm non-finite em '{group_name}'")
+
+                                    norm_value = total_norm.item()
+                                    grad_norms_per_group[group_name] = norm_value
+                                    
                             if (scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and
                                     self.config.optimizer.fused_back_pass):
                                 scaler.step_after_unscale_parameter_(self.model.optimizer)
@@ -1140,9 +1163,10 @@ class GenericTrainer(BaseTrainer):
                                 for stat_data in prodigy_current_data:
                                     group_idx = stat_data.get("group_idx")
                                     # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
-                                    name = stat_data.get("name") 
-                                    
+                                    name = stat_data.get("name")
                                     if name is not None:
+                                        if name in grad_norms_per_group:
+                                            stat_data['grad_norm'] = grad_norms_per_group[name]
                                         # Obter o d_num e d_denom
                                         d_num_pdgy_raw = stat_data.get("d_num")
                                         d_den_pdgy_raw = stat_data.get("d_den")
@@ -1167,6 +1191,7 @@ class GenericTrainer(BaseTrainer):
                                         d_num_pdgy=d_num_pdgy,
                                         d_den_pdgy=d_den_pdgy,
                                         dlr_pdgy=dlr_pdgy,
+                                        grad_norm=stat_data.get("grad_norm")
                                     )
 
                             # Scheduler de learning rate

@@ -223,7 +223,6 @@ class BaseStableDiffusionXLSetup(
       if deterministic:
           batch_seed = 0  # reprodutibilidade total
       # flag idiota, essa merda AINDA É deterministic mesmo false, porque usa o global step
-      # mudei pra ser realmente aleatória, pra poder funcionar o OHEM lá no predict 
       else:
           # gera seed imprevisível via Torch (GPU-safe) a cada invocação
           batch_seed = torch.randint(
@@ -456,3 +455,11 @@ class BaseStableDiffusionXLSetup(
       train_device=self.train_device,
       betas=model.noise_scheduler.betas.to(device=self.train_device),
     ).mean()
+
+  def update_sampler_priorities(self, timesteps: torch.Tensor, batch_loss: float):
+      """
+      Chama o método de atualização de prioridades do noiseMixin.
+      """
+      # Como esta classe herda de ModelSetupNoiseMixin, self.update_priorities está disponível.
+      self.update_priorities(timesteps, batch_loss)
+  

@@ -11,7 +11,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
-from modules.util.loss.masked_loss import masked_losses
+from modules.util.loss.masked_loss import masked_losses, sangoi_masked_loss
 from modules.util.loss.vb_loss import vb_losses
 from pytorch_msssim import ssim
 
@@ -55,14 +55,48 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         )
         return loss
 
+    # START sangoi_huber_loss
+    def sangoi_huber_loss(
+            self,
+            diff:  torch.Tensor,
+            snr:   torch.Tensor,
+            huber_c: float = 0.1,
+            mask:  torch.Tensor | None = None,
+            unmasked_weight: float = 0.1,
+            normalize_masked_area_loss: bool = True,
+    ) -> torch.Tensor:
+        """
+        Huber com β = huber_c * √SNR, clampado para faixas seguras.
+        Suporta máscara opcional (chama sangoi_masked_loss).
+        """
+        # β dinâmico (√SNR) com faixa [1e-2, 1]
+        beta = (huber_c * torch.sqrt(snr)).clamp(1e-2, 1.0).view(-1, 1, 1, 1)
+        beta_det = beta.detach()
+
+        abs_diff = diff.abs()
+        huber_raw = torch.where(
+            abs_diff < beta_det,
+            0.5 * abs_diff.square() / beta_det,
+            abs_diff - 0.5 * beta_det,
+        )
+
+        if mask is not None:
+            huber_raw = sangoi_masked_loss(
+                huber_raw, mask,
+                unmasked_weight=unmasked_weight,
+                normalize=normalize_masked_area_loss,
+            )
+
+        # redução final: média sobre (C, H, W)
+        return huber_raw.mean(dim=(1, 2, 3))
+
     def __masked_losses(
         self,
         batch: dict,
         data: dict,
         config: TrainConfig,
     ):
-        diff = data["predicted"] - data["target"]
-        losses = torch.tensor(0.0, device=diff.device)
+        losses = 0
 
         pred, tgt = data["predicted"], data["target"]
         if pred.dtype != tgt.dtype:
@@ -73,15 +107,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             losses += F.mse_loss(pred, tgt, reduction="none") * config.mse_strength
 
         if config.mae_strength != 0:
-            losses += F.l1_loss(pred, tgt, reduction="none") * config.mae_strength
+            losses += F.smooth_l1_loss(pred, tgt, beta=0.1) * config.mae_strength
+
+        if config.huber_strength != 0:
+            diff = pred - tgt
+            snr  = self.__snr(data["timestep"], pred.device)
+            losses += self.sangoi_huber_loss(diff=diff, snr=snr) * config.huber_strength # considerando que o hook de grad está ativo
 
         # log-cosh Loss
         if config.log_cosh_strength != 0:
-            log_cosh_loss= self.__log_cosh_loss(
+            losses += self.__log_cosh_loss(
                 data["predicted"],
                 data["target"],
             ).mean([1, 2, 3]) * config.log_cosh_strength
-
+            
         # VB loss
         if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
             losses += (
@@ -101,7 +140,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 * config.vb_loss_strength
             )
 
-        return log_cosh_loss
+        return losses
 
     def __unmasked_losses(
         self,

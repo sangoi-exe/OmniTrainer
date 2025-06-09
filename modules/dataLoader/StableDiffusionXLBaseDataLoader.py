@@ -335,7 +335,6 @@ class StableDiffusionXLBaseDataLoader(
         inpainting_modules = self._inpainting_modules(config)
         preparation_modules = self._preparation_modules(config, model)
         
-        # --- INÍCIO DA MODIFICAÇÃO CHANNELS_LAST ---
         # Bloco para adicionar nosso módulo de conversão condicionalmente
         channels_last_conversion_modules = []
         # Lista dos tensores que são 4D e precisam de conversão.
@@ -349,7 +348,6 @@ class StableDiffusionXLBaseDataLoader(
         # Cria a instância do nosso módulo
         convert_to_channels_last = ConvertToChannelsLast(in_name_list=tensors_to_convert)
         channels_last_conversion_modules.append(convert_to_channels_last)
-        # --- FIM DA MODIFICAÇÃO CHANNELS_LAST ---
 
         cache_modules = self._cache_modules(config, model)
         output_modules = self._output_modules(config, model)

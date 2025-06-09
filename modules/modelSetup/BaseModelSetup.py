@@ -96,6 +96,14 @@ class BaseModelSetup(
     ):
         pass
 
+    @abstractmethod
+    def update_sampler_priorities(self, timesteps: torch.Tensor, batch_loss: float):
+        """
+        Atualiza as prioridades do amostrador de timesteps, se aplicável.
+        As implementações podem simplesmente passar (pass) se não usarem este mecanismo.
+        """
+        pass
+
     def report_to_tensorboard(
         self,
         model: BaseModel,

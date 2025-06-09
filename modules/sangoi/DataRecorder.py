@@ -23,6 +23,7 @@ class DataRecorder:
         d_num_pdgy: Optional[float] = None,
         d_den_pdgy: Optional[float] = None,
         dlr_pdgy: Optional[float] = None,
+        grad_norm: Optional[float] = None,
         # E as próprias condições primárias e de estabilidade se quiser (bools)
     ):
         """Registra todas as métricas relevantes para o módulo no step atual."""
@@ -32,6 +33,8 @@ class DataRecorder:
             self.metrics_history[name]["d_den_pdgy"].append(d_den_pdgy)
         if dlr_pdgy is not None:
             self.metrics_history[name]["dlr_pdgy"].append(dlr_pdgy)
+        if grad_norm is not None:
+            self.metrics_history[name]["grad_norm"].append(grad_norm)
 
         # if self.debug and step >= 5 and step % 5 == 0: # Use a flag de debug do DataRecorder
         #     debug_log_message = f"DataRecorder for '{name}': "

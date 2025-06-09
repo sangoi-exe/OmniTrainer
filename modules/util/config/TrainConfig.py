@@ -278,6 +278,7 @@ class TrainConfig(BaseConfig):
     save_predictions: bool
     gen_lora_keys: bool
     bucket_ratio: int
+    huber_strength: float
     
     # traingps settings
     train_gps_save_it: bool
@@ -805,7 +806,9 @@ class TrainConfig(BaseConfig):
         data.append(("adpt_dcoef_path", "", str, False))
         data.append(("data_recorder", False, bool, False))
         data.append(("convctrl_use_it", False, bool, False))
-        data.append(("run_number", 1, int, False))        
+        data.append(("run_number", 1, int, False))
+        data.append(("huber_strength", 0.0, float, False))
+    
         
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
