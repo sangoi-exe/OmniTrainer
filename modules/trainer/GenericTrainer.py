@@ -1094,8 +1094,9 @@ class GenericTrainer(BaseTrainer):
                         )
 
                         # ----- Sampler / scheduler -----
-                        timestep = model_output_data["timestep"]
-                        self.model_setup.update_sampler_priorities(timestep, loss.item())
+                        if self.config.timestep_distribution == "PRIORITY_SAMPLING":
+                            timestep = model_output_data["timestep"]
+                            self.model_setup.update_sampler_priorities(timestep, loss.item(), self.config)
 
                         loss = loss / self.config.gradient_accumulation_steps
 

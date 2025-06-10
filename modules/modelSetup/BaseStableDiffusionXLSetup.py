@@ -456,10 +456,10 @@ class BaseStableDiffusionXLSetup(
       betas=model.noise_scheduler.betas.to(device=self.train_device),
     ).mean()
 
-  def update_sampler_priorities(self, timesteps: torch.Tensor, batch_loss: float):
+  def update_sampler_priorities(self, timesteps: torch.Tensor, batch_loss: float, config: TrainConfig):
       """
       Chama o método de atualização de prioridades do noiseMixin.
       """
       # Como esta classe herda de ModelSetupNoiseMixin, self.update_priorities está disponível.
-      self.update_priorities(timesteps, batch_loss)
+      self.update_priorities(timesteps, batch_loss, config)
   

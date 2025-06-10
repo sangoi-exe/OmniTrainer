@@ -7,6 +7,7 @@ class TimestepDistribution(Enum):
     LOGIT_NORMAL = 'LOGIT_NORMAL'
     HEAVY_TAIL = 'HEAVY_TAIL'
     COS_MAP = 'COS_MAP'
+    PRIORITY_SAMPLING = 'PRIORITY_SAMPLING'
 
     def __str__(self):
         return self.value
