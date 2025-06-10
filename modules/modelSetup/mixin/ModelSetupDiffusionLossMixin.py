@@ -317,7 +317,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # Fator para normalizar o erro para um intervalo aproximado de [0, 1].
         # Ajuste este valor se seus erros médios por amostra forem consistentemente
         # maiores ou menores que 1.0. Um valor de 1.0 a 2.0 é um bom começo.
-        NORMALIZATION_FACTOR = 1.0
+        NORMALIZATION_FACTOR = 2
 
         # 1. Calcular o erro absoluto médio por amostra no batch.
         mae_per_sample = torch.abs(target - predicted).mean(dim=[1, 2, 3])
