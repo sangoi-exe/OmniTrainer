@@ -714,9 +714,9 @@ class TrainingTab:
         components.entry(frame, 4, 1, self.ui_state, "huber_strength")
         
 				# charbonnier Strength
-        components.label(frame, 4, 0, "Charbonnier Strength",
+        components.label(frame, 5, 0, "Charbonnier Strength",
                          tooltip="Charbonnier loss, um pouco melhorr que log-cosh.")
-        components.entry(frame, 4, 1, self.ui_state, "charbonnier_strength")
+        components.entry(frame, 5, 1, self.ui_state, "charbonnier_strength")
 
         if supports_vb_loss:
             # VB Strength

@@ -1045,8 +1045,39 @@ def create_optimizer(
         # presentes nos param_groups dentro do state_dict fornecido.
         optimizer.load_state_dict(state_dict)
 
-    return optimizer
+    # ========================== INÍCIO DO BLOCO DE DEBUG ==========================
+    # if optimizer is not None:
+    #     import pprint
+    #     print("\n" + "="*40)
+    #     print("    DEBUG: CRIANDO O OTIMIZADOR")
+    #     print("="*40)
+    #     print(f"Tipo de otimizador: {type(optimizer).__name__}")
+        
+    #     # 'optimizer.defaults' contém os argumentos de inicialização (lr, betas, etc.)
+    #     print("\nParâmetros padrão de criação:")
+    #     pprint.pprint(optimizer.defaults)
+        
+    #     # Inspeciona cada grupo de parâmetros para ver LRs específicos
+    #     print(f"\nNúmero de grupos de parâmetros: {len(optimizer.param_groups)}")
+    #     total_params = 0
+    #     for i, group in enumerate(optimizer.param_groups):
+    #         group_params = sum(p.numel() for p in group['params'])
+    #         total_params += group_params
+            
+    #         # Pega as configurações do grupo, exceto a lista de tensores
+    #         group_settings = {k: v for k, v in group.items() if k != 'params'}
+            
+    #         print(f"\n--- Grupo {i} ---")
+    #         print(f"  Nº de parâmetros no grupo: {group_params:,}")
+    #         print(f"  Configurações do grupo:")
+    #         pprint.pprint(group_settings)
+            
+    #     print("\n" + "-"*40)
+    #     print(f"Total de parâmetros a serem otimizados: {total_params:,}")
+    #     print("="*40 + "\n")
+    # =========================== FIM DO BLOCO DE DEBUG ============================
 
+    return optimizer
 
 def create_ema(
         parameters: Iterable[Parameter] | list[dict],

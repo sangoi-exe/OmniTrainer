@@ -1156,43 +1156,43 @@ class GenericTrainer(BaseTrainer):
                                 if self.config.clip_grad_norm is not None:
                                     nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                                 self.model.optimizer.step()
+                            if self.config.optimizer == "PRODIGY":
+                                # puxar as stats do Prodigy após o opt step
+                                prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
+                                if prodigy_current_data and hasattr(self.model, "param_group_mapping"):
+                                    for stat_data in prodigy_current_data:
+                                        group_idx = stat_data.get("group_idx")
+                                        # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
+                                        name = stat_data.get("name")
+                                        if name is not None:
+                                            if name in grad_norms_per_group:
+                                                stat_data['grad_norm'] = grad_norms_per_group[name]
+                                            # Obter o d_num e d_denom
+                                            d_num_pdgy_raw = stat_data.get("d_num")
+                                            d_den_pdgy_raw = stat_data.get("d_den")
+                                            dlr_pdgy_raw = stat_data.get("dlr")
+                                        else:
+                                            logFun("Deu pau aqui na parte de extrair d_num e d_den.", lvl="warning")
 
-                            # puxar as stats do Prodigy após o opt step
-                            prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
-                            if prodigy_current_data and hasattr(self.model, "param_group_mapping"):
-                                for stat_data in prodigy_current_data:
-                                    group_idx = stat_data.get("group_idx")
-                                    # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
-                                    name = stat_data.get("name")
-                                    if name is not None:
-                                        if name in grad_norms_per_group:
-                                            stat_data['grad_norm'] = grad_norms_per_group[name]
-                                        # Obter o d_num e d_denom
-                                        d_num_pdgy_raw = stat_data.get("d_num")
-                                        d_den_pdgy_raw = stat_data.get("d_den")
-                                        dlr_pdgy_raw = stat_data.get("dlr")
-                                    else:
-                                        logFun("Deu pau aqui na parte de extrair d_num e d_den.", lvl="warning")
-
-                                    d_num_pdgy = None
-                                    if d_num_pdgy_raw is not None:
-                                        d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
+                                        d_num_pdgy = None
+                                        if d_num_pdgy_raw is not None:
+                                            d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
+                                            
+                                        d_den_pdgy = None
+                                        if d_den_pdgy_raw is not None:
+                                            d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)                                        
                                         
-                                    d_den_pdgy = None
-                                    if d_den_pdgy_raw is not None:
-                                        d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)                                        
-                                    
-                                    dlr_pdgy = None
-                                    if dlr_pdgy_raw is not None:
-                                        dlr_pdgy = float(d_den_pdgy_raw.item() if isinstance(dlr_pdgy_raw, torch.Tensor) else dlr_pdgy_raw)                                        
+                                        dlr_pdgy = None
+                                        if dlr_pdgy_raw is not None:
+                                            dlr_pdgy = float(d_den_pdgy_raw.item() if isinstance(dlr_pdgy_raw, torch.Tensor) else dlr_pdgy_raw)                                        
 
-                                    self.recorder.log_metrics_step(
-                                        name=name,
-                                        d_num_pdgy=d_num_pdgy,
-                                        d_den_pdgy=d_den_pdgy,
-                                        dlr_pdgy=dlr_pdgy,
-                                        grad_norm=stat_data.get("grad_norm")
-                                    )
+                                        self.recorder.log_metrics_step(
+                                            name=name,
+                                            d_num_pdgy=d_num_pdgy,
+                                            d_den_pdgy=d_den_pdgy,
+                                            dlr_pdgy=dlr_pdgy,
+                                            grad_norm=stat_data.get("grad_norm")
+                                        )
 
                             # Scheduler de learning rate
                             lr_scheduler.step()

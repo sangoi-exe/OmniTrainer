@@ -141,34 +141,6 @@ def step_prodigy(self, closure=None):
                 global_d_numerator = d_numerator
                 global_d_denom = d_denom
 
-            # 1. Gradiente médio do grupo (|g|) -> escalar
-            # Usamos tensor para evitar problemas de device e permitir detach()
-            device_param = next(p for p in group["params"] if p.grad is not None).device
-            grad_abs_sum = torch.tensor(0.0, device=device_param)
-            grad_elem_cnt = 0
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad.data
-                grad_abs_sum += g.abs().sum().item()
-                grad_elem_cnt += g.numel()
-            grad_mean = grad_abs_sum / (grad_elem_cnt + 1e-8)
-
-            # 2. Estado por grupo para EMA
-            dstate     = self.state.setdefault("_dcoef_state", {})
-            ema_prev   = dstate.get(group_idx, grad_mean.detach())
-            beta_dc    = group.get("dcoef_beta", 0.9)
-            ema_curr   = beta_dc * ema_prev + (1 - beta_dc) * grad_mean
-            dstate[group_idx] = ema_curr
-
-            # 3. Novo d_coef
-            target     = group.get("dcoef_target", 0.05)
-            dc_min     = group.get("dcoef_min", 0.25)
-            dc_max     = group.get("dcoef_max", 4.0)
-
-            new_dcoef = torch.clamp(target / (ema_curr + 1e-8), dc_min, dc_max).item()
-            group["d_coef"] = new_dcoef  # overwrite para o passo atual
-
             # compute d_hat and d_max for the current group
             d_hat = d_coef * global_d_numerator / global_d_denom
 
@@ -222,26 +194,22 @@ def step_prodigy(self, closure=None):
             if beta1 > 0:
                 exp_avg = state["exp_avg"]
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    # <<< CHATGPT ADD STROCHASTIC PROTECT >>>
                     try:
                         addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
                         p.data.addcdiv_(exp_avg, denom, value=-dlr)
-                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(exp_avg, denom, value=-dlr)
             else:
                 if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                    # <<< CHATGPT ADD STROCHASTIC PROTECT <<<
                     try:
                         addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
                     except Exception as e:
                         print(f"Stochastic rounding failed, using fallback addcdiv_: {e}")
                         traceback.print_exc()
                         p.data.addcdiv_(grad, denom, value=-dlr * d)
-                    # <<< FIM CHATGPT ADD STROCHASTIC PROTECT >>>
                 else:
                     p.data.addcdiv_(grad, denom, value=-dlr * d)
 
@@ -251,11 +219,10 @@ def step_prodigy(self, closure=None):
 
     # --- INÍCIO DA LÓGICA DE ATUALIZAÇÃO COM WARMUP ---
     # Esta seção prepara os hiperparâmetros para a PRÓXIMA chamada.
-
     # Usaremos o contador do primeiro grupo como referência global para o warmup.
     # Isso assume que todos os grupos avançam juntos.
     # global_step = self.param_groups[0].get('k', 0) 
-    # warmup_steps = getattr(self, 'dcoef_warmup_steps', 100) # Pega o valor do objeto optimizer
+    # warmup_steps = getattr(self, 'dcoef_warmup_steps', 1000) # Pega o valor do objeto optimizer
 
     # for group_idx, group in enumerate(self.param_groups):
     #     if not group['params'] or group['lr'] == 0.0:

@@ -95,7 +95,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             mask_unseen      = ~self._visited[self._unseen]
             self._unseen     = self._unseen[mask_unseen]
 
-            return t
+            return t.int()
 
         # --- Amostragem por prioridade ------------------------------------------
         pri = self._priority.clone()
@@ -114,12 +114,12 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             temperature *= 1.25   # achata mais
 
         # Piso mínimo de exploração
-        EPS = 0.05
+        EPS = 0.30
         prob = (1 - EPS) * prob + EPS / num_train_timesteps
 
         t = torch.multinomial(prob, batch_size, replacement=True, generator=generator)
 
-        return t
+        return t.int()
 
     # Lembre-se que sua função update_priorities precisa ser chamada no trainer.
     # A lógica dela parece ok, mas ela acumula loss indefinidamente.
