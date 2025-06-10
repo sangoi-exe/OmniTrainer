@@ -286,62 +286,61 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     # PROPOSTA DE REFAÇÃO - __sangoi_loss_weighting
     def __sangoi_loss_weighting(
       self,
-      timesteps: Tensor,
+      timesteps: Tensor, # Atualmente não utilizado, mas mantido para consistência da API
       predicted: Tensor,
       target: Tensor,
       device: torch.device,
       gamma: float,
     ):
       """
-      Calcula um peso de loss por amostra baseado nos princípios de Online Hard Example Mining (OHEM).
-      Amostras fáceis (erro baixo) recebem um peso menor (loss reduzida), especialmente em
-      cenários considerados difíceis (SNR alto), para focar o treino nas amostras que o modelo ainda erra.
+      Calcula um peso de loss por amostra inspirado na Focal Loss.
+      A loss é ponderada com base no erro da predição, focando o treinamento
+      nos exemplos que o modelo mais erra ("hard examples").
+
+      O peso é calculado como: weight = (normalized_error) ^ gamma.
+      - Erros pequenos resultam em pesos exponencialmente menores (ex: 0.1^2 = 0.01).
+      - Erros grandes resultam em pesos maiores, dominando o gradiente.
 
       Args:
-          timesteps: Tensor com os timesteps de cada amostra no batch.
+          timesteps: Tensor com os timesteps. Atualmente ignorado por esta estratégia.
           predicted: Tensor com a predição do modelo.
           target: Tensor com o alvo da predição (ruído).
           device: Dispositivo para os tensores.
-          gamma: Hiperparâmetro que controla a força do OHEM. Valores maiores
-                reduzem mais agressivamente a loss de amostras fáceis.
+          gamma: Expoente de foco (Focal Loss gamma). Um valor > 1.0.
+                Valores maiores (ex: 2.0, 3.0) focam o treinamento de forma
+                mais agressiva nos erros mais difíceis.
 
       Returns:
-          Um tensor de pesos no formato (batch_size,), com valores no intervalo [0, 1].
+          Um tensor de pesos no formato (batch_size,).
       """
       with torch.no_grad():
-        # 1. Métrica de Qualidade da Predição (quão "fácil" foi o exemplo?)
-        # Usamos MAE (L1 loss) por ser mais robusto que MAPE.
-        # torch.tanh mapeia o erro para o intervalo [0, 1], agindo como uma normalização suave.
+        # Fator para normalizar o erro para um intervalo aproximado de [0, 1].
+        # Ajuste este valor se seus erros médios por amostra forem consistentemente
+        # maiores ou menores que 1.0. Um valor de 1.0 a 2.0 é um bom começo.
+        NORMALIZATION_FACTOR = 1.0
+
+        # 1. Calcular o erro absoluto médio por amostra no batch.
         mae_per_sample = torch.abs(target - predicted).mean(dim=[1, 2, 3])
-        # prediction_quality: 1.0 para erro zero (muito fácil), próximo de 0.0 para erro alto (difícil).
-        prediction_quality = 1.0 - torch.tanh(mae_per_sample)
 
-        # 2. Métrica de Dificuldade do Cenário
-        # Com base na análise, SNR alto (timesteps baixos) é mais difícil.
-        # log1p(x) = log(1+x) é numericamente mais estável para x pequeno.
-        snr = self.__snr(timesteps, device)
-        scenario_difficulty = torch.log1p(snr) # Aumenta com a dificuldade (SNR alto).
+        # 2. Normalizar o erro para o intervalo [0, 1].
+        # Isso é crucial para que o expoente gamma funcione como esperado.
+        # Usamos clamp para garantir que o erro normalizado não exceda 1.0.
+        normalized_error = torch.clamp(mae_per_sample / NORMALIZATION_FACTOR, max=1.0)
 
-        # 3. Calcular o "potencial de redução de loss"
-        # A maior redução ocorre para predições de alta qualidade em cenários de alta dificuldade.
-        # Isso significa que o modelo acertou algo difícil e podemos "premiá-lo" ignorando essa loss.
-        reduction_potential = prediction_quality * scenario_difficulty
+        # 3. Calcular o peso final (Focal Weight).
+        # Exemplos com erro baixo (ex: normalized_error=0.1) terão um peso muito baixo (0.1^2=0.01).
+        # Exemplos com erro alto (ex: normalized_error=0.9) terão um peso alto (0.9^2=0.81).
+        final_weight = normalized_error ** gamma
 
-        # 4. Calcular o peso final da loss
-        # O 'gamma' agora age como um fator de força.
-        # Subtraímos o potencial de redução de 1.0 para obter o peso final.
-        # torch.clamp garante que o peso final esteja estritamente entre 0.0 e 1.0.
-        final_weight = torch.clamp(1.0 - (reduction_potential * gamma), min=0.0, max=1.0)
-
-        # Log para monitoramento
+        # Log para monitoramento (agora com nomes que fazem sentido)
         self.tensorboard.add_scalar(
-          "SangoiW/1_Prediction_Quality_Avg", prediction_quality.mean().item(), self.progress.global_step
+          "sangoi/1_MAE_Avg", mae_per_sample.mean().item(), self.progress.global_step
         )
         self.tensorboard.add_scalar(
-          "SangoiW/2_Scenario_Difficulty_Avg", scenario_difficulty.mean().item(), self.progress.global_step
+          "sangoi/2_NormalizedError_Avg", normalized_error.mean().item(), self.progress.global_step
         )
         self.tensorboard.add_scalar(
-          "SangoiW/3_Final_Weight_Avg", final_weight.mean().item(), self.progress.global_step
+          "sangoi/3_FinalWeight_Avg", final_weight.mean().item(), self.progress.global_step
         )
 
         return final_weight
