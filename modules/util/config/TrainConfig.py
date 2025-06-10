@@ -21,7 +21,6 @@ from modules.util.enum.LearningRateScaler import LearningRateScaler
 from modules.util.enum.LearningRateScheduler import LearningRateScheduler
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
-from modules.util.enum.LossMode import LossMode
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
@@ -338,7 +337,6 @@ class TrainConfig(BaseConfig):
     loss_scaler: LossScaler
     learning_rate_scaler: LearningRateScaler
     clip_grad_norm: float
-    loss_mode_fn: LossMode
 
     # noise
     offset_noise_weight: float
@@ -842,7 +840,6 @@ class TrainConfig(BaseConfig):
         data.append(("only_cache", False, bool, False))
         data.append(("resolution", "512", str, False))
         data.append(("frames", "25", str, False))
-        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
         data.append(("add_grad_sample", False, bool, False))

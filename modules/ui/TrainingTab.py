@@ -10,7 +10,6 @@ from modules.util.enum.LearningRateScaler import LearningRateScaler
 from modules.util.enum.LearningRateScheduler import LearningRateScheduler
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
-from modules.util.enum.LossMode import LossMode
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.optimizer_util import change_optimizer
@@ -687,11 +686,6 @@ class TrainingTab:
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
         frame.grid_columnconfigure(0, weight=1)
-
-        # Loss Mode function
-        components.label(frame, 0, 0, "Loss Mode",
-                         tooltip="Choice of loss mode function. Can help the model learn details more accurately.")
-        components.options(frame, 0, 1, [str(x) for x in list(LossMode)], self.ui_state, "loss_mode_fn")
 
         # MSE Strength
         components.label(frame, 1, 0, "MSE Strength",
