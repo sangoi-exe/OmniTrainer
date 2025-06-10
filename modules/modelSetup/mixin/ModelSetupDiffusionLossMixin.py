@@ -88,19 +88,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         target: torch.Tensor,
         eps: float = 1e-3,
         alpha: float = 0.5,      # 0.5 = raiz -> Charbonnier clássico
-        scale: bool = False
         ):
         """
         Charbonnier/pseudo-Huber generalizado.
         alpha=0.5 -> clássico; alpha<0.5 deixa não-convexo (GC-0.45 etc.)
         """
         diff = pred - target
-        loss = torch.pow(diff * diff + eps * eps, alpha)
+        loss = torch.pow(torch.square(diff) + eps * eps, alpha)
 
-        # opcional: normalizar para não inflar a escala média do loss
-        if scale:
-            loss = loss / (eps ** (2*alpha))       # mantém compatível c/ outras losses
-        
         return loss
 
     def __masked_losses(
@@ -110,51 +105,68 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         config: TrainConfig,
         ):
 
-        losses = 0
-        mean_dim = list(range(1, data['predicted'].ndim))
-
-        pred, tgt = data["predicted"], data["target"]
+        losses = torch.zeros_like(data["predicted"])
+        pred = data["predicted"]
+        tgt  = data["target"].to(dtype=pred.dtype)
+        
         if pred.dtype != tgt.dtype:
             tgt = tgt.to(dtype=pred.dtype)
             
         # teste de vetorização
-        if config.mse_strength != 0:
-            losses += F.mse_loss(pred, tgt, reduction="none") * config.mse_strength
+        if config.mse_strength:
+            losses += (
+                F.mse_loss(pred, tgt, reduction="none")
+                * config.mse_strength
+            )
 
-        if config.mae_strength != 0:
-            losses += F.smooth_l1_loss(pred, tgt, beta=0.1) * config.mae_strength
+        if config.mae_strength:
+            losses += (
+                F.smooth_l1_loss(pred, tgt, beta=0.1, reduction="none")
+                * config.mae_strength
+            )
 
-        if config.huber_strength != 0:
+        if config.huber_strength:
             diff = pred - tgt
             snr  = self.__snr(data["timestep"], pred.device)
-            losses += self.sangoi_huber_loss(diff=diff, snr=snr) * config.huber_strength # considerando que o hook de grad está ativo
+            losses += (
+                self.sangoi_huber_loss(diff=diff, snr=snr)
+                * config.huber_strength
+            )
 
-        # huber Loss
-        if config.log_cosh_strength != 0:
-            losses += self.__log_cosh_loss(pred, tgt) * config.log_cosh_strength
-        
-        # Charbonnier Loss
-        if config.charbonnier_strength != 0:
-            losses += self.charbonnier_loss(pred, tgt) * config.charbonnier_strength
+        if config.log_cosh_strength:
+            losses += (
+                self.__log_cosh_loss(pred, tgt, reduction="none")
+                * config.log_cosh_strength
+            )
+
+        if config.charbonnier_strength:
+            # scale=False ⇒ grad verdadeiro
+            losses += (
+                self.charbonnier_loss(pred, tgt)
+                * config.charbonnier_strength
+            )
             
         # VB loss
-        if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
-            losses += (
-                masked_losses(
-                    losses=vb_losses(
-                        coefficients=self.__coefficients,
-                        x_0=data["scaled_latent_image"],
-                        x_t=data["noisy_latent_image"],
-                        t=data["timestep"],
-                        predicted_eps=data["predicted"],
-                        predicted_var_values=data["predicted_var_values"],
-                    ),
-                    mask=batch["latent_mask"],
-                    unmasked_weight=config.unmasked_weight,
-                    normalize_masked_area_loss=config.normalize_masked_area_loss,
-                ).mean(mean_dim)
-                * config.vb_loss_strength
+        if (
+            config.vb_loss_strength
+            and "predicted_var_values" in data
+            and self.__coefficients is not None
+        ):
+            vb = vb_losses(
+                coefficients=self.__coefficients,
+                x_0=data["scaled_latent_image"],
+                x_t=data["noisy_latent_image"],
+                t=data["timestep"],
+                predicted_eps=pred,
+                predicted_var_values=data["predicted_var_values"],
             )
+            vb = masked_losses(
+                vb,
+                mask=batch["latent_mask"],
+                unmasked_weight=config.unmasked_weight,
+                normalize_masked_area_loss=config.normalize_masked_area_loss,
+            )
+            losses += vb * config.vb_loss_strength
 
         losses = sangoi_masked_loss(
             losses, batch["latent_mask"],
@@ -162,6 +174,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             normalize=config.normalize_masked_area_loss,
         )
 
+        mean_dim = list(range(1, pred.ndim))  # deixa batch na dim-0        
         return losses.mean(mean_dim)
 
     def __unmasked_losses(
@@ -169,66 +182,65 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         batch: dict,
         data: dict,
         config: TrainConfig,
-    ):        
-        losses = 0
-        mean_dim = list(range(1, data['predicted'].ndim))
+    ):
+        pred = data["predicted"]
+        tgt  = data["target"].to(dtype=pred.dtype)
 
-        pred, tgt = data["predicted"], data["target"]
-        if pred.dtype != tgt.dtype:
-            tgt = tgt.to(dtype=pred.dtype)
+        # tensor acumulador – mesmo shape de pred
+        losses = torch.zeros_like(pred)
 
-        # MSE/L2 Loss
-        if config.mse_strength != 0:
-            losses += F.mse_loss(
-                data["predicted"],
-                data["target"],
-                reduction="none",
-            ).mean(mean_dim) * config.mse_strength
-
-        # MAE/L1 Loss
-        if config.mae_strength != 0:
-            losses += F.l1_loss(
-                data["predicted"],
-                data["target"],
-                reduction="none",
-            ).mean(mean_dim) * config.mae_strength
-
-        # log-cosh Loss
-        if config.log_cosh_strength != 0:
-            losses += self.__log_cosh_loss(
-                data["predicted"],
-                data["target"],
-            ).mean(mean_dim) * config.log_cosh_strength
-
-        if config.huber_strength != 0:
-            diff = pred - tgt
-            snr  = self.__snr(data["timestep"], pred.device)
-            losses += self.sangoi_huber_loss(diff=diff, snr=snr).mean(mean_dim) * config.huber_strength # considerando que o hook de grad está ativo
-        
-        # Charbonnier Loss
-        if config.charbonnier_strength != 0:
-            losses += self.charbonnier_loss(pred, tgt).mean(mean_dim) * config.charbonnier_strength
-
-        # VB loss
-        if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
+        if config.mse_strength:
             losses += (
-                masked_losses(
-                    losses=vb_losses(
-                        coefficients=self.__coefficients,
-                        x_0=data["scaled_latent_image"],
-                        x_t=data["noisy_latent_image"],
-                        t=data["timestep"],
-                        predicted_eps=data["predicted"],
-                        predicted_var_values=data["predicted_var_values"],
-                    ),
-                    mask=batch["latent_mask"],
-                    unmasked_weight=config.unmasked_weight,
-                    normalize_masked_area_loss=config.normalize_masked_area_loss,
-                ).mean(mean_dim)
-                * config.vb_loss_strength
+                F.mse_loss(pred, tgt, reduction="none")
+                * config.mse_strength
             )
 
-        return losses
+        if config.mae_strength:
+            losses += (
+                F.l1_loss(pred, tgt, reduction="none")
+                * config.mae_strength
+            )
+
+        if config.log_cosh_strength:
+            losses += (
+                self.__log_cosh_loss(pred, tgt, reduction="none")
+                * config.log_cosh_strength
+            )
+
+        if config.huber_strength:
+            diff = pred - tgt
+            snr  = self.__snr(data["timestep"], pred.device)
+            losses += (
+                self.sangoi_huber_loss(diff=diff, snr=snr)
+                * config.huber_strength
+            )
+
+        if config.charbonnier_strength:
+            losses += (
+                self.charbonnier_loss(pred, tgt, scale=False)
+                * config.charbonnier_strength
+            )
+
+        # VB loss
+        if (
+            config.vb_loss_strength
+            and "predicted_var_values" in data
+            and self.__coefficients is not None
+        ):
+            vb = vb_losses(
+                coefficients=self.__coefficients,
+                x_0=data["scaled_latent_image"],
+                x_t=data["noisy_latent_image"],
+                t=data["timestep"],
+                predicted_eps=pred,
+                predicted_var_values=data["predicted_var_values"],
+            )
+            vb = vb.mean(dim=tuple(range(1, vb.ndim)))  # (B,)
+            losses += vb.view_as(losses.mean(dim=tuple(range(1, losses.ndim))))
+            losses *= config.vb_loss_strength
+
+        mean_dim = list(range(1, losses.ndim))
+        return losses.mean(mean_dim)
 
     def __snr(self, timesteps: Tensor, device: torch.device):
         if self.__coefficients:
@@ -283,67 +295,33 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     # START v2025-05-27c – __sangoi_loss_weighting refeito
     # VOLTANDO ÀS ORIGENS 04-06-2025
-    # PROPOSTA DE REFAÇÃO - __sangoi_loss_weighting
     def __sangoi_loss_weighting(
-      self,
-      timesteps: Tensor, # Atualmente não utilizado, mas mantido para consistência da API
-      predicted: Tensor,
-      target: Tensor,
-      device: torch.device,
-      gamma: float,
-    ):
-      """
-      Calcula um peso de loss por amostra inspirado na Focal Loss.
-      A loss é ponderada com base no erro da predição, focando o treinamento
-      nos exemplos que o modelo mais erra ("hard examples").
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        gamma: float = 2.0,
+        eps: float = 1e-8,
+        detach_weight: bool = False,
+    ) -> torch.Tensor:
+        """
+        Peso focal contínuo baseado no MAE médio por amostra.
+        weight_i = ((mae_i + eps) / (mean_mae + eps)) ** gamma
 
-      O peso é calculado como: weight = (normalized_error) ^ gamma.
-      - Erros pequenos resultam em pesos exponencialmente menores (ex: 0.1^2 = 0.01).
-      - Erros grandes resultam em pesos maiores, dominando o gradiente.
+        * Se detach_weight=True, o peso não retropropaga gradiente
+          (vira só reescala de loss, tipo focal clássico).
+        * eps evita divisão por zero e mantém gradientes finitos.
+        """
+        dims = tuple(range(1, predicted.ndim))          # todas exceto batch
+        mae_per_sample = torch.abs(predicted - target).mean(dims)  # (B,)
 
-      Args:
-          timesteps: Tensor com os timesteps. Atualmente ignorado por esta estratégia.
-          predicted: Tensor com a predição do modelo.
-          target: Tensor com o alvo da predição (ruído).
-          device: Dispositivo para os tensores.
-          gamma: Expoente de foco (Focal Loss gamma). Um valor > 1.0.
-                Valores maiores (ex: 2.0, 3.0) focam o treinamento de forma
-                mais agressiva nos erros mais difíceis.
+        # escala automática: erro relativo ao batch
+        mean_mae = mae_per_sample.mean().clamp_min(eps)
+        weight = ((mae_per_sample + eps) / mean_mae).pow(gamma)    # (B,)
 
-      Returns:
-          Um tensor de pesos no formato (batch_size,).
-      """
-      with torch.no_grad():
-        # Fator para normalizar o erro para um intervalo aproximado de [0, 1].
-        # Ajuste este valor se seus erros médios por amostra forem consistentemente
-        # maiores ou menores que 1.0. Um valor de 1.0 a 2.0 é um bom começo.
-        NORMALIZATION_FACTOR = 2
+        if detach_weight:
+            weight = weight.detach()
 
-        # 1. Calcular o erro absoluto médio por amostra no batch.
-        mae_per_sample = torch.abs(target - predicted).mean(dim=[1, 2, 3])
-
-        # 2. Normalizar o erro para o intervalo [0, 1].
-        # Isso é crucial para que o expoente gamma funcione como esperado.
-        # Usamos clamp para garantir que o erro normalizado não exceda 1.0.
-        normalized_error = torch.clamp(mae_per_sample / NORMALIZATION_FACTOR, max=1.0)
-
-        # 3. Calcular o peso final (Focal Weight).
-        # Exemplos com erro baixo (ex: normalized_error=0.1) terão um peso muito baixo (0.1^2=0.01).
-        # Exemplos com erro alto (ex: normalized_error=0.9) terão um peso alto (0.9^2=0.81).
-        final_weight = normalized_error ** gamma
-
-        # Log para monitoramento (agora com nomes que fazem sentido)
-        self.tensorboard.add_scalar(
-          "sangoi/1_MAE_Avg", mae_per_sample.mean().item(), self.progress.global_step
-        )
-        self.tensorboard.add_scalar(
-          "sangoi/2_NormalizedError_Avg", normalized_error.mean().item(), self.progress.global_step
-        )
-        self.tensorboard.add_scalar(
-          "sangoi/3_FinalWeight_Avg", final_weight.mean().item(), self.progress.global_step
-        )
-
-        return final_weight
+        return weight
 
     def _diffusion_losses(
         self,
@@ -418,13 +396,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         self.progress.global_step,
                     )
                     
-                    # A nova função já retorna um peso entre [0, 1]
                     losses *= self.__sangoi_loss_weighting(
-                      data["timestep"],
-                      data["predicted"],
-                      data["target"],
-                      losses.device,
-                      config.loss_weight_strength, # Este é o seu 'gamma'
+                      predicted=data["predicted"],
+                      target=data["target"],
+                      gamma=config.loss_weight_strength,
                     )
                     
                     self.tensorboard.add_scalar(
