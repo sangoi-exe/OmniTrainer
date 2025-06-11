@@ -51,6 +51,10 @@ class SangoiTab:
                          tooltip="Generate a txt with lora layers that is going to be trained")
         components.switch(self.main_frame, row_index, 1, self.ui_state, "gen_lora_keys")
         
+        components.label(self.main_frame, row_index, 2, "Data Recorder",
+                         tooltip="Gravar estatísticas do treino")
+        components.switch(self.main_frame, row_index, 3, self.ui_state, "data_recorder")
+        
         # Slot 3 (cols 4, 5) fica em branco
         components.label(self.main_frame, row_index, 4, "Sangoi Debug",
                          tooltip="Debug pros meus badalhos")

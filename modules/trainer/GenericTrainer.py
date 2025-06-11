@@ -1079,10 +1079,10 @@ class GenericTrainer(BaseTrainer):
 
                         predicted = model_output_data["predicted"]      # bf16/fp16
 
-                        if self.config.masked_training:
-                            mask_bf16 = prepare_mask(batch["latent_mask"], predicted)
-                            # Hook que zera gradiente fora da máscara
-                            self.stop_grad_outside_mask(predicted, mask_bf16)   # função global ou estática
+                        # if self.config.masked_training:
+                        #     mask_bf16 = prepare_mask(batch["latent_mask"], predicted)
+                        #     # Hook que zera gradiente fora da máscara
+                        #     self.stop_grad_outside_mask(predicted, mask_bf16)   # função global ou estática
 
                         # ----- LOSS normal (forward com contexto) -----
                         loss = self.model_setup.calculate_loss(
@@ -1111,9 +1111,9 @@ class GenericTrainer(BaseTrainer):
                             loss.backward()
 
                         # Debug: verificar vazamento
-                        if self.config.debugoi and predicted.grad is not None:
-                            leak = (predicted.grad * (1 - mask_bf16.float())).abs().max()
-                            logFun(f"Leak grad = {leak.item():.2e}", lvl="warning")
+                        # if self.config.debugoi and predicted.grad is not None:
+                        #     leak = (predicted.grad * (1 - mask_bf16.float())).abs().max()
+                        #     logFun(f"Leak grad = {leak.item():.2e}", lvl="warning")
                             
                         has_gradient = True
                         accumulated_loss += loss.item()
@@ -1157,43 +1157,43 @@ class GenericTrainer(BaseTrainer):
                                 if self.config.clip_grad_norm is not None:
                                     nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                                 self.model.optimizer.step()
-                            
+                            if self.recorder:
                             # puxar as stats do Prodigy após o opt step
-                            prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
-                            if prodigy_current_data and hasattr(self.model, "param_group_mapping"):
-                                for stat_data in prodigy_current_data:
-                                    group_idx = stat_data.get("group_idx")
-                                    # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
-                                    name = stat_data.get("name")
-                                    if name is not None:
-                                        if name in grad_norms_per_group:
-                                            stat_data['grad_norm'] = grad_norms_per_group[name]
-                                        # Obter o d_num e d_denom
-                                        d_num_pdgy_raw = stat_data.get("d_num")
-                                        d_den_pdgy_raw = stat_data.get("d_den")
-                                        dlr_pdgy_raw = stat_data.get("dlr")
-                                    else:
-                                        logFun("Deu pau aqui na parte de extrair d_num e d_den.", lvl="warning")
+                                prodigy_current_data = self.model.optimizer.pop_stats() # Pop aqui!
+                                if prodigy_current_data and hasattr(self.model, "param_group_mapping"):
+                                    for stat_data in prodigy_current_data:
+                                        group_idx = stat_data.get("group_idx")
+                                        # 'name' já vem de stat_data, que deve ser o mesmo de param_group_mapping[group_idx]
+                                        name = stat_data.get("name")
+                                        if name is not None:
+                                            if name in grad_norms_per_group:
+                                                stat_data['grad_norm'] = grad_norms_per_group[name]
+                                            # Obter o d_num e d_denom
+                                            d_num_pdgy_raw = stat_data.get("d_num")
+                                            d_den_pdgy_raw = stat_data.get("d_den")
+                                            dlr_pdgy_raw = stat_data.get("dlr")
+                                        else:
+                                            logFun("Deu pau aqui na parte de extrair d_num e d_den.", lvl="warning")
 
-                                    d_num_pdgy = None
-                                    if d_num_pdgy_raw is not None:
-                                        d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
+                                        d_num_pdgy = None
+                                        if d_num_pdgy_raw is not None:
+                                            d_num_pdgy = float(d_num_pdgy_raw.item() if isinstance(d_num_pdgy_raw, torch.Tensor) else d_num_pdgy_raw)
+                                            
+                                        d_den_pdgy = None
+                                        if d_den_pdgy_raw is not None:
+                                            d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)                                        
                                         
-                                    d_den_pdgy = None
-                                    if d_den_pdgy_raw is not None:
-                                        d_den_pdgy = float(d_den_pdgy_raw.item() if isinstance(d_den_pdgy_raw, torch.Tensor) else d_den_pdgy_raw)                                        
-                                    
-                                    dlr_pdgy = None
-                                    if dlr_pdgy_raw is not None:
-                                        dlr_pdgy = float(d_den_pdgy_raw.item() if isinstance(dlr_pdgy_raw, torch.Tensor) else dlr_pdgy_raw)                                        
+                                        dlr_pdgy = None
+                                        if dlr_pdgy_raw is not None:
+                                            dlr_pdgy = float(d_den_pdgy_raw.item() if isinstance(dlr_pdgy_raw, torch.Tensor) else dlr_pdgy_raw)                                        
 
-                            self.recorder.log_metrics_step(
-                                name=name,
-                                d_num_pdgy=d_num_pdgy if d_num_pdgy is not None else None,
-                                d_den_pdgy=d_den_pdgy if d_den_pdgy is not None else None,
-                                dlr_pdgy=dlr_pdgy if dlr_pdgy is not None else None,
-                                grad_norm=stat_data.get("grad_norm", None)
-                            )
+                                        self.recorder.log_metrics_step(
+                                            name=name,
+                                            d_num_pdgy=d_num_pdgy if d_num_pdgy is not None else None,
+                                            d_den_pdgy=d_den_pdgy if d_den_pdgy is not None else None,
+                                            dlr_pdgy=dlr_pdgy if dlr_pdgy is not None else None,
+                                            grad_norm=stat_data.get("grad_norm", None)
+                                        )
 
                             # Scheduler de learning rate
                             lr_scheduler.step()

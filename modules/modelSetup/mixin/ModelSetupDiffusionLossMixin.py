@@ -135,7 +135,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         if config.log_cosh_strength:
             losses += (
-                self.__log_cosh_loss(pred, tgt, reduction="none")
+                self.__log_cosh_loss(pred, tgt)
                 * config.log_cosh_strength
             )
 
@@ -203,7 +203,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         if config.log_cosh_strength:
             losses += (
-                self.__log_cosh_loss(pred, tgt, reduction="none")
+                self.__log_cosh_loss(pred, tgt)
                 * config.log_cosh_strength
             )
 
@@ -217,7 +217,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         if config.charbonnier_strength:
             losses += (
-                self.charbonnier_loss(pred, tgt, scale=False)
+                self.charbonnier_loss(pred, tgt)
                 * config.charbonnier_strength
             )
 
