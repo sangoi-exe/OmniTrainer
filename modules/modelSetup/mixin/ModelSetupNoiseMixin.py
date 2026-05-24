@@ -14,12 +14,75 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         super().__init__()
 
         self.__weights = None
+        self._offset_noise_psi_schedule: Tensor | None = None
+        self._priority: Tensor | None = None
+        self._unseen: Tensor | None = None
+
+    def _compute_and_cache_offset_noise_psi_schedule(self, betas: Tensor) -> Tensor:
+        """
+        Computes the time-dependent psi_t coefficients for generalized offset noise.
+        This implementation follows the paper "Generalized Diffusion Model with Adjusted Offset Noise",
+        specifically Equation (34) and the logic of Algorithm 1 for the "balanced-phi_t, psi_t strategy".
+        """
+        if self._offset_noise_psi_schedule is not None and self._offset_noise_psi_schedule.shape[0] == betas.shape[0]:
+            return self._offset_noise_psi_schedule.to(betas.device).to(torch.float64)
+
+        betas = betas.to(torch.float64)
+        T = betas.shape[0]
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # From paper footnote 4: "we introduce α_0 = 1 for convenience".
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0], device=betas.device, dtype=betas.dtype), alphas_cumprod[:-1]])
+
+        # --- Start of Algorithm 1 ---
+        gammas = torch.zeros(T, device=betas.device, dtype=betas.dtype)
+
+        # Step 1: Set gamma_1 = 1
+        gammas[0] = 1.0
+
+        # This sum is `Σ_{i=1 to t-1} γ_i/√¯αᵢ₋₁` which we build iteratively.
+        cumulative_sum_term = gammas[0] / torch.sqrt(alphas_cumprod_prev[0])
+
+        # Step 2-4: Loop for t = 2 to T (in code: t = 1 to T-1)
+        for t in range(1, T):
+            alpha_t = alphas[t]
+            alpha_cumprod_tm1 = alphas_cumprod_prev[t]
+
+            # Denominator from the paper's formula for C_t.
+            c_t_denominator = alpha_t * (1 - alpha_cumprod_tm1)
+            c_t = (1 - alpha_t) * torch.sqrt(alpha_cumprod_tm1) / c_t_denominator
+
+            # Paper's recursive formula uses the full cumulative sum.
+            gammas[t] = c_t * cumulative_sum_term
+
+            # Update the sum for the next iteration.
+            cumulative_sum_term += gammas[t] / torch.sqrt(alphas_cumprod_prev[t])
+
+        # Step 5: Calculate normalization factor psi_T
+        psi_T_denominator = torch.sqrt(1 - alphas_cumprod[-1])
+        psi_T = cumulative_sum_term / psi_T_denominator
+
+        # Step 6-8: Normalize gammas
+        gammas_normalized = gammas / psi_T
+        # --- End of Algorithm 1 ---
+
+        # Finally, calculate the psi schedule for all timesteps t using Equation (22)
+        terms = gammas_normalized / torch.sqrt(alphas_cumprod_prev)
+        s_cumulative = torch.cumsum(terms, dim=0)
+        psi_schedule = s_cumulative / torch.sqrt(1 - alphas_cumprod)
+
+        self._offset_noise_psi_schedule = psi_schedule.to(betas.device)
+        return self._offset_noise_psi_schedule
+
 
     def _create_noise(
             self,
             source_tensor: Tensor,
             config: TrainConfig,
-            generator: Generator
+            generator: Generator,
+            timestep: Tensor | None = None,
+            betas: Tensor | None = None,
     ) -> Tensor:
         noise = torch.randn(
             source_tensor.shape,
@@ -35,7 +98,16 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 device=config.train_device,
                 dtype=source_tensor.dtype
             )
-            noise = noise + (config.offset_noise_weight * offset_noise)
+            # Use the time-dependent generalized method if enabled.
+            # This will only be true for Diffusion models (which uses betas)
+            if config.generalized_offset_noise and timestep is not None and betas is not None:
+                psi_schedule = self._compute_and_cache_offset_noise_psi_schedule(betas).to(timestep.device)
+                psi_t = psi_schedule[timestep]
+                psi_t = psi_t.view(psi_t.shape[0], *[1 for _ in range(source_tensor.ndim - 1)])
+                # Scale by the time-dependent psi_t factor
+                noise = noise + (psi_t * config.offset_noise_weight * offset_noise)
+            else: # Otherwise, use the normal offset noise.
+                noise = noise + (config.offset_noise_weight * offset_noise)
 
         if config.perturbation_noise_weight > 0:
             perturbation_noise = torch.randn(
@@ -55,9 +127,11 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             generator: Generator,
             batch_size: int,
             config: TrainConfig,
-            latent_width: int | None = None,
-            latent_height: int | None = None,
+            shift: float = None,
     ) -> Tensor:
+        if shift is None:
+            shift = config.timestep_shift
+
         if deterministic:
             # -1 is for zero-based indexing
             return torch.tensor(
@@ -69,24 +143,6 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             min_timestep = int(num_train_timesteps * config.min_noising_strength)
             max_timestep = int(num_train_timesteps * config.max_noising_strength)
             num_timestep = max_timestep - min_timestep
-
-            shift = config.timestep_shift
-            if config.dynamic_timestep_shifting:
-                if not latent_width or not latent_height:
-                    raise NotImplementedError("Dynamic timestep shifting not support by this model")
-
-                base_seq_len = 256
-                max_seq_len = 4096
-                base_shift = 0.5
-                max_shift = 1.15
-                patch_size = 2
-
-                image_seq_len = (latent_width // patch_size) * (latent_height // patch_size)
-                m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-                b = base_shift - m * base_seq_len
-                mu = image_seq_len * m + b
-
-                shift = math.exp(mu)
 
             if config.timestep_distribution in [
                 TimestepDistribution.UNIFORM,
@@ -132,13 +188,9 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 # continuous implementations
                 if config.timestep_distribution == TimestepDistribution.COS_MAP:
                     if self.__weights is None:
-
                         weights = 2.0 / (math.pi - 2.0 * math.pi * linspace + 2.0 * math.pi * linspace ** 2.0)
                         weights *= linspace_derivative
                         self.__weights = weights.to(device=generator.device)
-
-                    samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True, generator=generator) + min_timestep
-                    timestep = samples.to(dtype=torch.long, device=generator.device)
                 elif config.timestep_distribution == TimestepDistribution.SIGMOID:
                     if self.__weights is None:
                         bias = config.noising_bias + 0.5
@@ -148,60 +200,61 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                         weights = 1 / (1 + torch.exp(-weight * (weights - bias)))  # Sigmoid
                         weights *= linspace_derivative
                         self.__weights = weights.to(device=generator.device)
+                elif config.timestep_distribution == TimestepDistribution.INVERTED_PARABOLA:
+                    if self.__weights is None:
+                        bias = config.noising_bias + 0.5
+                        weight = config.noising_weight
 
+                        weights = torch.clamp(-weight * ((linspace - bias) ** 2) + 2, min=0.0)
+                        weights *= linspace_derivative
+                        self.__weights = weights.to(device=generator.device)
+                elif config.timestep_distribution == TimestepDistribution.PRIORITY_SAMPLING:
+                    if self._priority is None or self._priority.shape[0] != num_train_timesteps:
+                        self._priority = torch.ones(num_train_timesteps, device=generator.device)
+                        self._unseen = torch.arange(min_timestep, max_timestep, device=generator.device)
+
+                    if self._unseen.numel() > 0:
+                        unseen_sample_count = min(batch_size, self._unseen.numel())
+                        unseen_indexes = torch.randperm(
+                            self._unseen.numel(),
+                            generator=generator,
+                            device=generator.device,
+                        )[:unseen_sample_count]
+                        samples = self._unseen[unseen_indexes]
+
+                        unseen_mask = torch.ones(self._unseen.numel(), dtype=torch.bool, device=generator.device)
+                        unseen_mask[unseen_indexes] = False
+                        self._unseen = self._unseen[unseen_mask]
+
+                        if unseen_sample_count < batch_size:
+                            random_samples = torch.randint(
+                                min_timestep,
+                                max_timestep,
+                                (batch_size - unseen_sample_count,),
+                                generator=generator,
+                                device=generator.device,
+                                dtype=torch.long,
+                            )
+                            samples = torch.cat([samples, random_samples])
+
+                        return samples.long()
+
+                    probabilities = torch.softmax(
+                        self._priority[min_timestep:max_timestep] / config.priority_temperature,
+                        dim=0,
+                    )
+                    samples = torch.multinomial(
+                        probabilities,
+                        num_samples=batch_size,
+                        replacement=True,
+                        generator=generator,
+                    )
+                    samples = samples + min_timestep
+                    timestep = samples.to(dtype=torch.long, device=generator.device)
+                else:
                     samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True, generator=generator) + min_timestep
                     timestep = samples.to(dtype=torch.long, device=generator.device)
-                elif config.timestep_distribution == TimestepDistribution.PRIORITY_SAMPLING:
-                                    device = generator.device
-                                    
-                                    # --- Inicialização na primeira chamada ---
-                                    if self._priority is None:
-                                        # Inicializa as prioridades com 1.0 para garantir amostragem uniforme no início.
-                                        self._priority = torch.ones(num_train_timesteps, device=device)
-                                        
-                                        # Guardamos uma cópia das prioridades iniciais para a fase de "boot-strap"
-                                        self._unseen = torch.arange(num_train_timesteps, device=device)
 
-                                    # --- Fase 1: Boot-strap (amostrar cada um pelo menos uma vez) ---
-                                    # Garante que o modelo veja todo o espectro de timesteps no início.
-                                    if self._unseen.numel() > 0:
-                                        # Se o batch for maior que o número de timesteps restantes, pegue todos.
-                                        k = min(batch_size, self._unseen.numel())
-                                        
-                                        # Amostra k índices aleatórios da lista de não vistos.
-                                        perm = torch.randperm(self._unseen.numel(), generator=generator, device=device)[:k]
-                                        timesteps = self._unseen[perm]
-                                        
-                                        # Remove os timesteps amostrados da lista de não vistos.
-                                        # Esta é uma maneira eficiente de fazer isso sem reconstruir a lista toda.
-                                        mask = torch.ones(self._unseen.numel(), dtype=torch.bool, device=device)
-                                        mask[perm] = False
-                                        self._unseen = self._unseen[mask]
-                                        
-                                        # Se o batch for maior, preencha o restante com amostragem aleatória simples.
-                                        if k < batch_size:
-                                            remaining = batch_size - k
-                                            # Amostra aleatória de todo o range (fallback)
-                                            random_timesteps = torch.randint(0, num_train_timesteps, (remaining,), generator=generator, device=device, dtype=torch.long)
-                                            timesteps = torch.cat([timesteps, random_timesteps])
-                                            
-                                        return timesteps.long() # Retorna como long
-                                    
-                                    # --- Fase 2: Amostragem por Prioridade ---
-                                    # Usa as prioridades atualizadas pela função `update_priorities`.
-                                    # Softmax com temperatura para converter prioridades em probabilidades.
-                                    # A temperatura ajusta o quão "gananciosa" é a amostragem.
-                                    # Temp alta -> mais uniforme. Temp baixa -> mais focada nos picos.
-                                    probs = torch.softmax(self._priority / config.priority_temperature, dim=0)
-
-                                    # Amostra com base nas probabilidades calculadas.
-                                    timesteps = torch.multinomial(
-                                        probs,
-                                        num_samples=batch_size,
-                                        replacement=True,
-                                        generator=generator
-                                    )
-                                    return timesteps.long() # Retorna como long
             return timestep.int()
 
     def _get_timestep_continuous(
@@ -231,78 +284,40 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             return continuous
 
     @torch.no_grad()
-    def update_priorities(self,
-                          timesteps: torch.Tensor,   # 1-D, shape (bs,), dtype long
-                          batch_loss: torch.Tensor,  # 1-D, shape (bs,), dtype float
-                          config: TrainConfig):      # Passa a config para pegar os hiperparâmetros
-        """
-        Atualiza as prioridades de forma vetorial usando EMA e um kernel de espalhamento.
-        `batch_loss` deve ser um tensor 1-D com a loss para cada item no batch.
-        """
-        if self._priority is None or self.config.timestep_distribution != TimestepDistribution.PRIORITY_SAMPLING:
-            return  # Sampler não inicializado ou não está em uso
+    def update_priorities(
+            self,
+            timesteps: Tensor,
+            batch_loss: Tensor,
+            config: TrainConfig,
+    ):
+        if self._priority is None or config.timestep_distribution != TimestepDistribution.PRIORITY_SAMPLING:
+            return
 
+        timesteps = timesteps.to(device=self._priority.device, dtype=torch.long)
+        batch_loss = batch_loss.detach().to(device=self._priority.device, dtype=self._priority.dtype)
         if batch_loss.dim() == 0:
             batch_loss = batch_loss.expand(timesteps.shape[0])
 
-        # --- Etapa 1: Calcular o valor de atualização da EMA para cada timestep no batch ---
-        # `target_priority` é o valor que queremos que a prioridade se aproxime: loss * learning_rate
-        # Adicionamos 1.0 como base para garantir exploração.
         target_priority = 1.0 + (batch_loss * config.priority_lr)
-
-        # --- Etapa 2: Aplicar a atualização da EMA de forma vetorial ---
-        # Pega as prioridades atuais para os timesteps amostrados.
         old_priorities = self._priority[timesteps]
-        
-        # Fórmula da EMA: β * old + (1 - β) * new
-        # O `new` aqui é o nosso `target_priority`.
-        new_priorities = config.priority_beta * old_priorities + (1 - config.priority_beta) * target_priority
-        
-        # Atualiza o tensor de prioridades principal nos locais corretos.
-        # `scatter_` é bom para isso, mas uma simples indexação é mais clara e igualmente eficiente aqui.
-        self._priority[timesteps] = new_priorities
+        self._priority[timesteps] = (
+            config.priority_beta * old_priorities
+            + (1 - config.priority_beta) * target_priority
+        )
 
-        # --- Etapa 3 (Opcional, mas recomendado): Espalhamento (Smearing) Vetorizado ---
         if config.priority_radius > 0:
             radius = config.priority_radius
-            
-            # Precisamos operar sobre os timesteps únicos para evitar interferência.
-            unique_ts = timesteps.unique()
-            
-            # Cria a matriz de deslocamentos do kernel (de -radius a +radius)
+            unique_timesteps = timesteps.unique()
             kernel_offsets = torch.arange(-radius, radius + 1, device=self._priority.device)
-            
-            # Pega as prioridades atualizadas dos timesteps únicos
-            updated_priorities_at_unique_ts = self._priority[unique_ts].unsqueeze(1) # Shape: [num_unique, 1]
-
-            # Calcula os pesos do kernel (triangular)
-            # Shape: [1, 2*radius+1]
             kernel_weights = (1.0 - kernel_offsets.abs() / (radius + 1)).unsqueeze(0)
-            
-            # Calcula as prioridades a serem espalhadas
-            # Shape: [num_unique, 2*radius+1]
-            priorities_to_spread = updated_priorities_at_unique_ts * kernel_weights
+            priorities_to_spread = self._priority[unique_timesteps].unsqueeze(1) * kernel_weights
+            target_indexes = unique_timesteps.unsqueeze(1) + kernel_offsets.unsqueeze(0)
+            valid_indexes = (target_indexes >= 0) & (target_indexes < self._priority.numel())
 
-            # Calcula os índices de destino no tensor de prioridade principal
-            # Shape: [num_unique, 2*radius+1]
-            target_indices = unique_ts.unsqueeze(1) + kernel_offsets.unsqueeze(0)
-
-            # --- Clipping de segurança para evitar erros de índice out-of-bounds ---
-            # mascara valores fora do range [0, num_timesteps-1]
-            valid_mask = (target_indices >= 0) & (target_indices < self._priority.numel())
-            
-            # Aplica a máscara para pegar apenas os valores e índices válidos
-            flat_target_indices = target_indices[valid_mask]
-            flat_priorities_to_spread = priorities_to_spread[valid_mask]
-
-            # --- Operação final de espalhamento ---
-            # Usamos `torch.max` para garantir que o espalhamento só aumente as prioridades,
-            # nunca diminuindo uma prioridade que já era alta.
-            # `scatter_reduce_` com 'amax' é a operação perfeita e mais eficiente para isso.
             self._priority.scatter_reduce_(
                 dim=0,
-                index=flat_target_indices,
-                src=flat_priorities_to_spread,
-                reduce="amax", # amax = maximum
-                include_self=False # não inclui o valor original no cálculo do max
-            )        
+                index=target_indexes[valid_indexes],
+                src=priorities_to_spread[valid_indexes],
+                reduce="amax",
+                include_self=True,
+            )

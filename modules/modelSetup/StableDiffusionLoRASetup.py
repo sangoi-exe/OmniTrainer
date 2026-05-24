@@ -1,19 +1,17 @@
 from modules.model.StableDiffusionModel import StableDiffusionModel
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.BaseStableDiffusionSetup import BaseStableDiffusionSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.enum.ModelType import ModelType
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.torch_util import state_dict_has_prefix
 from modules.util.TrainProgress import TrainProgress
 
 import torch
-
-PRESETS = {
-    "attn-mlp": ["attentions"],
-    "attn-only": ["attn"],
-    "full": [],
-}
 
 
 class StableDiffusionLoRASetup(
@@ -38,12 +36,7 @@ class StableDiffusionLoRASetup(
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
-        if config.text_encoder.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="text_encoder_lora",
-                parameters=model.text_encoder_lora.parameters(),
-                learning_rate=config.text_encoder.learning_rate,
-            ))
+        self._create_model_part_parameters(parameter_group_collection, "text_encoder_lora", model.text_encoder_lora, config.text_encoder)
 
         if config.train_any_embedding() or config.train_any_output_embedding():
             self._add_embedding_param_groups(
@@ -51,12 +44,7 @@ class StableDiffusionLoRASetup(
                 "embeddings"
             )
 
-        if config.unet.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="unet_lora",
-                parameters=model.unet_lora.parameters(),
-                learning_rate=config.unet.learning_rate,
-            ))
+        self._create_model_part_parameters(parameter_group_collection, "unet_lora", model.unet_lora, config.unet)
 
         return parameter_group_collection
 
@@ -70,15 +58,8 @@ class StableDiffusionLoRASetup(
         model.unet.requires_grad_(False)
         model.vae.requires_grad_(False)
 
-        if model.text_encoder_lora is not None:
-            train_text_encoder = config.text_encoder.train and \
-                                 not self.stop_text_encoder_training_elapsed(config, model.train_progress)
-            model.text_encoder_lora.requires_grad_(train_text_encoder)
-
-        if model.unet_lora is not None:
-            train_unet = config.unet.train and \
-                         not self.stop_unet_training_elapsed(config, model.train_progress)
-            model.unet_lora.requires_grad_(train_unet)
+        self._setup_model_part_requires_grad("text_encoder_lora", model.text_encoder_lora, config.text_encoder, model.train_progress)
+        self._setup_model_part_requires_grad("unet_lora", model.unet_lora, config.unet, model.train_progress)
 
     def setup_model(
             self,
@@ -94,7 +75,7 @@ class StableDiffusionLoRASetup(
         ) if create_te else None
 
         model.unet_lora = LoRAModuleWrapper(
-            model.unet, "lora_unet", config, config.lora_layers.split(",")
+            model.unet, "lora_unet", config, config.layer_filter.split(",")
         )
 
         if model.lora_state_dict:
@@ -121,9 +102,10 @@ class StableDiffusionLoRASetup(
         self._remove_added_embeddings_from_tokenizer(model.tokenizer)
         self._setup_embeddings(model, config)
         self._setup_embedding_wrapper(model, config)
-        self.__setup_requires_grad(model, config)
 
-        init_model_parameters(model, self.create_parameters(model, config), self.train_device)
+        params = self.create_parameters(model, config)
+        self.__setup_requires_grad(model, config)
+        init_model_parameters(model, params, self.train_device)
 
     def setup_train_device(
             self,
@@ -163,3 +145,12 @@ class StableDiffusionLoRASetup(
             self._normalize_output_embeddings(model.all_text_encoder_embeddings())
             model.embedding_wrapper.normalize_embeddings()
         self.__setup_requires_grad(model, config)
+
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_15, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_15_INPAINTING, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_20, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_20_BASE, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_20_INPAINTING, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_20_DEPTH, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_21, TrainingMethod.LORA)
+factory.register(BaseModelSetup, StableDiffusionLoRASetup, ModelType.STABLE_DIFFUSION_21_BASE, TrainingMethod.LORA)

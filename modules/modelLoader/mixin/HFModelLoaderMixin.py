@@ -1,14 +1,15 @@
 import json
 import os
+import re
+import traceback
 from abc import ABCMeta
 from itertools import repeat
 
+from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.DataType import DataType
 from modules.util.quantization_util import (
     is_quantized_parameter,
-    replace_linear_with_fp8_layers,
-    replace_linear_with_int8_layers,
-    replace_linear_with_nf4_layers,
+    replace_linear_with_quantized_layers,
 )
 
 import torch
@@ -30,6 +31,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             dtype: DataType,
             train_dtype: DataType,
             keep_in_fp32_modules: list[str] | None,
+            quantization: QuantizationConfig | None,
             pretrained_model_name_or_path: str,
             subfolder: str | None,
             model_filename: str,
@@ -39,13 +41,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
         if keep_in_fp32_modules is None:
             keep_in_fp32_modules = []
 
-        with accelerate.init_empty_weights():
-            if dtype.quantize_nf4():
-                replace_linear_with_nf4_layers(sub_module, keep_in_fp32_modules, copy_parameters=False)
-            elif dtype.quantize_int8():
-                replace_linear_with_int8_layers(sub_module, keep_in_fp32_modules, copy_parameters=False)
-            elif dtype.quantize_fp8():
-                replace_linear_with_fp8_layers(sub_module, keep_in_fp32_modules, copy_parameters=False)
+        replace_linear_with_quantized_layers(sub_module, dtype, keep_in_fp32_modules, quantization, copy_parameters=False)
 
         is_local = os.path.isdir(pretrained_model_name_or_path)
 
@@ -115,9 +111,21 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             for f in full_filenames:
                 state_dict |= load_file(f)
 
-        if hasattr(sub_module, '_convert_deprecated_attention_blocks'):
-            sub_module._convert_deprecated_attention_blocks(state_dict)
+        if hasattr(sub_module, '_fix_state_dict_keys_on_load'):
+            sub_module._fix_state_dict_keys_on_load(state_dict)
 
+        if hasattr(sub_module, "_checkpoint_conversion_mapping"): #required for loading the text encoder of Qwen
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_k = k
+                for pattern, replacement in sub_module._checkpoint_conversion_mapping.items():
+                    new_k = re.sub(pattern, replacement, new_k)
+                new_state_dict[new_k] = v
+            state_dict = new_state_dict
+
+        #tensors that will be quantized are loaded at their original dtype. non-quantized tensors are converted
+        #to their intended dtype here
+        #TODO the following code requires quite a few workarounds by now. Is there a better way?
         for key, value in state_dict.items():
             module = sub_module
             tensor_name = key
@@ -158,7 +166,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             dtype: DataType,
             train_dtype: DataType,
             pretrained_model_name_or_path: str,
-            subfolder: str | None = None,
+            subfolder: str = "",
     ):
         user_agent = {
             "file_type": "model",
@@ -180,6 +188,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             dtype=dtype,
             train_dtype=train_dtype,
             keep_in_fp32_modules=module_type._keep_in_fp32_modules,
+            quantization=None,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             subfolder=subfolder,
             model_filename="model.safetensors",
@@ -194,6 +203,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             train_dtype: DataType,
             pretrained_model_name_or_path: str,
             subfolder: str | None = None,
+            quantization: QuantizationConfig | None = None,
     ):
         user_agent = {
             "file_type": "model",
@@ -214,7 +224,8 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             sub_module=sub_module,
             dtype=dtype,
             train_dtype=train_dtype,
-            keep_in_fp32_modules=None,
+            keep_in_fp32_modules=module_type._keep_in_fp32_modules,
+            quantization=quantization,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             subfolder=subfolder,
             model_filename="diffusion_pytorch_model.safetensors",
@@ -228,21 +239,16 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             dtype: DataType,
             train_dtype: DataType,
             keep_in_fp32_modules: list[str] | None,
+            quantization: QuantizationConfig | None,
     ):
         if keep_in_fp32_modules is None:
             keep_in_fp32_modules = []
 
-        if dtype.quantize_nf4():
-            replace_linear_with_nf4_layers(sub_module, keep_in_fp32_modules, copy_parameters=True)
-        elif dtype.quantize_int8():
-            replace_linear_with_int8_layers(sub_module, keep_in_fp32_modules, copy_parameters=True)
-        elif dtype.quantize_fp8():
-            replace_linear_with_fp8_layers(sub_module, keep_in_fp32_modules, copy_parameters=True)
+        replace_linear_with_quantized_layers(sub_module, dtype, keep_in_fp32_modules, quantization, copy_parameters=True)
 
         for module_name, module in sub_module.named_modules():
             param_iter = [(x, y[0], y[1]) for x, y in zip(repeat(False), module._parameters.items(), strict=False)]
             buffer_iter = [(x, y[0], y[1]) for x, y in zip(repeat(True), module._buffers.items(), strict=False)]
-
             for is_buffer, tensor_name, value in param_iter + buffer_iter:
                 if value is not None and torch.is_floating_point(value):
                     old_type = type(value)
@@ -266,6 +272,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             sub_module: nn.Module,
             dtype: DataType,
             train_dtype: DataType,
+            quantization: QuantizationConfig | None = None,
     ):
         module_type = type(sub_module)
 
@@ -274,6 +281,7 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             dtype,
             train_dtype,
             module_type._keep_in_fp32_modules,
+            quantization,
         )
 
     def _convert_diffusers_sub_module_to_dtype(
@@ -281,10 +289,31 @@ class HFModelLoaderMixin(metaclass=ABCMeta):
             sub_module: nn.Module,
             dtype: DataType,
             train_dtype: DataType,
+            quantization: QuantizationConfig | None = None,
     ):
         return self.__convert_sub_module_to_dtype(
             sub_module,
             dtype,
             train_dtype,
             None,
+            quantization,
         )
+
+    def _prepare_sub_modules(self, pretrained_model_name_or_path: str, diffusers_modules: list[str], transformers_modules: list[str]):
+        is_local = os.path.isdir(pretrained_model_name_or_path)
+        if is_local:
+            return
+
+        diffusers_paths = [((folder + "/") if folder else "") + "diffusion_pytorch_model*" for folder in diffusers_modules]
+        transformers_paths = [((folder + "/") if folder else "") + "model*" for folder in transformers_modules]
+        transformers_paths.extend([((folder + "/") if folder else "") + "pytorch_model*" for folder in transformers_modules])
+        try:
+            huggingface_hub.snapshot_download(
+                pretrained_model_name_or_path,
+                allow_patterns=diffusers_paths + transformers_paths,
+            )
+        except huggingface_hub.errors.HFValidationError:
+            pass
+        except Exception:
+            traceback.print_exc()
+            print("Error during bulk preloading of Huggingface model repository, proceeding without preloading")

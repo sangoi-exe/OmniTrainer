@@ -62,3 +62,4 @@ class DataRecorder:
         except Exception as e:
             logFun(f"[DataRecorder] ERRO ao salvar histórico de métricas em {path}: {e}", lvl="error")
             traceback.print_exc()
+            raise

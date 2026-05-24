@@ -1,6 +1,7 @@
 from abc import ABCMeta
 from random import Random
 
+import modules.util.multi_gpu_util as multi
 from modules.model.StableDiffusionModel import StableDiffusionModel, StableDiffusionModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
@@ -8,6 +9,7 @@ from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiff
 from modules.modelSetup.mixin.ModelSetupDiffusionMixin import ModelSetupDiffusionMixin
 from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
+from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_basic_transformer_blocks,
@@ -18,11 +20,11 @@ from modules.util.conv_util import apply_circular_padding_to_conv2d
 from modules.util.dtype_util import create_autocast_context
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
+from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
 import torch
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
 
 class BaseStableDiffusionSetup(
@@ -32,8 +34,14 @@ class BaseStableDiffusionSetup(
     ModelSetupNoiseMixin,
     ModelSetupDiffusionMixin,
     ModelSetupEmbeddingMixin,
+    ModelSetupText2ImageMixin,
     metaclass=ABCMeta,
 ):
+    LAYER_PRESETS = {
+        "attn-mlp": ["attentions"],
+        "attn-only": ["attn"],
+        "full": [],
+    }
 
     def __init__(self, train_device: torch.device, temp_device: torch.device, debug_mode: bool):
         super().__init__(train_device, temp_device, debug_mode)
@@ -63,9 +71,9 @@ class BaseStableDiffusionSetup(
             config.weight_dtypes().embedding if config.train_any_embedding() else None,
         ], config.enable_autocast_cache)
 
-        quantize_layers(model.text_encoder, self.train_device, model.train_dtype)
-        quantize_layers(model.vae, self.train_device, model.train_dtype)
-        quantize_layers(model.unet, self.train_device, model.train_dtype)        
+        quantize_layers(model.text_encoder, self.train_device, model.train_dtype, config)
+        quantize_layers(model.vae, self.train_device, model.train_dtype, config)
+        quantize_layers(model.unet, self.train_device, model.train_dtype, config)
 
     def _setup_embeddings(
             self,
@@ -77,6 +85,7 @@ class BaseStableDiffusionSetup(
             embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
             if embedding_state is None:
                 embedding_state = self._create_new_embedding(
+                    model,
                     embedding_config,
                     model.tokenizer,
                     model.text_encoder,
@@ -142,7 +151,7 @@ class BaseStableDiffusionSetup(
             deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step
+            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -157,7 +166,7 @@ class BaseStableDiffusionSetup(
                 text_encoder_layer_skip=config.text_encoder_layer_skip,
                 text_encoder_output=batch[
                     'text_encoder_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-                text_encoder_dropout_probability=config.text_encoder.dropout_probability,
+                text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
             )
 
             latent_image = batch['latent_image']
@@ -167,14 +176,20 @@ class BaseStableDiffusionSetup(
             if config.model_type.has_conditioning_image_input():
                 scaled_latent_conditioning_image = batch['latent_conditioning_image'] * vae_scaling_factor
 
-            latent_noise = self._create_noise(scaled_latent_image, config, generator)
-
             timestep = self._get_timestep_discrete(
                 model.noise_scheduler.config['num_train_timesteps'],
                 deterministic,
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+            )
+
+            latent_noise = self._create_noise(
+                scaled_latent_image,
+                config,
+                generator,
+                timestep,
+                model.noise_scheduler.betas,
             )
 
             scaled_noisy_latent_image = self._add_noise_discrete(
@@ -321,5 +336,15 @@ class BaseStableDiffusionSetup(
             data=data,
             config=config,
             train_device=self.train_device,
-            betas=model.noise_scheduler.betas.to(device=self.train_device),
+            model=model,
+            betas=model.noise_scheduler.betas,
         ).mean()
+
+    def prepare_text_caching(self, model: StableDiffusionModel, config: TrainConfig):
+        model.to(self.temp_device)
+
+        if not config.train_text_encoder_or_embedding():
+            model.text_encoder_to(self.train_device)
+
+        model.eval()
+        torch_gc()

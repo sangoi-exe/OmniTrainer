@@ -1,25 +1,13 @@
 import torch
 from torch import Tensor
 
-# supostamente pode ser melhor usar essa do que addcdiv e etc
-def addcdiv_stochastic_buffered_(input_bf16: Tensor, buffer_fp32: Tensor, tensor1: Tensor, tensor2: Tensor, value: float = 1.0):
-    """
-    Versão otimizada que usa um buffer float32 pré-alocado.
-    input_bf16 + (tensor1 / tensor2 * value)
-    
-    Args:
-        input_bf16: O tensor de entrada/saída (bfloat16).
-        buffer_fp32: Um buffer pré-alocado com o mesmo shape, mas dtype float32.
-        tensor1, tensor2, value: Argumentos para addcdiv.
-    """
-    # 1. Copia o valor atual de bf16 para o buffer fp32
-    buffer_fp32.copy_(input_bf16)
-    
-    # 2. Realiza a operação em precisão total (float32) no buffer
-    buffer_fp32.addcdiv_(tensor1, tensor2, value=value)
-    
-    # 3. Copia o resultado de volta para o tensor original com arredondamento estocástico
-    copy_stochastic_(input_bf16, buffer_fp32)
+generator = None
+
+def set_seed(seed: int, device: torch.device):
+    global generator
+    if generator is None or generator.device != device:
+        generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
 
 def copy_stochastic_(target: Tensor, source: Tensor):
     """
@@ -29,12 +17,17 @@ def copy_stochastic_(target: Tensor, source: Tensor):
         target: the target tensor with dtype=bfloat16
         source: the target tensor with dtype=float32
     """
+
+    global generator
+
     # create a random 16 bit integer
-    result = torch.randint_like(
-        source,
+    result = torch.randint(
+        size=source.shape,
+        device=source.device,
         dtype=torch.int32,
         low=0,
         high=(1 << 16),
+        generator=generator,
     )
 
     # add the random number to the lower 16 bit of the mantissa

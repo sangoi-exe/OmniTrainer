@@ -1,9 +1,8 @@
+import os
 import json
 import traceback
-import os
 import torch
-from torch import Tensor
-from typing import Iterable, Tuple, Dict, Optional, List, TYPE_CHECKING
+from typing import Iterable, Tuple, Dict, Optional, TYPE_CHECKING
 from collections import defaultdict
 
 from modules.sangoi.logFun import logFun
@@ -40,11 +39,11 @@ class TrainGPS:
 
         # --- Armazenamento de dados ---
         # Usado para calcular os deltas a serem salvos (Modo Coleta/Refinamento)
-        self.save_run_initial_weights: Dict[str, torch.Tensor] = {}
+        self.save_run_initial_weights: Dict[str, list[torch.Tensor]] = {}
         # Usado para calcular a penalidade contra o padrão de referência (Modo Aplicação/Refinamento)
-        self.use_run_initial_weights: Dict[str, torch.Tensor] = {}
+        self.use_run_initial_weights: Dict[str, list[torch.Tensor]] = {}
         # Padrão de referência carregado de um arquivo
-        self.reference_deltas: Dict[str, torch.Tensor] = {}
+        self.reference_deltas: Dict[str, Dict[str, torch.Tensor]] = {}
         # Log dos deltas da run atual, agrupados por época
         self.delta_log_by_module: Dict[str, Dict[str, float]] = defaultdict(dict)
 
@@ -79,19 +78,18 @@ class TrainGPS:
             logFun("[TrainGPS] Tentativa de logar deltas sem pesos iniciais capturados. Ignorando.", lvl="warning")
             return
 
-        current_deltas = self._calculate_current_deltas(self.save_run_initial_weights)
-        
-        # Agrupa os deltas por prefixo e calcula a norma L2
-        group_norms_sq: Dict[str, float] = defaultdict(float)
-        for name, delta in current_deltas.items():
-            # Define o prefixo de agrupamento (ajuste aqui para granularidade desejada)
-            prefix = name.split(".")[0]
-            group_norms_sq[prefix] += torch.norm(delta.float(), p=2).pow(2).item()
+        with torch.no_grad():
+            current_deltas = self._calculate_current_deltas(self.save_run_initial_weights)
+
+            group_norms_sq: Dict[str, float] = defaultdict(float)
+            for group_name, delta_tensors in current_deltas.items():
+                for delta_tensor in delta_tensors:
+                    group_norms_sq[group_name] += torch.norm(delta_tensor.float(), p=2).pow(2).item()
 
         epoch_key = f"epoch_{epoch}"
-        for prefix, norm_sq in group_norms_sq.items():
+        for group_name, norm_sq in group_norms_sq.items():
             delta_norm = norm_sq ** 0.5
-            self.delta_log_by_module[epoch_key][prefix] = delta_norm
+            self.delta_log_by_module[epoch_key][group_name] = delta_norm
 
         logFun(f"[TrainGPS] Deltas logados para {epoch_key}.", lvl="info")
 
@@ -106,47 +104,37 @@ class TrainGPS:
             self.current_total_delta_norm = None
             return torch.tensor(0.0, device=target_device)
 
-        try:
-            current_deltas_by_group = self._get_current_deltas_by_group(self.use_run_initial_weights)
-            
-            # Precisamos obter os deltas de referência para a época atual.
-            current_epoch = self.model.train_progress.epoch
-            reference_key_prefix = f"epoch_{current_epoch}"
-            
-            relevant_reference_deltas = {
-                key.split("/", 1)[1]: val
-                for key, val in self.reference_deltas.items()
-                if key.startswith(reference_key_prefix)
-            }
+        current_deltas_by_group = self._get_current_deltas_by_group(self.use_run_initial_weights)
 
-            if not relevant_reference_deltas:
-                # Nenhuma referência para esta época, sem penalidade.
-                return torch.tensor(0.0, device=target_device)
+        current_epoch = self.model.train_progress.epoch
+        reference_key_prefix = f"epoch_{current_epoch}"
 
-            common_keys = [k for k in relevant_reference_deltas if k in current_deltas_by_group]
-            if not common_keys:
-                return torch.tensor(0.0, device=target_device)
+        relevant_reference_deltas = self.reference_deltas.get(reference_key_prefix, {})
 
-            # Empilha os vetores para cálculo em batch
-            ref_vec = torch.stack([relevant_reference_deltas[k].to(device=target_device, dtype=torch.float32) for k in common_keys])
-            cur_vec = torch.stack([current_deltas_by_group[k].to(dtype=torch.float32) for k in common_keys])
-
-            # Calcula a norma do delta atual para logging
-            self.current_total_delta_norm = float(torch.norm(cur_vec, p=2))
-
-            if self.penalty_metric == "cosine":
-                # 1 - similaridade = distância. Queremos minimizar a distância.
-                penalty = 1.0 - torch.nn.functional.cosine_similarity(cur_vec.flatten(), ref_vec.flatten(), dim=0, eps=1e-8)
-            else:  # "mse"
-                penalty = torch.nn.functional.mse_loss(cur_vec, ref_vec)
-
-            return (lambda_weight * penalty).to(dtype=self._get_target_dtype())
-
-        except Exception as e:
-            logFun(f"[TrainGPS] Erro em compute_penalty: {e}", lvl="error")
-            traceback.print_exc()
-            self.current_total_delta_norm = None
+        if not relevant_reference_deltas:
             return torch.tensor(0.0, device=target_device)
+
+        common_keys = [key for key in relevant_reference_deltas if key in current_deltas_by_group]
+        if not common_keys:
+            raise RuntimeError(f"TrainGPS reference epoch has no matching parameter groups: {reference_key_prefix}")
+
+        ref_vec = torch.stack([
+            relevant_reference_deltas[key].to(device=target_device, dtype=torch.float32)
+            for key in common_keys
+        ])
+        cur_vec = torch.stack([
+            current_deltas_by_group[key].to(dtype=torch.float32)
+            for key in common_keys
+        ])
+
+        self.current_total_delta_norm = float(torch.norm(cur_vec.detach(), p=2))
+
+        if self.penalty_metric == "cosine":
+            penalty = 1.0 - torch.nn.functional.cosine_similarity(cur_vec.flatten(), ref_vec.flatten(), dim=0, eps=1e-8)
+        else:
+            penalty = torch.nn.functional.mse_loss(cur_vec, ref_vec)
+
+        return (lambda_weight * penalty).to(dtype=self._get_target_dtype())
 
     def save_log_to_file(self, path: str):
         """Salva o dicionário de deltas logados em um arquivo JSON."""
@@ -160,6 +148,7 @@ class TrainGPS:
         except Exception as e:
             logFun(f"[TrainGPS] ERRO ao salvar log de deltas: {e}", lvl="error")
             traceback.print_exc()
+            raise
 
     def get_delta_norms_for_logging(self) -> Tuple[Optional[float], Optional[float]]:
         """Retorna as normas L2 cacheadas do delta atual e de referência para logging."""
@@ -167,16 +156,17 @@ class TrainGPS:
 
     # --- Métodos Privados de Lógica Interna ---
 
-    def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor]]:
+    def _iterate_param_groups(self, detach: bool) -> Iterable[Tuple[str, list[torch.Tensor]]]:
         """Iterador privado que abstrai a obtenção de parâmetros treináveis do modelo."""
-        # Itera sobre os grupos de parâmetros que definimos no setup
-        for group in self.param_collection.groups:
-            # O nome do grupo já é o prefixo único do módulo LoRA
-            prefix = group.unique_name
-            for param in group.parameters:
-                # O 'nome' completo do parâmetro não é tão importante quanto o prefixo do grupo.
-                # Usamos o prefixo para consistência com como os deltas são agrupados.
-                yield prefix, param.detach()
+        for unique_name in self.param_collection.unique_name_mapping:
+            group = self.param_collection.by_unique_name(unique_name)
+            if group is None:
+                raise RuntimeError(f"Missing TrainGPS parameter group: {unique_name}")
+
+            yield unique_name, [
+                param.detach() if detach else param
+                for param in group.parameters
+            ]
 
     def _get_target_device(self) -> torch.device:
         """Obtém o device do primeiro parâmetro do modelo."""
@@ -194,40 +184,54 @@ class TrainGPS:
 
     def _capture_weights_generic(
         self, target_device: torch.device, target_dtype: Optional[torch.dtype] = None
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, list[torch.Tensor]]:
         """Helper genérico para capturar os pesos atuais do modelo."""
         storage_dict = {}
         processed_params = 0
-        for name, param in self._iterate_params():
-            captured_param = param.clone().to(device=target_device)
-            if target_dtype:
-                captured_param = captured_param.to(dtype=target_dtype)
-            storage_dict[name] = captured_param
-            processed_params += 1
+        for name, parameters in self._iterate_param_groups(detach=True):
+            captured_params = []
+            for param in parameters:
+                captured_param = param.clone().to(device=target_device)
+                if target_dtype:
+                    captured_param = captured_param.to(dtype=target_dtype)
+                captured_params.append(captured_param)
+                processed_params += 1
+
+            storage_dict[name] = captured_params
         
         if processed_params == 0:
             logFun("[TrainGPS] Aviso: _capture_weights_generic não encontrou parâmetros.", lvl="warning")
         
         return storage_dict
     
-    def _calculate_current_deltas(self, reference_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def _calculate_current_deltas(self, reference_weights: Dict[str, list[torch.Tensor]]) -> Dict[str, list[torch.Tensor]]:
         """Helper privado para calcular deltas atuais contra um dicionário de referência."""
         current_deltas = {}
-        for name, current_param in self._iterate_params():
+        for name, current_params in self._iterate_param_groups(detach=False):
             if name in reference_weights:
-                initial_weight = reference_weights[name].to(device=current_param.device)
-                current_deltas[name] = current_param - initial_weight
+                initial_weights = reference_weights[name]
+                if len(current_params) != len(initial_weights):
+                    raise RuntimeError(f"TrainGPS parameter count changed for group: {name}")
+
+                current_deltas[name] = [
+                    current_param - initial_weight.to(device=current_param.device)
+                    for current_param, initial_weight in zip(current_params, initial_weights, strict=True)
+                ]
         return current_deltas
     
-    def _get_current_deltas_by_group(self, reference_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def _get_current_deltas_by_group(self, reference_weights: Dict[str, list[torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Calcula a norma L2 dos deltas atuais, agrupados por prefixo."""
         deltas = self._calculate_current_deltas(reference_weights)
         
-        # Agrupa os deltas (ainda como tensores) pela norma quadrada
-        deltas_sq: Dict[str, torch.Tensor] = defaultdict(lambda: torch.tensor(0.0, device=self._get_target_device()))
-        for name, delta_tensor in deltas.items():
-            # O 'name' aqui já é o prefixo do grupo
-            deltas_sq[name] += torch.norm(delta_tensor.float(), p=2).pow(2)
+        # Agrupa os deltas (ainda como tensores) pela norma quadrada.
+        deltas_sq: Dict[str, torch.Tensor] = {}
+        for name, delta_tensors in deltas.items():
+            for delta_tensor in delta_tensors:
+                delta_norm_sq = torch.norm(delta_tensor.float(), p=2).pow(2)
+                if name in deltas_sq:
+                    deltas_sq[name] = deltas_sq[name] + delta_norm_sq
+                else:
+                    deltas_sq[name] = delta_norm_sq
             
         return {k: torch.sqrt(v) for k, v in deltas_sq.items()}
 
@@ -237,22 +241,35 @@ class TrainGPS:
             with open(pattern_path, "r", encoding="utf-8") as f:
                 loaded_data = json.load(f)
 
-            # Converte os dados carregados em tensores no device da CPU por enquanto
-            self.reference_deltas = {
-                key: torch.tensor(value, dtype=torch.float32, device="cpu")
-                for epoch_data in loaded_data.values() for key, value in epoch_data.items()
-            }
+            reference_deltas: Dict[str, Dict[str, torch.Tensor]] = {}
+            for epoch_key, epoch_data in loaded_data.items():
+                if not isinstance(epoch_key, str) or not isinstance(epoch_data, dict):
+                    raise ValueError("TrainGPS reference pattern must map epoch keys to group dictionaries")
+
+                reference_deltas[epoch_key] = {}
+                for group_name, value in epoch_data.items():
+                    if not isinstance(group_name, str) or isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ValueError("TrainGPS reference group values must be numeric")
+                    reference_deltas[epoch_key][group_name] = torch.tensor(value, dtype=torch.float32, device="cpu")
+
+            self.reference_deltas = reference_deltas
             
             # Recalcula a norma de referência total.
             if self.reference_deltas:
-                total_norm_sq = sum(v.pow(2).sum() for v in self.reference_deltas.values())
+                total_norm_sq = sum(
+                    value.pow(2).sum()
+                    for epoch_data in self.reference_deltas.values()
+                    for value in epoch_data.values()
+                )
                 self.reference_delta_norm = torch.sqrt(total_norm_sq).item()
-                logFun(f"[TrainGPS] Padrão de referência carregado com {len(self.reference_deltas)} deltas. Norma L2 total: {self.reference_delta_norm:.4f}", lvl="success")
+                delta_count = sum(len(epoch_data) for epoch_data in self.reference_deltas.values())
+                logFun(f"[TrainGPS] Padrão de referência carregado com {delta_count} deltas. Norma L2 total: {self.reference_delta_norm:.4f}", lvl="success")
             else:
-                logFun("[TrainGPS] Padrão de referência carregado, mas está vazio.", lvl="warning")
+                raise ValueError("TrainGPS reference pattern is empty")
         
         except Exception as e:
             logFun(f"[TrainGPS] Falha ao carregar ou processar padrão de referência: {e}", lvl="error")
             traceback.print_exc()
             self.reference_deltas = {}
             self.reference_delta_norm = None
+            raise

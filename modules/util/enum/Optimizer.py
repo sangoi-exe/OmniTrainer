@@ -17,11 +17,13 @@ class Optimizer(Enum):
     # 32 bit is torch and not bnb
     ADAMW = 'ADAMW'
     ADAMW_8BIT = 'ADAMW_8BIT'
+    ADAMW_ADV = 'ADAMW_ADV'
 
     AdEMAMix = 'AdEMAMix'
     AdEMAMix_8BIT = "AdEMAMix_8BIT"
 
     ADOPT = 'ADOPT'
+    ADOPT_ADV = 'ADOPT_ADV'
 
     LAMB = 'LAMB'
     LAMB_8BIT = 'LAMB_8BIT'
@@ -31,6 +33,7 @@ class Optimizer(Enum):
 
     LION = 'LION'
     LION_8BIT = 'LION_8BIT'
+    LION_ADV = 'LION_ADV'
 
     RMSPROP = 'RMSPROP'
     RMSPROP_8BIT = 'RMSPROP_8BIT'
@@ -38,6 +41,7 @@ class Optimizer(Enum):
     # 32 bit is torch and not bnb
     SGD = 'SGD'
     SGD_8BIT = 'SGD_8BIT'
+    SIGNSGD_ADV = 'SIGNSGD_ADV'
 
     # Schedule-free optimizers
     SCHEDULE_FREE_ADAMW = 'SCHEDULE_FREE_ADAMW'
@@ -52,12 +56,20 @@ class Optimizer(Enum):
 
     # Prodigy
     PRODIGY = 'PRODIGY'
+    PRODIGY_PLUS_SCHEDULE_FREE = 'PRODIGY_PLUS_SCHEDULE_FREE'
+    PRODIGY_ADV = 'PRODIGY_ADV'
 
     # ADAFACTOR
     ADAFACTOR = 'ADAFACTOR'
 
     # CAME
     CAME = 'CAME'
+    CAME_8BIT = 'CAME_8BIT'
+
+    # MUON
+    MUON = 'MUON'
+    MUON_ADV = 'MUON_ADV'
+    ADAMUON_ADV = 'ADAMUON_ADV'
 
     #Pytorch Optimizers
     ADABELIEF = 'ADABELIEF'
@@ -74,6 +86,8 @@ class Optimizer(Enum):
             self.DADAPT_ADA_GRAD,
             self.DADAPT_LION,
             self.PRODIGY,
+            self.PRODIGY_PLUS_SCHEDULE_FREE,
+            self.PRODIGY_ADV,
         ]
 
     @property
@@ -81,22 +95,34 @@ class Optimizer(Enum):
         return self in [
             self.SCHEDULE_FREE_ADAMW,
             self.SCHEDULE_FREE_SGD,
+            self.PRODIGY_PLUS_SCHEDULE_FREE,
         ]
 
     def supports_fused_back_pass(self):
         return self in [
             Optimizer.ADAFACTOR,
             Optimizer.CAME,
+            Optimizer.CAME_8BIT,
             Optimizer.ADAM,
             Optimizer.ADAMW,
             Optimizer.PRODIGY,
+            Optimizer.ADAMW_ADV,
+            Optimizer.ADOPT_ADV,
+            Optimizer.PRODIGY_PLUS_SCHEDULE_FREE,
+            Optimizer.PRODIGY_ADV,
+            Optimizer.LION_ADV,
+            Optimizer.MUON_ADV,
+            Optimizer.ADAMUON_ADV,
+            Optimizer.SIGNSGD_ADV,
         ]
 
     # Small helper for adjusting learning rates to adaptive optimizers.
     def maybe_adjust_lrs(self, lrs: dict[str, float], optimizer: torch.optim.Optimizer):
         if self.is_adaptive:
             return {
-                key: (lr * optimizer.param_groups[i].get("d", 1.0) if lr is not None else None)
+                # Return `effective_lr * d` if "effective_lr" key present, otherwise return `lr * d`
+                key: (optimizer.param_groups[i].get("effective_lr", lr) * optimizer.param_groups[i].get("d", 1.0)
+                      if lr is not None else None)
                 for i, (key, lr) in enumerate(lrs.items())
             }
         return lrs

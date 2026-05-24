@@ -2,6 +2,8 @@ from collections.abc import Callable
 from enum import Enum
 from typing import Any, get_args, get_origin
 
+from modules.util.type_util import issubclass_safe
+
 
 class BaseConfig:
     config_version: int
@@ -9,7 +11,7 @@ class BaseConfig:
 
     def __init__(
             self,
-            data: list[(str, Any, type, bool)],
+            data: list[tuple[str, Any, type, bool]],
             config_version: int | None = None,
             config_migrations: dict[int, Callable[[dict], dict]] | None = None
     ):
@@ -32,15 +34,15 @@ class BaseConfig:
 
         for name in self.types:
             value = getattr(self, name)
-            if issubclass(self.types[name], BaseConfig):
+            if issubclass_safe(self.types[name], BaseConfig):
                 data[name] = value.to_dict()
             elif self.types[name] is list or get_origin(self.types[name]) is list:
-                if len(get_args(self.types[name])) > 0 and issubclass(get_args(self.types[name])[0], BaseConfig):
+                if len(get_args(self.types[name])) > 0 and issubclass_safe(get_args(self.types[name])[0], BaseConfig):
                     data[name] = [le.to_dict() for le in value] if value is not None else None
                 else:
                     data[name] = value
             elif self.types[name] is dict or get_origin(self.types[name]) is dict:
-                if len(get_args(self.types[name])) > 0 and issubclass(get_args(self.types[name])[1], BaseConfig):
+                if len(get_args(self.types[name])) > 0 and issubclass_safe(get_args(self.types[name])[1], BaseConfig):
                     dict_data = {}
                     for dict_key, dict_value in value.items():
                         dict_data[dict_key] = dict_value.to_dict()
@@ -49,7 +51,7 @@ class BaseConfig:
                     data[name] = value
             elif self.types[name] is str:
                 data[name] = value
-            elif issubclass(self.types[name], Enum):
+            elif issubclass_safe(self.types[name], Enum):
                 data[name] = None if value is None else str(value)
             elif self.types[name] is bool or self.types[name] is int:
                 data[name] = value
@@ -72,10 +74,10 @@ class BaseConfig:
 
         for name in self.types:
             try:
-                if issubclass(self.types[name], BaseConfig):
+                if issubclass_safe(self.types[name], BaseConfig):
                     getattr(self, name).from_dict(data[name])
                 elif self.types[name] is list or get_origin(self.types[name]) is list:
-                    if len(get_args(self.types[name])) > 0 and issubclass(get_args(self.types[name])[0], BaseConfig):
+                    if len(get_args(self.types[name])) > 0 and issubclass_safe(get_args(self.types[name])[0], BaseConfig):
                         list_type = get_args(self.types[name])[0]
                         if data[name] is not None:
                             old_value = \
@@ -90,128 +92,31 @@ class BaseConfig:
                             value = None
                         setattr(self, name, value)
                     else:
-                        value = data[name]
-
-                        # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
-                        if self.types[name] is list or get_origin(self.types[name]) is list:
-                            # detecta se a lista veio como string JSON
-                            if isinstance(value, str):
-                                try:
-                                    import json
-                                    parsed = json.loads(value)
-                                    if isinstance(parsed, list):
-                                        value = parsed
-                                    else:
-                                        raise ValueError("Parsed value is not a list")
-                                except Exception as e:
-                                    print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
-                                    value = []
-
-                            # se a lista deveria conter dicts, garante isso
-                            expected = get_args(self.types[name])
-                            if expected and expected[0] is dict:
-                                if not all(isinstance(v, dict) for v in value):
-                                    print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
-                                    value = []
-
-                        setattr(self, name, value)
-
+                        setattr(self, name, data[name])
                 elif self.types[name] is dict or get_origin(self.types[name]) is dict:
-                    if len(get_args(self.types[name])) > 0 and issubclass(get_args(self.types[name])[1], BaseConfig):
+                    if len(get_args(self.types[name])) > 0 and issubclass_safe(get_args(self.types[name])[1], BaseConfig):
                         dict_type = get_args(self.types[name])[1]
                         value = {}
                         for dict_key, dict_value in data[name].items():
                             value[dict_key] = dict_type.default_values().from_dict(dict_value)
                         setattr(self, name, value)
                     else:
-                          value = data[name]
-
-                          # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
-                          if self.types[name] is list or get_origin(self.types[name]) is list:
-                              # detecta se a lista veio como string JSON
-                              if isinstance(value, str):
-                                  try:
-                                      import json
-                                      parsed = json.loads(value)
-                                      if isinstance(parsed, list):
-                                          value = parsed
-                                      else:
-                                          raise ValueError("Parsed value is not a list")
-                                  except Exception as e:
-                                      print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
-                                      value = []
-
-                              # se a lista deveria conter dicts, garante isso
-                              expected = get_args(self.types[name])
-                              if expected and expected[0] is dict:
-                                  if not all(isinstance(v, dict) for v in value):
-                                      print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
-                                      value = []
-
-                          setattr(self, name, value)
+                        setattr(self, name, data[name])
                 elif self.types[name] is str:
                     if self.nullables[name]:
                         setattr(self, name, None if data[name] is None else str(data[name]))
                     else:
                         setattr(self, name, str(data[name]))
-                elif issubclass(self.types[name], Enum):
+                elif issubclass_safe(self.types[name], Enum):
                     if isinstance(data[name], str):
                         if self.nullables[name]:
                             setattr(self, name, None if data[name] is None else self.types[name][data[name]])
                         else:
                             setattr(self, name, self.types[name][data[name]])
                     else:
-                          value = data[name]
-
-                          # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
-                          if self.types[name] is list or get_origin(self.types[name]) is list:
-                              # detecta se a lista veio como string JSON
-                              if isinstance(value, str):
-                                  try:
-                                      import json
-                                      parsed = json.loads(value)
-                                      if isinstance(parsed, list):
-                                          value = parsed
-                                      else:
-                                          raise ValueError("Parsed value is not a list")
-                                  except Exception as e:
-                                      print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
-                                      value = []
-
-                              # se a lista deveria conter dicts, garante isso
-                              expected = get_args(self.types[name])
-                              if expected and expected[0] is dict:
-                                  if not all(isinstance(v, dict) for v in value):
-                                      print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
-                                      value = []
-
-                          setattr(self, name, value)
+                        setattr(self, name, data[name])
                 elif self.types[name] is bool:
-                  value = data[name]
-
-                  # Protege listas simples com conteúdo errado vindo como string (ex: "lora_layer_rules")
-                  if self.types[name] is list or get_origin(self.types[name]) is list:
-                      # detecta se a lista veio como string JSON
-                      if isinstance(value, str):
-                          try:
-                              import json
-                              parsed = json.loads(value)
-                              if isinstance(parsed, list):
-                                  value = parsed
-                              else:
-                                  raise ValueError("Parsed value is not a list")
-                          except Exception as e:
-                              print(f"[BaseConfig] Failed to parse list for field '{name}': {e}")
-                              value = []
-
-                      # se a lista deveria conter dicts, garante isso
-                      expected = get_args(self.types[name])
-                      if expected and expected[0] is dict:
-                          if not all(isinstance(v, dict) for v in value):
-                              print(f"[BaseConfig] Field '{name}' expected list[dict], but got malformed list. Resetting to empty.")
-                              value = []
-
-                  setattr(self, name, value)
+                    setattr(self, name, data[name])
                 elif self.types[name] is int:
                     if self.nullables[name]:
                         setattr(self, name, None if data[name] is None else int(data[name]))

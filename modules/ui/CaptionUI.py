@@ -14,7 +14,8 @@ from modules.module.WDModel import WDModel
 from modules.ui.GenerateCaptionsWindow import GenerateCaptionsWindow
 from modules.ui.GenerateMasksWindow import GenerateMasksWindow
 from modules.util import path_util
-from modules.util.torch_util import default_device
+from modules.util.image_util import load_image
+from modules.util.torch_util import default_device, torch_gc
 from modules.util.ui import components
 from modules.util.ui.ui_utils import bind_mousewheel, set_window_icon
 from modules.util.ui.UIState import UIState
@@ -36,61 +37,33 @@ class CaptionUI(ctk.CTkToplevel):
             initial_include_subdirectories: bool,
             *args,
             **kwargs,
-    ):
-        ctk.CTkToplevel.__init__(self, parent, *args, **kwargs)
+    ) -> None:
+        super().__init__(parent, *args, **kwargs)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.dir = initial_dir
-        self.config_ui_data = {
-            "include_subdirectories": initial_include_subdirectories
-        }
+        self.config_ui_data = {"include_subdirectories": initial_include_subdirectories}
         self.config_ui_state = UIState(self, self.config_ui_data)
         self.image_size = 850
-
-        self.title("OneTrainer")
-        self.geometry("1280x980")
-        self.resizable(False, False)
-        set_window_icon(self)
-        self.wait_visibility()
-        self.focus_set()
-
         self.help_text = """
-Keyboard shortcuts when focusing on the prompt input field:
-Up arrow: previous image
-Down arrow: next image
-Return: save
-Ctrl+M: only show the mask
-Ctrl+D: draw mask editing mode
-Ctrl+F: fill mask editing mode
+    Keyboard shortcuts when focusing on the prompt input field:
+    Up arrow: previous image
+    Down arrow: next image
+    Return: save
+    Ctrl+M: only show the mask
+    Ctrl+D: draw mask editing mode
+    Ctrl+F: fill mask editing mode
 
-When editing masks:
-Left click: add mask
-Right click: remove mask
-Mouse wheel: increase or decrease brush size"""
-
+    When editing masks:
+    Left click: add mask
+    Right click: remove mask
+    Mouse wheel: increase or decrease brush size"""
         self.masking_model = None
         self.captioning_model = None
-
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-        # relative path from self.dir to each image
         self.image_rel_paths = []
         self.current_image_index = -1
-
-        self.top_bar(self)
-
-        self.bottom_frame = ctk.CTkFrame(self)
-        self.bottom_frame.grid(row=1, column=0, sticky="nsew")
-
-        self.bottom_frame.grid_rowconfigure(0, weight=1)
-        self.bottom_frame.grid_columnconfigure(0, weight=0)
-        self.bottom_frame.grid_columnconfigure(1, weight=1)
-
         self.file_list = None
         self.image_labels = []
-        self.file_list_column(self.bottom_frame)
-
         self.pil_image = None
         self.image_width = 0
         self.image_height = 0
@@ -106,10 +79,33 @@ Mouse wheel: increase or decrease brush size"""
         self.mask_editing_alpha = None
         self.prompt_var = None
         self.prompt_component = None
-        self.content_column(self.bottom_frame)
 
+
+        self.title("OneTrainer")
+        self.geometry("1280x980")
+        self.resizable(False, False)
+
+
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+
+        self.top_bar(self)
+
+        self.bottom_frame = ctk.CTkFrame(self)
+        self.bottom_frame.grid(row=1, column=0, sticky="nsew")
+        self.bottom_frame.grid_rowconfigure(0, weight=1)
+        self.bottom_frame.grid_columnconfigure(0, weight=0)
+        self.bottom_frame.grid_columnconfigure(1, weight=1)
+
+        self.file_list_column(self.bottom_frame)
+        self.content_column(self.bottom_frame)
         self.load_directory()
-        self.after(150, lambda: set_window_icon(self))
+
+        self.wait_visibility()
+        self.focus_set()
+        self.after(200, lambda: set_window_icon(self))
 
     def top_bar(self, master):
         top_frame = ctk.CTkFrame(master)
@@ -229,7 +225,7 @@ Mouse wheel: increase or decrease brush size"""
     def scan_directory(self, include_subdirectories: bool = False):
         def __is_supported_image_extension(filename):
             name, ext = os.path.splitext(filename)
-            return path_util.is_supported_image_extension(ext) and not name.endswith("-masklabel")
+            return path_util.is_supported_image_extension(ext) and not name.endswith("-masklabel") and not name.endswith("-condlabel")
 
         self.image_rel_paths = []
 
@@ -258,7 +254,7 @@ Mouse wheel: increase or decrease brush size"""
             image_name = os.path.join(self.dir, image_name)
 
         try:
-            return Image.open(image_name).convert('RGB')
+            return load_image(image_name, convert_mode="RGB")
         except Exception:
             print(f'Could not open image {image_name}')
 
@@ -269,7 +265,7 @@ Mouse wheel: increase or decrease brush size"""
             mask_name = os.path.join(self.dir, mask_name)
 
             try:
-                return Image.open(mask_name).convert('RGB')
+                return load_image(mask_name, convert_mode='RGB')
             except Exception:
                 return None
         else:
@@ -518,39 +514,59 @@ Mouse wheel: increase or decrease brush size"""
             traceback.print_exc()
 
     def load_masking_model(self, model):
-        self.captioning_model = None
+        model_type = type(self.masking_model).__name__ if self.masking_model else None
 
-        if model == "ClipSeg":
-            if self.masking_model is None or not isinstance(self.masking_model, ClipSegModel):
-                print("loading ClipSeg model, this may take a while")
-                self.masking_model = ClipSegModel(default_device, torch.float32)
-        elif model == "Rembg":
-            if self.masking_model is None or not isinstance(self.masking_model, RembgModel):
-                print("loading Rembg model, this may take a while")
-                self.masking_model = RembgModel(default_device, torch.float32)
-        elif model == "Rembg-Human":
-            if self.masking_model is None or not isinstance(self.masking_model, RembgHumanModel):
-                print("loading Rembg-Human model, this may take a while")
-                self.masking_model = RembgHumanModel(default_device, torch.float32)
-        elif model == "Hex Color":
-            if self.masking_model is None or not isinstance(self.masking_model, MaskByColor):
-                self.masking_model = MaskByColor(default_device, torch.float32)
+        if model == "ClipSeg" and model_type != "ClipSegModel":
+            self._release_models()
+            print("loading ClipSeg model, this may take a while")
+            self.masking_model = ClipSegModel(default_device, torch.float32)
+        elif model == "Rembg" and model_type != "RembgModel":
+            self._release_models()
+            print("loading Rembg model, this may take a while")
+            self.masking_model = RembgModel(default_device, torch.float32)
+        elif model == "Rembg-Human" and model_type != "RembgHumanModel":
+            self._release_models()
+            print("loading Rembg-Human model, this may take a while")
+            self.masking_model = RembgHumanModel(default_device, torch.float32)
+        elif model == "Hex Color" and model_type != "MaskByColor":
+            self._release_models()
+            self.masking_model = MaskByColor(default_device, torch.float32)
 
     def load_captioning_model(self, model):
-        self.masking_model = None
+        model_type = type(self.captioning_model).__name__ if self.captioning_model else None
 
-        if model == "Blip":
-            if self.captioning_model is None or not isinstance(self.captioning_model, BlipModel):
-                print("loading Blip model, this may take a while")
-                self.captioning_model = BlipModel(default_device, torch.float16)
-        elif model == "Blip2":
-            if self.captioning_model is None or not isinstance(self.captioning_model, Blip2Model):
-                print("loading Blip2 model, this may take a while")
-                self.captioning_model = Blip2Model(default_device, torch.float16)
-        elif model == "WD14 VIT v2":
-            if self.captioning_model is None or not isinstance(self.captioning_model, WDModel):
-                print("loading WD14_VIT_v2 model, this may take a while")
-                self.captioning_model = WDModel(default_device, torch.float16)
+        if model == "Blip" and model_type != "BlipModel":
+            self._release_models()
+            print("loading Blip model, this may take a while")
+            self.captioning_model = BlipModel(default_device, torch.float16)
+        elif model == "Blip2" and model_type != "Blip2Model":
+            self._release_models()
+            print("loading Blip2 model, this may take a while")
+            self.captioning_model = Blip2Model(default_device, torch.float16)
+        elif model == "WD14 VIT v2" and model_type != "WDModel":
+            self._release_models()
+            print("loading WD14_VIT_v2 model, this may take a while")
+            self.captioning_model = WDModel(default_device, torch.float16)
 
     def print_help(self):
         print(self.help_text)
+
+    def _release_models(self):
+        """Release all models from VRAM"""
+        freed = False
+        if self.captioning_model is not None:
+            self.captioning_model = None
+            freed = True
+        if self.masking_model is not None:
+            self.masking_model = None
+            freed = True
+        if freed:
+            torch_gc()
+
+    def _on_close(self):
+        self._release_models()
+        self.destroy()
+
+    def destroy(self):
+        self._release_models()
+        super().destroy()

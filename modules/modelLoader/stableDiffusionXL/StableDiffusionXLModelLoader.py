@@ -5,6 +5,7 @@ from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.SDConfigModelLoaderMixin import SDConfigModelLoaderMixin
 from modules.util import create
+from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.NoiseScheduler import NoiseScheduler
 from modules.util.ModelNames import ModelNames
@@ -46,9 +47,10 @@ class StableDiffusionXLModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             vae_model_name: str,
+            quantization: QuantizationConfig,
     ):
         if os.path.isfile(os.path.join(base_model_name, "meta.json")):
-            self.__load_diffusers(model, model_type, weight_dtypes, base_model_name, vae_model_name)
+            self.__load_diffusers(model, model_type, weight_dtypes, base_model_name, vae_model_name, quantization)
         else:
             raise Exception("not an internal model")
 
@@ -59,22 +61,67 @@ class StableDiffusionXLModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             vae_model_name: str,
+            quantization: QuantizationConfig,
     ):
-        tokenizer_1 = CLIPTokenizer.from_pretrained(base_model_name, subfolder="tokenizer")
-        tokenizer_2 = CLIPTokenizer.from_pretrained(base_model_name, subfolder="tokenizer_2")
-        noise_scheduler = DDIMScheduler.from_pretrained(base_model_name, subfolder="scheduler")
-        noise_scheduler = create.create_noise_scheduler(NoiseScheduler.DDIM, noise_scheduler)
-        text_encoder_1 = self._load_transformers_sub_module(CLIPTextModel, weight_dtypes.text_encoder, weight_dtypes.train_dtype, base_model_name, "text_encoder")
-        text_encoder_2 = self._load_transformers_sub_module(CLIPTextModelWithProjection, weight_dtypes.text_encoder_2, weight_dtypes.train_dtype, base_model_name, "text_encoder_2")
-        
+        tokenizer_1 = CLIPTokenizer.from_pretrained(
+            base_model_name,
+            subfolder="tokenizer",
+        )
+
+        tokenizer_2 = CLIPTokenizer.from_pretrained(
+            base_model_name,
+            subfolder="tokenizer_2",
+        )
+
+        noise_scheduler = DDIMScheduler.from_pretrained(
+            base_model_name,
+            subfolder="scheduler",
+        )
+        noise_scheduler = create.create_noise_scheduler(
+            noise_scheduler=NoiseScheduler.DDIM,
+            original_noise_scheduler=noise_scheduler,
+        )
+
+        text_encoder_1 = self._load_transformers_sub_module(
+            CLIPTextModel,
+            weight_dtypes.text_encoder,
+            weight_dtypes.train_dtype,
+            base_model_name,
+            "text_encoder",
+        )
+
+        text_encoder_2 = self._load_transformers_sub_module(
+            CLIPTextModelWithProjection,
+            weight_dtypes.text_encoder_2,
+            weight_dtypes.train_dtype,
+            base_model_name,
+            "text_encoder_2",
+        )
+
         if vae_model_name:
-            vae = self._load_diffusers_sub_module(AutoencoderKL, weight_dtypes.vae, weight_dtypes.fallback_train_dtype, vae_model_name)
+            vae = self._load_diffusers_sub_module(
+                AutoencoderKL,
+                weight_dtypes.vae,
+                weight_dtypes.fallback_train_dtype,
+                vae_model_name,
+            )
         else:
-            vae = self._load_diffusers_sub_module(AutoencoderKL, weight_dtypes.vae, weight_dtypes.fallback_train_dtype, base_model_name, "vae")
-        
-        unet = self._load_diffusers_sub_module(UNet2DConditionModel, weight_dtypes.unet, weight_dtypes.train_dtype, base_model_name, "unet")
-        
-        self.__apply_learnable_tau_processors(unet, weight_dtypes)
+            vae = self._load_diffusers_sub_module(
+                AutoencoderKL,
+                weight_dtypes.vae,
+                weight_dtypes.fallback_train_dtype,
+                base_model_name,
+                "vae",
+            )
+
+        unet = self._load_diffusers_sub_module(
+            UNet2DConditionModel,
+            weight_dtypes.unet,
+            weight_dtypes.train_dtype,
+            base_model_name,
+            "unet",
+            quantization,
+        )
 
         model.model_type = model_type
         model.tokenizer_1 = tokenizer_1
@@ -92,11 +139,24 @@ class StableDiffusionXLModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             vae_model_name: str,
+            quantization: QuantizationConfig,
     ):
-        pipeline = StableDiffusionXLPipeline.from_single_file(base_model_name, original_config=model.sd_config_filename, safety_checker=None)
-        noise_scheduler = create.create_noise_scheduler(NoiseScheduler.DDIM, pipeline.scheduler)
+        pipeline = StableDiffusionXLPipeline.from_single_file(
+            pretrained_model_link_or_path=base_model_name,
+            original_config=model.sd_config_filename,
+            safety_checker=None,
+        )
+
+        noise_scheduler = create.create_noise_scheduler(
+            noise_scheduler=NoiseScheduler.DDIM,
+            original_noise_scheduler=pipeline.scheduler,
+        )
+
         if vae_model_name:
-            pipeline.vae = AutoencoderKL.from_pretrained(vae_model_name, torch_dtype=weight_dtypes.vae.torch_dtype())
+            pipeline.vae = AutoencoderKL.from_pretrained(
+                vae_model_name,
+                torch_dtype=weight_dtypes.vae.torch_dtype(),
+            )
 
         text_encoder_1 = pipeline.text_encoder.to(dtype=weight_dtypes.text_encoder.torch_dtype())
         text_encoder_1.text_model.embeddings.to(dtype=weight_dtypes.text_encoder.torch_dtype(False))
@@ -121,23 +181,49 @@ class StableDiffusionXLModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             vae_model_name: str,
+            quantization: QuantizationConfig,
     ):
         if model_type.has_conditioning_image_input():
-            pipeline = StableDiffusionXLInpaintPipeline.from_single_file(base_model_name, original_config=model.sd_config_filename, safety_checker=None, use_safetensors=True)
+            pipeline = StableDiffusionXLInpaintPipeline.from_single_file(
+                pretrained_model_link_or_path=base_model_name,
+                original_config=model.sd_config_filename,
+                safety_checker=None,
+                use_safetensors=True,
+            )
         else:
-            pipeline = StableDiffusionXLPipeline.from_single_file(base_model_name, original_config=model.sd_config_filename, safety_checker=None, use_safetensors=True)
-        
-        noise_scheduler = create.create_noise_scheduler(NoiseScheduler.DDIM, pipeline.scheduler)
-        if vae_model_name:
-            vae = self._load_diffusers_sub_module(AutoencoderKL, weight_dtypes.vae, weight_dtypes.fallback_train_dtype, vae_model_name)
-        else:
-            vae = self._convert_diffusers_sub_module_to_dtype(pipeline.vae, weight_dtypes.vae, weight_dtypes.fallback_train_dtype)
-        
-        text_encoder_1 = self._convert_transformers_sub_module_to_dtype(pipeline.text_encoder_1, weight_dtypes.text_encoder, weight_dtypes.train_dtype)
-        text_encoder_2 = self._convert_transformers_sub_module_to_dtype(pipeline.text_encoder_2, weight_dtypes.text_encoder_2, weight_dtypes.train_dtype)
-        unet = self._convert_diffusers_sub_module_to_dtype(pipeline.unet, weight_dtypes.unet, weight_dtypes.train_dtype)
+            pipeline = StableDiffusionXLPipeline.from_single_file(
+                pretrained_model_link_or_path=base_model_name,
+                original_config=model.sd_config_filename,
+                safety_checker=None,
+                use_safetensors=True,
+            )
 
-        self.__apply_learnable_tau_processors(unet)
+        noise_scheduler = create.create_noise_scheduler(
+            noise_scheduler=NoiseScheduler.DDIM,
+            original_noise_scheduler=pipeline.scheduler,
+        )
+
+        if vae_model_name:
+            vae = self._load_diffusers_sub_module(
+                AutoencoderKL,
+                weight_dtypes.vae,
+                weight_dtypes.fallback_train_dtype,
+                vae_model_name,
+            )
+        else:
+            vae = self._convert_diffusers_sub_module_to_dtype(
+                pipeline.vae, weight_dtypes.vae, weight_dtypes.fallback_train_dtype
+            )
+
+        text_encoder_1 = self._convert_transformers_sub_module_to_dtype(
+            pipeline.text_encoder, weight_dtypes.text_encoder, weight_dtypes.train_dtype
+        )
+        text_encoder_2 = self._convert_transformers_sub_module_to_dtype(
+            pipeline.text_encoder_2, weight_dtypes.text_encoder_2, weight_dtypes.train_dtype
+        )
+        unet = self._convert_diffusers_sub_module_to_dtype(
+            pipeline.unet, weight_dtypes.unet, weight_dtypes.train_dtype, quantization,
+        )
 
         model.model_type = model_type
         model.tokenizer_1 = pipeline.tokenizer
@@ -154,6 +240,7 @@ class StableDiffusionXLModelLoader(
             model_type: ModelType,
             model_names: ModelNames,
             weight_dtypes: ModelWeightDtypes,
+            quantization: QuantizationConfig,
     ):
         stacktraces = []
 
@@ -161,28 +248,30 @@ class StableDiffusionXLModelLoader(
         model.sd_config_filename = self._get_sd_config_name(model_type, model_names.base_model)
 
         try:
-            self.__load_internal(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model)
+            self.__load_internal(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model, quantization)
             return
         except Exception:
             stacktraces.append(traceback.format_exc())
 
         try:
-            self.__load_diffusers(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model)
+            self.__load_diffusers(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model, quantization)
             return
         except Exception:
             stacktraces.append(traceback.format_exc())
 
         try:
-            self.__load_safetensors(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model)
+            self.__load_safetensors(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model, quantization)
             return
         except Exception:
             stacktraces.append(traceback.format_exc())
 
-        try:
-            self.__load_ckpt(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model)
-            return
-        except Exception:
-            stacktraces.append(traceback.format_exc())
+        if model_names.base_model.endswith(".ckpt"):
+            try:
+                self.__load_ckpt(model, model_type, weight_dtypes, model_names.base_model, model_names.vae_model)
+                print("Warning: Legacy code is used to load ckpt files. Some features may not be supported.")
+                return
+            except Exception:
+                stacktraces.append(traceback.format_exc())
 
         for stacktrace in stacktraces:
             print(stacktrace)

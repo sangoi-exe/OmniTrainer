@@ -1,6 +1,7 @@
 from abc import ABCMeta
 from random import Random
 
+import modules.util.multi_gpu_util as multi
 from modules.model.WuerstchenModel import WuerstchenModel, WuerstchenModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
@@ -8,6 +9,7 @@ from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiff
 from modules.modelSetup.mixin.ModelSetupDiffusionMixin import ModelSetupDiffusionMixin
 from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
+from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_clip_encoder_layers,
@@ -22,6 +24,7 @@ from modules.util.dtype_util import (
 )
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
+from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -35,8 +38,19 @@ class BaseWuerstchenSetup(
     ModelSetupNoiseMixin,
     ModelSetupDiffusionMixin,
     ModelSetupEmbeddingMixin,
+    ModelSetupText2ImageMixin,
     metaclass=ABCMeta,
 ):
+    # This is correct for the latest cascade, but other Wuerstchen models may have
+    # different names. I honestly don't know what makes a good preset here so I'm
+    # just guessing.
+    LAYER_PRESETS = {
+        "attn-only": ["attention"],
+        "full": [],
+        "down-blocks": ["down_blocks"],
+        "up-blocks": ["up_blocks"],
+        "mapper-only": ["mapper"],
+    }
 
     def setup_optimizations(
             self,
@@ -93,12 +107,12 @@ class BaseWuerstchenSetup(
         )
 
         if model.model_type.is_wuerstchen_v2():
-            quantize_layers(model.decoder_text_encoder, self.train_device, model.train_dtype)
-        quantize_layers(model.decoder_decoder, self.train_device, model.train_dtype)
-        quantize_layers(model.decoder_vqgan, self.train_device, model.train_dtype)
-        quantize_layers(model.effnet_encoder, self.train_device, model.effnet_encoder_train_dtype)
-        quantize_layers(model.prior_text_encoder, self.train_device, model.train_dtype)
-        quantize_layers(model.prior_prior, self.train_device, model.prior_train_dtype)
+            quantize_layers(model.decoder_text_encoder, self.train_device, model.train_dtype, config)
+        quantize_layers(model.decoder_decoder, self.train_device, model.train_dtype, config)
+        quantize_layers(model.decoder_vqgan, self.train_device, model.train_dtype, config)
+        quantize_layers(model.effnet_encoder, self.train_device, model.effnet_encoder_train_dtype, config)
+        quantize_layers(model.prior_text_encoder, self.train_device, model.train_dtype, config)
+        quantize_layers(model.prior_prior, self.train_device, model.prior_train_dtype, config)
 
     def _setup_embeddings(
             self,
@@ -110,6 +124,7 @@ class BaseWuerstchenSetup(
             embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
             if embedding_state is None:
                 embedding_state = self._create_new_embedding(
+                    model,
                     embedding_config,
                     model.prior_tokenizer,
                     model.prior_text_encoder,
@@ -195,7 +210,7 @@ class BaseWuerstchenSetup(
             elif model.model_type.is_stable_cascade():
                 scaled_latent_image = latent_image
 
-            batch_seed = 0 if deterministic else train_progress.global_step
+            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -232,7 +247,7 @@ class BaseWuerstchenSetup(
                     'text_encoder_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
                 pooled_text_encoder_output=batch[
                     'pooled_text_encoder_output'] if not config.train_text_encoder_or_embedding() else None,
-                text_encoder_dropout_probability=config.text_encoder.dropout_probability,
+                text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
             )
 
             latent_input = scaled_noisy_latent_image
@@ -345,3 +360,12 @@ class BaseWuerstchenSetup(
             train_device=self.train_device,
             alphas_cumprod_fun=self.__alpha_cumprod,
         ).mean()
+
+    def prepare_text_caching(self, model: WuerstchenModel, config: TrainConfig):
+        model.to(self.temp_device)
+
+        if not config.train_text_encoder_or_embedding():
+            model.text_encoder_to(self.train_device)
+
+        model.eval()
+        torch_gc()

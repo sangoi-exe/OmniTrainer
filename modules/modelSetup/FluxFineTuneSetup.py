@@ -1,7 +1,12 @@
 from modules.model.FluxModel import FluxModel
 from modules.modelSetup.BaseFluxSetup import BaseFluxSetup
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.enum.ModelType import ModelType
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.ModuleFilter import ModuleFilter
+from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.TrainProgress import TrainProgress
 
@@ -30,19 +35,8 @@ class FluxFineTuneSetup(
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
-        if config.text_encoder.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="text_encoder_1",
-                parameters=model.text_encoder_1.parameters(),
-                learning_rate=config.text_encoder.learning_rate,
-            ))
-
-        if config.text_encoder_2.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="text_encoder_2",
-                parameters=model.text_encoder_2.parameters(),
-                learning_rate=config.text_encoder_2.learning_rate,
-            ))
+        self._create_model_part_parameters(parameter_group_collection, "text_encoder_1", model.text_encoder_1, config.text_encoder)
+        self._create_model_part_parameters(parameter_group_collection, "text_encoder_2", model.text_encoder_2, config.text_encoder_2)
 
         if config.train_any_embedding() or config.train_any_output_embedding():
             if config.text_encoder.train_embedding and model.text_encoder_1 is not None:
@@ -57,13 +51,8 @@ class FluxFineTuneSetup(
                     "embeddings_2"
                 )
 
-        if config.prior.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="transformer",
-                parameters=model.transformer.parameters(),
-                learning_rate=config.prior.learning_rate,
-            ))
-
+        self._create_model_part_parameters(parameter_group_collection, "transformer", model.transformer, config.transformer,
+                                           freeze=ModuleFilter.create(config), debug=config.debug_mode)
         return parameter_group_collection
 
     def __setup_requires_grad(
@@ -73,19 +62,9 @@ class FluxFineTuneSetup(
     ):
         self._setup_embeddings_requires_grad(model, config)
 
-        if model.text_encoder_1 is not None:
-            train_text_encoder_1 = config.text_encoder.train and \
-                                   not self.stop_text_encoder_training_elapsed(config, model.train_progress)
-            model.text_encoder_1.requires_grad_(train_text_encoder_1)
-
-        if model.text_encoder_2 is not None:
-            train_text_encoder_2 = config.text_encoder_2.train and \
-                                   not self.stop_text_encoder_2_training_elapsed(config, model.train_progress)
-            model.text_encoder_2.requires_grad_(train_text_encoder_2)
-
-        train_transformer = config.prior.train and \
-                     not self.stop_prior_training_elapsed(config, model.train_progress)
-        model.transformer.requires_grad_(train_transformer)
+        self._setup_model_part_requires_grad("text_encoder_1", model.text_encoder_1, config.text_encoder, model.train_progress)
+        self._setup_model_part_requires_grad("text_encoder_2", model.text_encoder_2, config.text_encoder_2, model.train_progress)
+        self._setup_model_part_requires_grad("transformer", model.transformer, config.transformer, model.train_progress)
 
         model.vae.requires_grad_(False)
 
@@ -105,9 +84,10 @@ class FluxFineTuneSetup(
         self._remove_added_embeddings_from_tokenizer(model.tokenizer_2)
         self._setup_embeddings(model, config)
         self._setup_embedding_wrapper(model, config)
-        self.__setup_requires_grad(model, config)
 
-        init_model_parameters(model, self.create_parameters(model, config), self.train_device)
+        params = self.create_parameters(model, config)
+        self.__setup_requires_grad(model, config)
+        init_model_parameters(model, params, self.train_device)
 
     def setup_train_device(
             self,
@@ -142,7 +122,7 @@ class FluxFineTuneSetup(
 
         model.vae.eval()
 
-        if config.prior.train:
+        if config.transformer.train:
             model.transformer.train()
         else:
             model.transformer.eval()
@@ -160,3 +140,6 @@ class FluxFineTuneSetup(
             if model.embedding_wrapper_2 is not None:
                 model.embedding_wrapper_2.normalize_embeddings()
         self.__setup_requires_grad(model, config)
+
+factory.register(BaseModelSetup, FluxFineTuneSetup, ModelType.FLUX_DEV_1, TrainingMethod.FINE_TUNE)
+factory.register(BaseModelSetup, FluxFineTuneSetup, ModelType.FLUX_FILL_DEV_1, TrainingMethod.FINE_TUNE)

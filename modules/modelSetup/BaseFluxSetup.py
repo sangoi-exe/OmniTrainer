@@ -1,6 +1,7 @@
 from abc import ABCMeta
 from random import Random
 
+import modules.util.multi_gpu_util as multi
 from modules.model.FluxModel import FluxModel, FluxModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
@@ -8,6 +9,7 @@ from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiff
 from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
 from modules.modelSetup.mixin.ModelSetupFlowMatchingMixin import ModelSetupFlowMatchingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
+from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_clip_encoder_layers,
@@ -15,10 +17,10 @@ from modules.util.checkpointing_util import (
     enable_checkpointing_for_t5_encoder_layers,
 )
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.conv_util import apply_circular_padding_to_conv2d
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
+from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -32,8 +34,15 @@ class BaseFluxSetup(
     ModelSetupNoiseMixin,
     ModelSetupFlowMatchingMixin,
     ModelSetupEmbeddingMixin,
+    ModelSetupText2ImageMixin,
     metaclass=ABCMeta
 ):
+    LAYER_PRESETS = {
+        "attn-mlp": ["attn", "ff.net"],
+        "attn-only": ["attn"],
+        "blocks": ["transformer_block"],
+        "full": [],
+    }
 
     def setup_optimizations(
             self,
@@ -49,14 +58,8 @@ class BaseFluxSetup(
                 model.text_encoder_2_offload_conductor = \
                     enable_checkpointing_for_t5_encoder_layers(model.text_encoder_2, config)
 
-        if config.force_circular_padding:
-            apply_circular_padding_to_conv2d(model.vae)
-            apply_circular_padding_to_conv2d(model.transformer)
-            if model.transformer_lora is not None:
-                apply_circular_padding_to_conv2d(model.transformer_lora)
-
         model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
-            config.weight_dtypes().prior,
+            config.weight_dtypes().transformer,
             config.weight_dtypes().text_encoder,
             config.weight_dtypes().text_encoder_2,
             config.weight_dtypes().vae,
@@ -77,10 +80,10 @@ class BaseFluxSetup(
                 config.enable_autocast_cache,
             )
 
-        quantize_layers(model.text_encoder_1, self.train_device, model.train_dtype)
-        quantize_layers(model.text_encoder_2, self.train_device, model.text_encoder_2_train_dtype)
-        quantize_layers(model.vae, self.train_device, model.train_dtype)
-        quantize_layers(model.transformer, self.train_device, model.train_dtype)
+        quantize_layers(model.text_encoder_1, self.train_device, model.train_dtype, config)
+        quantize_layers(model.text_encoder_2, self.train_device, model.text_encoder_2_train_dtype, config)
+        quantize_layers(model.vae, self.train_device, model.train_dtype, config)
+        quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
 
     def _setup_embeddings(
             self,
@@ -93,17 +96,20 @@ class BaseFluxSetup(
             if embedding_state is None:
                 with model.autocast_context:
                     embedding_state_1 = self._create_new_embedding(
+                        model,
                         embedding_config,
                         model.tokenizer_1,
                         model.text_encoder_1,
                     )
 
                     embedding_state_2 = self._create_new_embedding(
+                        model,
                         embedding_config,
                         model.tokenizer_2,
                         model.text_encoder_2,
                         lambda text: model.encode_text(
                             text=text,
+                            text_encoder_2_sequence_length = config.text_encoder_2_sequence_length,
                             train_device=self.temp_device,
                         )[0][0][1:],
                     )
@@ -198,7 +204,7 @@ class BaseFluxSetup(
             deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step
+            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -215,13 +221,14 @@ class BaseFluxSetup(
                 tokens_mask_2=batch.get("tokens_mask_2"),
                 text_encoder_1_layer_skip=config.text_encoder_layer_skip,
                 text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
+                text_encoder_2_sequence_length=config.text_encoder_2_sequence_length,
                 pooled_text_encoder_1_output=batch['text_encoder_1_pooled_state'] \
                     if 'text_encoder_1_pooled_state' in batch and not config.train_text_encoder_or_embedding() else None,
                 text_encoder_2_output=batch['text_encoder_2_hidden_state'] \
                     if 'text_encoder_2_hidden_state' in batch and not config.train_text_encoder_2_or_embedding() else None,
-                text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
-                text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
-                apply_attention_mask=config.prior.attention_mask,
+                text_encoder_1_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
+                text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability if not deterministic else None,
+                apply_attention_mask=config.transformer.attention_mask,
             )
 
             latent_image = batch['latent_image']
@@ -234,14 +241,14 @@ class BaseFluxSetup(
 
             latent_noise = self._create_noise(scaled_latent_image, config, generator)
 
+            shift = model.calculate_timestep_shift(scaled_latent_image.shape[-2], scaled_latent_image.shape[-1])
             timestep = self._get_timestep_discrete(
                 model.noise_scheduler.config['num_train_timesteps'],
                 deterministic,
                 generator,
                 scaled_latent_image.shape[0],
                 config,
-                latent_height=scaled_latent_image.shape[-2],
-                latent_width=scaled_latent_image.shape[-1],
+                shift = shift if config.dynamic_timestep_shifting else config.timestep_shift,
             )
 
             scaled_noisy_latent_image, sigma = self._add_noise_discrete(
@@ -259,7 +266,7 @@ class BaseFluxSetup(
                 latent_input = scaled_noisy_latent_image
 
             if model.transformer.config.guidance_embeds:
-                guidance = torch.tensor([config.prior.guidance_scale], device=self.train_device)
+                guidance = torch.tensor([config.transformer.guidance_scale], device=self.train_device)
                 guidance = guidance.expand(latent_input.shape[0])
             else:
                 guidance = None
@@ -276,22 +283,15 @@ class BaseFluxSetup(
                 model.train_dtype.torch_dtype()
             )
 
-            packed_latent_input = model.pack_latents(
-                latent_input,
-                latent_input.shape[0],
-                latent_input.shape[1],
-                latent_input.shape[2],
-                latent_input.shape[3],
-            )
-
+            packed_latent_input = model.pack_latents(latent_input)
             packed_predicted_flow = model.transformer(
                 hidden_states=packed_latent_input.to(dtype=model.train_dtype.torch_dtype()),
                 timestep=timestep / 1000,
                 guidance=guidance.to(dtype=model.train_dtype.torch_dtype()),
                 pooled_projections=pooled_text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
                 encoder_hidden_states=text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
-                txt_ids=text_ids.to(dtype=model.train_dtype.torch_dtype()),
-                img_ids=image_ids.to(dtype=model.train_dtype.torch_dtype()),
+                txt_ids=text_ids,
+                img_ids=image_ids,
                 joint_attention_kwargs=None,
                 return_dict=True
             ).sample
@@ -312,63 +312,14 @@ class BaseFluxSetup(
 
             if config.debug_mode:
                 with torch.no_grad():
-                    self._save_text(
-                        self._decode_tokens(batch['tokens_1'], model.tokenizer_1),
-                        config.debug_dir + "/training_batches",
-                        "7-prompt",
-                        train_progress.global_step,
-                    )
-
-                    # noise
-                    self._save_image(
-                        self._project_latent_to_image(latent_noise),
-                        config.debug_dir + "/training_batches",
-                        "1-noise",
-                        train_progress.global_step,
-                    )
-
-                    # noisy image
-                    self._save_image(
-                        self._project_latent_to_image(scaled_noisy_latent_image),
-                        config.debug_dir + "/training_batches",
-                        "2-noisy_image",
-                        train_progress.global_step,
-                    )
-
-                    # predicted flow
-                    self._save_image(
-                        self._project_latent_to_image(predicted_flow),
-                        config.debug_dir + "/training_batches",
-                        "3-predicted_flow",
-                        train_progress.global_step,
-                    )
-
-                    # flow
-                    flow = latent_noise - scaled_latent_image
-                    self._save_image(
-                        self._project_latent_to_image(flow),
-                        config.debug_dir + "/training_batches",
-                        "4-flow",
-                        train_progress.global_step,
-                    )
-
                     predicted_scaled_latent_image = scaled_noisy_latent_image - predicted_flow * sigma
-
-                    # predicted image
-                    self._save_image(
-                        self._project_latent_to_image(predicted_scaled_latent_image),
-                        config.debug_dir + "/training_batches",
-                        "5-predicted_image",
-                        train_progress.global_step,
-                    )
-
-                    # image
-                    self._save_image(
-                        self._project_latent_to_image(scaled_latent_image),
-                        config.debug_dir + "/training_batches",
-                        "6-image",
-                        model.train_progress.global_step,
-                    )
+                    self._save_tokens("7-prompt", batch['tokens_1'], model.tokenizer_1, config, train_progress)
+                    self._save_latent("1-noise", latent_noise, config, train_progress)
+                    self._save_latent("2-noisy_image", scaled_noisy_latent_image, config, train_progress)
+                    self._save_latent("3-predicted_flow", predicted_flow, config, train_progress)
+                    self._save_latent("4-flow", flow, config, train_progress)
+                    self._save_latent("5-predicted_image", predicted_scaled_latent_image, config, train_progress)
+                    self._save_latent("6-image", scaled_latent_image, config, train_progress)
 
         return model_output_data
 
@@ -384,5 +335,17 @@ class BaseFluxSetup(
             data=data,
             config=config,
             train_device=self.train_device,
-            sigmas=model.noise_scheduler.sigmas.to(device=self.train_device),
+            sigmas=model.noise_scheduler.sigmas,
         ).mean()
+
+    def prepare_text_caching(self, model: FluxModel, config: TrainConfig):
+        model.to(self.temp_device)
+
+        if not config.train_text_encoder_or_embedding():
+            model.text_encoder_to(self.train_device)
+
+        if not config.train_text_encoder_2_or_embedding():
+            model.text_encoder_2_to(self.train_device)
+
+        model.eval()
+        torch_gc()

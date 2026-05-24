@@ -6,7 +6,7 @@ def masked_losses(
         losses: Tensor,
         mask: Tensor,
         unmasked_weight: float,
-        normalize_masked_area_loss: bool
+        normalize_masked_area_loss: bool,
 ) -> Tensor:
     clamped_mask = torch.clamp(mask, unmasked_weight, 1)
 
@@ -15,29 +15,49 @@ def masked_losses(
     if normalize_masked_area_loss:
         losses = losses / clamped_mask.mean(dim=(1, 2, 3), keepdim=True)
 
-    del clamped_mask
-
     return losses
 
-# sangoi_masked_loss - pra usar quando eu removo os gradientes da parte unmasked
+
+def masked_losses_with_prior(
+        losses: Tensor,
+        prior_losses: Tensor | None,
+        mask: Tensor,
+        unmasked_weight: float,
+        normalize_masked_area_loss: bool,
+        masked_prior_preservation_weight: float,
+) -> Tensor:
+    clamped_mask = torch.clamp(mask, unmasked_weight, 1)
+
+    losses *= clamped_mask
+
+    if normalize_masked_area_loss:
+        losses = losses / clamped_mask.mean(dim=(1, 2, 3), keepdim=True)
+
+    if masked_prior_preservation_weight == 0 or prior_losses is None:
+        return losses
+
+    clamped_mask = (1 - clamped_mask)
+    prior_losses *= clamped_mask * masked_prior_preservation_weight
+
+    if normalize_masked_area_loss:
+        prior_losses = prior_losses / clamped_mask.mean(dim=(1, 2, 3), keepdim=True)
+
+    return losses + prior_losses
+
+
 def sangoi_masked_loss(
-        losses: torch.Tensor,
-        mask:   torch.Tensor,
-        unmasked_weight: float = 0.1,
-        normalize: bool = True,
-) -> torch.Tensor:
-    """
-    Aplica peso 1.0 na região mascarada e `unmasked_weight` no fundo.
-    Se `normalize=True`, reescala para que a perda represente densidade
-    por pixel mascarado (gradiente não dilui).
-    """
-    # peso = 1 dentro da máscara, w fora
+        losses: Tensor,
+        mask: Tensor,
+        unmasked_weight: float,
+        normalize_masked_area_loss: bool,
+) -> Tensor:
+    mask = mask.to(device=losses.device, dtype=losses.dtype)
     weight = torch.where(mask > 0.5, 1.0, unmasked_weight)
-    weighted = losses * weight
+    losses = losses * weight
 
-    if normalize:
-        pix_masked = mask.gt(0.5).float().sum(dim=(1, 2, 3), keepdim=True).clamp_min(1)
-        # reescala para manter magnitude original
-        weighted = weighted * mask.numel() / pix_masked
+    if normalize_masked_area_loss:
+        masked_pixels = mask.gt(0.5).to(dtype=losses.dtype).sum(dim=(1, 2, 3), keepdim=True).clamp_min(1)
+        pixels_per_sample = mask[0].numel()
+        losses = losses * (pixels_per_sample / masked_pixels)
 
-    return weighted
+    return losses

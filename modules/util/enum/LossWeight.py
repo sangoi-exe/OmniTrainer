@@ -9,5 +9,9 @@ class LossWeight(Enum):
     SIGMA = 'SIGMA'
     SANGOI = 'SANGOI'
 
+    def supports_flow_matching(self) -> bool:
+        return self == LossWeight.CONSTANT \
+            or self == LossWeight.SIGMA
+
     def __str__(self):
         return self.value

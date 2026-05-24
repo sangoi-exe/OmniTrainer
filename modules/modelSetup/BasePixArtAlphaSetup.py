@@ -1,6 +1,7 @@
 from abc import ABCMeta
 from random import Random
 
+import modules.util.multi_gpu_util as multi
 from modules.model.PixArtAlphaModel import PixArtAlphaModel, PixArtAlphaModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
@@ -8,16 +9,17 @@ from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiff
 from modules.modelSetup.mixin.ModelSetupDiffusionMixin import ModelSetupDiffusionMixin
 from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
+from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_basic_transformer_blocks,
     enable_checkpointing_for_t5_encoder_layers,
 )
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.conv_util import apply_circular_padding_to_conv2d
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
+from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -32,8 +34,15 @@ class BasePixArtAlphaSetup(
     ModelSetupNoiseMixin,
     ModelSetupDiffusionMixin,
     ModelSetupEmbeddingMixin,
+    ModelSetupText2ImageMixin,
     metaclass=ABCMeta,
 ):
+    LAYER_PRESETS = {
+        "attn-mlp": ["attn1", "attn2", "ff.net"],
+        "attn-only": ["attn1", "attn2"],
+        "blocks": ["transformer_block"],
+        "full": [],
+    }
 
     def __init__(self, train_device: torch.device, temp_device: torch.device, debug_mode: bool):
         super().__init__(train_device, temp_device, debug_mode)
@@ -50,14 +59,8 @@ class BasePixArtAlphaSetup(
             model.text_encoder_offload_conductor = \
                 enable_checkpointing_for_t5_encoder_layers(model.text_encoder, config)
 
-        if config.force_circular_padding:
-            apply_circular_padding_to_conv2d(model.vae)
-            apply_circular_padding_to_conv2d(model.transformer)
-            if model.transformer_lora is not None:
-                apply_circular_padding_to_conv2d(model.transformer_lora)
-
         model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
-            config.weight_dtypes().prior,
+            config.weight_dtypes().transformer,
             config.weight_dtypes().text_encoder,
             config.weight_dtypes().vae,
             config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
@@ -76,9 +79,9 @@ class BasePixArtAlphaSetup(
             config.enable_autocast_cache,
         )
 
-        quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype)
-        quantize_layers(model.vae, self.train_device, model.train_dtype)
-        quantize_layers(model.transformer, self.train_device, model.train_dtype)
+        quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype, config)
+        quantize_layers(model.vae, self.train_device, model.train_dtype, config)
+        quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
 
     def _setup_embeddings(
             self,
@@ -91,6 +94,7 @@ class BasePixArtAlphaSetup(
             if embedding_state is None:
                 with model.autocast_context:
                     embedding_state = self._create_new_embedding(
+                        model,
                         embedding_config,
                         model.tokenizer,
                         model.text_encoder,
@@ -156,7 +160,7 @@ class BasePixArtAlphaSetup(
             deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step
+            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -172,7 +176,7 @@ class BasePixArtAlphaSetup(
                 text_encoder_output=batch[
                     'text_encoder_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
                 attention_mask=batch['tokens_mask'],
-                text_encoder_dropout_probability=config.text_encoder.dropout_probability,
+                text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
             )
 
             latent_image = batch['latent_image']
@@ -333,5 +337,14 @@ class BasePixArtAlphaSetup(
             data=data,
             config=config,
             train_device=self.train_device,
-            betas=model.noise_scheduler.betas.to(device=self.train_device),
+            betas=model.noise_scheduler.betas,
         ).mean()
+
+    def prepare_text_caching(self, model: PixArtAlphaModel, config: TrainConfig):
+        model.to(self.temp_device)
+
+        if not config.train_text_encoder_or_embedding():
+            model.text_encoder_to(self.train_device)
+
+        model.eval()
+        torch_gc()

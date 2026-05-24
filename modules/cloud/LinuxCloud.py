@@ -39,17 +39,28 @@ class LinuxCloud(BaseCloud):
 
         config=self.config.cloud
         secrets=self.config.secrets.cloud
+        connect_kwargs=secrets.connect_kwargs()
 
         if secrets.host == '' or secrets.port == '':
             raise ValueError('Host and port required for SSH connection')
 
         try:
-            self.connection=fabric.Connection(host=secrets.host,port=secrets.port,user=secrets.user)
+            self.connection=fabric.Connection(host=secrets.host,
+                                             port=secrets.port,
+                                             user=secrets.user,
+                                             connect_kwargs=connect_kwargs)
             self.connection.open()
+            self.connection.transport.set_keepalive(30)
 
-            self.callback_connection=fabric.Connection(host=secrets.host,port=secrets.port,user=secrets.user)
+            self.callback_connection=fabric.Connection(host=secrets.host,
+                                                       port=secrets.port,
+                                                       user=secrets.user,
+                                                       connect_kwargs=connect_kwargs)
 
-            self.command_connection=fabric.Connection(host=secrets.host,port=secrets.port,user=secrets.user)
+            self.command_connection=fabric.Connection(host=secrets.host,
+                                                      port=secrets.port,
+                                                      user=secrets.user,
+                                                      connect_kwargs=connect_kwargs)
             #the command connection isn't used for long periods of time; prevent remote from closing it:
             self.command_connection.open()
             self.command_connection.transport.set_keepalive(30)
@@ -81,20 +92,21 @@ class LinuxCloud(BaseCloud):
                                   && cd {shlex.quote(parent)} \
                                   && {config.install_cmd})',in_stream=False)
 
-        #OT requires cuda in PATH, but runpod only sets that up in bashprofile, which is not used by fabric
-        #TODO test with other clouds
         result=self.connection.run(f"test -d {shlex.quote(config.onetrainer_dir)}/venv",warn=True,in_stream=False)
+
+        #many docker images, including the default ones on RunPod and vast.ai, only set up $PATH correctly
+        #for interactive shells. On RunPod, cuda is missing from $PATH; on vast.ai, python is missing.
+        #We cannot pretend to be interactive either, because then vast.ai starts a tmux screen.
+        #Add these paths manually:
+        cmd_env = f"export PATH=$PATH:/usr/local/cuda/bin:/venv/main/bin \
+                   && export OT_LAZY_UPDATES=true \
+                   && cd {shlex.quote(config.onetrainer_dir)}"
+
         if result.exited == 0:
             if update:
-                self.connection.run(f'cd {shlex.quote(config.onetrainer_dir)} \
-                                      && export PATH=$PATH:/usr/local/cuda/bin \
-                                      && export OT_LAZY_UPDATES=true \
-                                      && ./update.sh',in_stream=False)
+                self.connection.run(cmd_env + "&& ./update.sh", in_stream=False)
         else:
-            self.connection.run(f'cd {shlex.quote(config.onetrainer_dir)} \
-                                  && export PATH=$PATH:/usr/local/cuda/bin \
-                                  && export OT_LAZY_UPDATES=true \
-                                  && ./install.sh',in_stream=False)
+            self.connection.run(cmd_env + "&& ./install.sh", in_stream=False)
 
     def _make_tensorboard_tunnel(self):
         self.tensorboard_tunnel_stop=threading.Event()
@@ -137,7 +149,8 @@ class LinuxCloud(BaseCloud):
             self.__trail_detached_trainer()
             return
 
-        cmd="export PYTHONUNBUFFERED=1 \
+        cmd="export PATH=$PATH:/usr/local/cuda/bin:/venv/main/bin \
+             && export PYTHONUNBUFFERED=1 \
              && export OT_LAZY_UPDATES=true"
 
         if self.config.secrets.huggingface_token != "":

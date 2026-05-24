@@ -25,10 +25,21 @@ class ModelType(Enum):
 
     FLUX_DEV_1 = 'FLUX_DEV_1'
     FLUX_FILL_DEV_1 = 'FLUX_FILL_DEV_1'
+    FLUX_2 = 'FLUX_2'
 
     SANA = 'SANA'
 
     HUNYUAN_VIDEO = 'HUNYUAN_VIDEO'
+
+    HI_DREAM_FULL = 'HI_DREAM_FULL'
+
+    CHROMA_1 = 'CHROMA_1'
+
+    QWEN = 'QWEN'
+
+    Z_IMAGE = 'Z_IMAGE'
+
+    ERNIE = 'ERNIE'
 
     def __str__(self):
         return self.value
@@ -70,13 +81,36 @@ class ModelType(Enum):
 
     def is_flux(self):
         return self == ModelType.FLUX_DEV_1 \
+            or self == ModelType.FLUX_FILL_DEV_1 \
+            or self == ModelType.FLUX_2
+
+    def is_flux_1(self):
+        return self == ModelType.FLUX_DEV_1 \
             or self == ModelType.FLUX_FILL_DEV_1
+
+    def is_flux_2(self):
+        return self == ModelType.FLUX_2
+
+    def is_chroma(self):
+        return self == ModelType.CHROMA_1
+
+    def is_qwen(self):
+        return self == ModelType.QWEN
 
     def is_sana(self):
         return self == ModelType.SANA
 
     def is_hunyuan_video(self):
         return self == ModelType.HUNYUAN_VIDEO
+
+    def is_hi_dream(self):
+        return self == ModelType.HI_DREAM_FULL
+
+    def is_z_image(self):
+        return self == ModelType.Z_IMAGE
+
+    def is_ernie(self):
+        return self == ModelType.ERNIE
 
     def has_mask_input(self) -> bool:
         return self == ModelType.STABLE_DIFFUSION_15_INPAINTING \
@@ -96,8 +130,9 @@ class ModelType(Enum):
     def has_multiple_text_encoders(self):
         return self.is_stable_diffusion_3() \
             or self.is_stable_diffusion_xl() \
-            or self.is_flux() \
-            or self.is_hunyuan_video()
+            or self.is_flux_1() \
+            or self.is_hunyuan_video() \
+            or self.is_hi_dream() \
 
     def is_sd_v1(self):
         return self == ModelType.STABLE_DIFFUSION_15 \
@@ -117,10 +152,25 @@ class ModelType(Enum):
     def is_stable_cascade(self):
         return self == ModelType.STABLE_CASCADE_1
 
+    def is_flow_matching(self) -> bool:
+        return self.is_stable_diffusion_3() \
+            or self.is_flux() \
+            or self.is_chroma() \
+            or self.is_qwen() \
+            or self.is_sana() \
+            or self.is_hunyuan_video() \
+            or self.is_hi_dream() \
+            or self.is_z_image() \
+            or self.is_ernie()
+
+    def is_video_model(self) -> bool:
+        return self.is_hunyuan_video() #incase we add more video models in the future
+
 
 class PeftType(Enum):
     LORA = 'LORA'
     LOHA = 'LOHA'
+    OFT_2 = 'OFT_2'
 
     def __str__(self):
         return self.value
