@@ -1,5 +1,17 @@
 # Sangoi Changelog
 
+## 2026-05-24 - SotA Sangoi loss and masked-gradient port
+
+- Ported the requested SotA training-impact items from `origin/SotA04022025+Mods` into `master-update`: dynamic Sangoi loss behavior and masked-training prediction-gradient suppression.
+- Added `LossMode.ORIGINAL`/`LossMode.SANGOI` config ownership, defaulting to `ORIGINAL` so current loss behavior remains the default.
+- Added `LossTracker` and scalar-scheduled `DynamicLossControl` for dynamic MSE/MAE/log-cosh weighting without broad config/progress object reads.
+- Replaced `LossWeight.SANGOI` with the SotA SNR/MAPE/progress weighting path for diffusion losses, requiring `model.train_progress` and preserving TensorBoard as optional.
+- Preserved current additive Huber, Sangoi Huber, Sangoi Charbonnier, VB, TrainGPS, and priority-sampling behavior while integrating the new base-loss mode.
+- Added a graph-local masked-training gradient hook that zeros prediction gradients outside the latent mask and fails loud for LoRA masked prior preservation when that outside-mask training would be contradicted.
+- Added the loss-mode selector to the training UI and plumbed model progress into PixArtAlpha, Sana, and Wuerstchen diffusion loss callers.
+- Validation performed: `git diff --check`, targeted `compileall`, AST/source contract checks, diffusion caller matrix, hook-order checks, and scoped forbidden-residue scans passed. Runtime tensor/import smokes were blocked because the current shell Python cannot import `torch`.
+- Final `Senior Code Reviewer` gate completed with `READY`.
+
 ## 2026-05-24 - Upstream master merge resolution
 
 - Resolved the `master-update` merge against the upstream OneTrainer tree while preserving current Sangoi training contracts.

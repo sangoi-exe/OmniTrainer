@@ -259,6 +259,7 @@ class BaseSanaSetup(
             data=data,
             config=config,
             train_device=self.train_device,
+            model=model,
             betas=model.noise_scheduler.betas,
         ).mean()
 

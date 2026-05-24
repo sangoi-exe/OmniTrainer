@@ -19,6 +19,7 @@ from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.LearningRateScaler import LearningRateScaler
 from modules.util.enum.LearningRateScheduler import LearningRateScheduler
 from modules.util.enum.LossScaler import LossScaler
+from modules.util.enum.LossMode import LossMode
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
@@ -393,6 +394,11 @@ class TrainConfig(BaseConfig):
     bucket_ratio: int
     sangoi_huber_strength: float
     sangoi_charbonnier_strength: float
+    loss_tracker_window: int
+    loss_tracker_use_mad: bool
+    dls_use_ema: bool
+    dls_ema_decay: float
+    dls_outlier_threshold: float
 
     # Sangoi priority sampling
     priority_temperature: float
@@ -440,6 +446,7 @@ class TrainConfig(BaseConfig):
     only_cache: bool
     resolution: str
     frames: str
+    loss_mode_fn: LossMode
     mse_strength: float
     mae_strength: float
     log_cosh_strength: float
@@ -1004,6 +1011,11 @@ class TrainConfig(BaseConfig):
         data.append(("bucket_ratio", 64, int, False))
         data.append(("sangoi_huber_strength", 0.0, float, False))
         data.append(("sangoi_charbonnier_strength", 0.0, float, False))
+        data.append(("loss_tracker_window", 100, int, False))
+        data.append(("loss_tracker_use_mad", False, bool, False))
+        data.append(("dls_use_ema", False, bool, False))
+        data.append(("dls_ema_decay", 0.9, float, False))
+        data.append(("dls_outlier_threshold", 3.0, float, False))
 
         # Sangoi priority sampling
         data.append(("priority_temperature", 1.0, float, False))
@@ -1049,6 +1061,7 @@ class TrainConfig(BaseConfig):
         data.append(("only_cache", False, bool, False))
         data.append(("resolution", "512", str, False))
         data.append(("frames", "25", str, False))
+        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
         data.append(("log_cosh_strength", 0.0, float, False))

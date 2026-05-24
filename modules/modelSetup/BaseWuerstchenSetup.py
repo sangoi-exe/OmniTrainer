@@ -358,6 +358,7 @@ class BaseWuerstchenSetup(
             data=data,
             config=config,
             train_device=self.train_device,
+            model=model,
             alphas_cumprod_fun=self.__alpha_cumprod,
         ).mean()
 

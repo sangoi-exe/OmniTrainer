@@ -91,6 +91,51 @@ class GenericTrainer(BaseTrainer):
         self.is_paused = False
         self.pause_requested_at_epoch_end = False
 
+    @staticmethod
+    def stop_grad_outside_mask(tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        if not tensor.requires_grad:
+            return
+
+        def mask_gradient(grad: torch.Tensor) -> torch.Tensor:
+            return grad * mask
+
+        tensor.register_hook(mask_gradient)
+
+    @staticmethod
+    def prepare_mask_for_prediction(
+            mask: torch.Tensor,
+            reference: torch.Tensor,
+            threshold: float = 0.5,
+    ) -> torch.Tensor:
+        if mask.ndim == reference.ndim - 1:
+            mask = mask.unsqueeze(1)
+
+        if mask.ndim != reference.ndim:
+            raise ValueError(
+                f"Masked training latent mask rank {mask.ndim} does not match prediction rank {reference.ndim}"
+            )
+
+        if mask.shape[0] != reference.shape[0]:
+            raise ValueError(
+                f"Masked training batch mismatch: mask batch {mask.shape[0]} vs prediction batch {reference.shape[0]}"
+            )
+
+        if mask.shape[2:] != reference.shape[2:]:
+            raise ValueError(
+                f"Masked training spatial mismatch: mask shape {mask.shape[2:]} vs prediction shape {reference.shape[2:]}"
+            )
+
+        if mask.shape[1] != 1:
+            raise ValueError(
+                f"Masked training channel mismatch: expected singleton mask channel, got {mask.shape[1]}"
+            )
+
+        prepared_mask = (mask > threshold).to(device=reference.device, dtype=reference.dtype)
+        if reference.shape[1] != 1:
+            prepared_mask = prepared_mask.expand(reference.shape[0], reference.shape[1], *reference.shape[2:])
+
+        return prepared_mask
+
     def start(self):
         if multi.is_master():
             self.__save_config_to_workspace()
@@ -859,6 +904,15 @@ class GenericTrainer(BaseTrainer):
 
                     prior_pred_indices = [i for i in range(self.config.batch_size)
                                           if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
+                    if (
+                            self.config.masked_training
+                            and self.config.masked_prior_preservation_weight > 0
+                            and self.config.training_method == TrainingMethod.LORA
+                    ):
+                        raise ValueError(
+                            "SotA masked-gradient hook conflicts with masked prior preservation outside-mask gradients"
+                        )
+
                     if len(prior_pred_indices) > 0 \
                             or (self.config.masked_training
                                 and self.config.masked_prior_preservation_weight > 0
@@ -873,6 +927,11 @@ class GenericTrainer(BaseTrainer):
                         model_output_data['prior_target'] = prior_model_prediction
                     else:
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+                    predicted = model_output_data["predicted"]
+                    if self.config.masked_training and predicted.requires_grad:
+                        mask = self.prepare_mask_for_prediction(batch["latent_mask"], predicted)
+                        self.stop_grad_outside_mask(predicted, mask)
 
                     loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
