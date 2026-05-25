@@ -1,15 +1,18 @@
 # Docker Image
 
-A Dockerfile based on the `nvidia/cuda:11.8.0-devel-ubuntu22.04` is provided.
+A UI Dockerfile based on `nvidia/cuda:11.8.0-devel-ubuntu22.04` is provided at `resources/docker/NVIDIA-UI.Dockerfile`.
 
 This image requires `nvidia-driver-525` and `nvidia-docker2` installed on the host.
+
+> [!WARNING]
+> The UI Dockerfile is an old NVIDIA example. It now uses the POSIX uv-managed bootstrap, but the base CUDA image is still dated and should be treated as an example, not validated training infrastructure.
 
 ## Building Image
 
 Build using:
 
 ```
-docker build -t myuser/onetrainer:latest -f Dockerfile .
+docker build -t myuser/onetrainer:latest -f resources/docker/NVIDIA-UI.Dockerfile .
 ```
 
 ## Running Image

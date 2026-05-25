@@ -21,11 +21,11 @@ from transformers import PreTrainedTokenizer
 
 class BaseModelEmbedding:
     def __init__(
-            self,
-            uuid: str,
-            placeholder: str,
-            vector: torch.Tensor | None,
-            is_output_embedding: bool,
+        self,
+        uuid: str,
+        placeholder: str,
+        vector: torch.Tensor | None,
+        is_output_embedding: bool,
     ):
         self.uuid = uuid
         self.token_count = vector.shape[0] if vector is not None else 0
@@ -47,7 +47,7 @@ class BaseModelEmbedding:
             self.original_output_vector_std = None
 
         self.text_tokens = [f"<{uuid4()}>" for _ in range(self.token_count)]
-        self.joint_text_tokens = ''.join(self.text_tokens)
+        self.joint_text_tokens = "".join(self.text_tokens)
         self.joint_tokens_cache = None  # a cache for the joint_text_tokens when sent through the tokenizer
 
     def requires_grad(self) -> bool:
@@ -80,8 +80,8 @@ class BaseModel(metaclass=ABCMeta):
     tensorboard: SummaryWriter | None
 
     def __init__(
-            self,
-            model_type: ModelType,
+        self,
+        model_type: ModelType,
     ):
         self.model_type = model_type
         self.parameters = None
@@ -111,8 +111,8 @@ class BaseModel(metaclass=ABCMeta):
 
     @staticmethod
     def _add_embeddings_to_prompt(
-            additional_embeddings: list[BaseModelEmbedding],
-            prompt: str,
+        additional_embeddings: list[BaseModelEmbedding],
+        prompt: str,
     ) -> str:
         for embedding in additional_embeddings:
             prompt = prompt.replace(embedding.placeholder, embedding.joint_text_tokens)
@@ -121,10 +121,10 @@ class BaseModel(metaclass=ABCMeta):
 
     @staticmethod
     def _apply_output_embeddings(
-            embeddings: list[BaseModelEmbedding],
-            tokenizer: PreTrainedTokenizer,
-            tokens: torch.Tensor,
-            text_encoder_output: torch.Tensor,
+        embeddings: list[BaseModelEmbedding],
+        tokenizer: PreTrainedTokenizer,
+        tokens: torch.Tensor,
+        text_encoder_output: torch.Tensor,
     ) -> torch.Tensor:
         for embedding in embeddings:
             if embedding.is_output_embedding:

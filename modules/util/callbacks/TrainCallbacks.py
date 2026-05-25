@@ -7,18 +7,17 @@ from modules.util.TrainProgress import TrainProgress
 
 class TrainCallbacks:
     def __init__(
-            self,
-            on_update_train_progress: Callable[[TrainProgress, int, int], None] = lambda _, __, ___: None,
-            on_update_status: Callable[[str], None] = lambda _: None,
-            on_sample_default: Callable[[ModelSamplerOutput], None] = lambda _: None,
-            on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
-            on_sample_custom: Callable[[ModelSamplerOutput], None] = lambda _: None,
-            on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
-            
-            on_pause_request_accepted: Callable[[], None] = lambda: None,
-            on_pause_initiated: Callable[[], None] = lambda: None,
-            on_resume_started: Callable[[], None] = lambda: None,
-            on_resume_completed: Callable[[], None] = lambda: None						
+        self,
+        on_update_train_progress: Callable[[TrainProgress, int, int], None] = lambda _, __, ___: None,
+        on_update_status: Callable[[str], None] = lambda _: None,
+        on_sample_default: Callable[[ModelSamplerOutput], None] = lambda _: None,
+        on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
+        on_sample_custom: Callable[[ModelSamplerOutput], None] = lambda _: None,
+        on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
+        on_pause_request_accepted: Callable[[], None] = lambda: None,
+        on_pause_initiated: Callable[[], None] = lambda: None,
+        on_resume_started: Callable[[], None] = lambda: None,
+        on_resume_completed: Callable[[], None] = lambda: None,
     ):
         self.__on_update_train_progress = on_update_train_progress
         self.__on_update_status = on_update_status
@@ -37,7 +36,7 @@ class TrainCallbacks:
     def on_pause_request_accepted(self):
         """Chamado quando o trainer aceita a requisição de pausa."""
         if self.__on_pause_request_accepted:
-            with contextlib.suppress(Exception): # Segurança contra erros no callback da UI
+            with contextlib.suppress(Exception):  # Segurança contra erros no callback da UI
                 self.__on_pause_request_accepted()
 
     def on_pause_initiated(self):
@@ -57,10 +56,10 @@ class TrainCallbacks:
         if self.__on_resume_completed:
             with contextlib.suppress(Exception):
                 self.__on_resume_completed()
-                    
+
     def set_on_update_train_progress(
-            self,
-            on_update_train_progress: Callable[[TrainProgress, int, int], None] = lambda _, __, ___: None,
+        self,
+        on_update_train_progress: Callable[[TrainProgress, int, int], None] = lambda _, __, ___: None,
     ):
         self.__on_update_train_progress = on_update_train_progress
 
@@ -71,8 +70,8 @@ class TrainCallbacks:
 
     # on_update_status
     def set_on_update_status(
-            self,
-            on_update_status: Callable[[str], None] = lambda _: None,
+        self,
+        on_update_status: Callable[[str], None] = lambda _: None,
     ):
         self.__on_update_status = on_update_status
 
@@ -83,8 +82,8 @@ class TrainCallbacks:
 
     # on_sample_default
     def set_on_sample_default(
-            self,
-            on_sample_default: Callable[[ModelSamplerOutput], None] = lambda _: None,
+        self,
+        on_sample_default: Callable[[ModelSamplerOutput], None] = lambda _: None,
     ):
         self.__on_sample_default = on_sample_default
 
@@ -95,8 +94,8 @@ class TrainCallbacks:
 
     # on_update_sample_default_progress
     def set_on_update_sample_default_progress(
-            self,
-            on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
+        self,
+        on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
     ):
         self.__on_update_sample_default_progress = on_update_sample_default_progress
 
@@ -107,8 +106,8 @@ class TrainCallbacks:
 
     # on_sample_custom
     def set_on_sample_custom(
-            self,
-            on_sample_custom: Callable[[ModelSamplerOutput], None] = lambda _: None,
+        self,
+        on_sample_custom: Callable[[ModelSamplerOutput], None] = lambda _: None,
     ):
         self.__on_sample_custom = on_sample_custom
 
@@ -119,8 +118,8 @@ class TrainCallbacks:
 
     # on_update_sample_custom_progress
     def set_on_update_sample_custom_progress(
-            self,
-            on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
+        self,
+        on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
     ):
         self.__on_update_sample_custom_progress = on_update_sample_custom_progress
 

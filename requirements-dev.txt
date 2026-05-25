@@ -1,4 +1,4 @@
-# Git commit hook handler.
-# NOTE: It's a user-wide tool installed outside venv. Don't pin exact versions.
+# Git commit hook handler. Run through repo-local uv tools:
+# ./.uv/bin/uv tool run --python 3.13 --from pre-commit pre-commit ...
 # SEE: https://pre-commit.com/
 pre-commit>=4.0.1

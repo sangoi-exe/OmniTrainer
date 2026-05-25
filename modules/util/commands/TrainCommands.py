@@ -5,8 +5,8 @@ from modules.util.config.SampleConfig import SampleConfig
 
 class TrainCommands:
     def __init__(
-            self,
-            on_command=None# Callable[[TrainCommands], None] = lambda _: None
+        self,
+        on_command=None,  # Callable[[TrainCommands], None] = lambda _: None
     ):
         self.__command_lock = threading.Lock()
         self.reset()
@@ -14,7 +14,7 @@ class TrainCommands:
         self.__on_command = on_command
 
     def reset(self):
-        #don't reset stop
+        # don't reset stop
         with self.__command_lock:
             self.__sample_custom_commands = []
             self.__sample_default_command = False
@@ -24,14 +24,14 @@ class TrainCommands:
             self.__resume_requested = False
 
     def set_on_command(
-            self,
-            on_command#: Callable[[TrainCommands], None] = lambda _: None
+        self,
+        on_command,  #: Callable[[TrainCommands], None] = lambda _: None
     ):
         self.__on_command = on_command
 
     def get_and_reset_on_command(self):
         on_command = self.__on_command
-        self.__on_command=None
+        self.__on_command = None
         return on_command
 
     def stop(self):

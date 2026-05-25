@@ -8,23 +8,16 @@ from torch.nn import Parameter
 
 class NamedParameterGroup:
     def __init__(
-            self,
-            unique_name: str,
-            parameters: Iterable[Parameter],
-            learning_rate: float,
-            display_name: str | None = None,
+        self,
+        unique_name: str,
+        parameters: Iterable[Parameter],
+        learning_rate: float,
+        display_name: str | None = None,
     ):
         self.unique_name = unique_name
         self.display_name = display_name if display_name is not None else unique_name
         self.parameters = list(parameters)
         self.learning_rate = learning_rate
-        self.is_enabled: bool = True 
-        
-    def set_requires_grad(self, flag: bool):
-      """Liga/desliga o gradiente de todas as params do grupo."""
-      self.is_enabled = flag
-      for p in self.parameters:
-          p.requires_grad = flag
 
 
 class NamedParameterGroupCollection:
@@ -45,18 +38,22 @@ class NamedParameterGroupCollection:
         for group in self.__groups:
             # Determine the learning rate
             lr = group.learning_rate if group.learning_rate is not None else config.learning_rate
-            lr = lr * ((config.learning_rate_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)) ** 0.5)
+            lr = lr * (
+                (config.learning_rate_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)) ** 0.5
+            )
 
             # Create a parameter group for the text encoder
-            parameters.append({
-                'params': list(group.parameters),
-                'lr': lr,
-                'initial_lr': lr,
-                'name': group.unique_name,
-            })
+            parameters.append(
+                {
+                    "params": list(group.parameters),
+                    "lr": lr,
+                    "initial_lr": lr,
+                    "name": group.unique_name,
+                }
+            )
 
         return parameters
-    
+
     def by_unique_name(self, name: str) -> NamedParameterGroup | None:
         for g in self.__groups:
             if g.unique_name == name:

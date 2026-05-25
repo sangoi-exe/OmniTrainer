@@ -1,13 +1,17 @@
 [project]
-requires-python = ">=3.10"
+name = "onetrainer-sangoi"
+version = "0.0.0"
+requires-python = ">=3.10,<3.14"
+
+[tool.uv]
+python-preference = "managed"
+python-downloads = "manual"
 
 [tool.ruff]
 extend-exclude = [
     # Exclude all third-party dependencies and environments.
-    # NOTE: Conda installs mgds+diffusers into "src/" in the project directory.
     ".venv*",
     "venv*",
-    "conda_env*",
     "src",
     # Do not lint the universal Python 2/3 version checker.
     "scripts/util/version_check.py",

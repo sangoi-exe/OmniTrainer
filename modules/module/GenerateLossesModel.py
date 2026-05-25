@@ -5,15 +5,13 @@ from modules.dataLoader import BaseDataLoader
 from modules.model.BaseModel import BaseModel
 from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.sangoi.logFun import ProgressContext
 from modules.util import create
 from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
 import torch
-
-from tqdm import tqdm
-from modules.sangoi.logFun import logFun, ProgressContext
 
 
 class GenerateLossesModel:
@@ -84,40 +82,33 @@ class GenerateLossesModel:
             training_method=self.config.training_method,
             config=self.config,
             train_progress=self.model.train_progress,
-            is_validation=False
+            is_validation=False,
         )
 
         data_set = self.data_loader.get_data_set()
         data_set.start_next_epoch()
         approximate_num_steps = data_set.approximate_length()
 
-        step_tqdm = tqdm(self.data_loader.get_data_loader(), total=approximate_num_steps, desc="Calculating loss")
-
         self.model_setup.setup_train_device(self.model, self.config)
 
         filename_loss_list: list[tuple[str, float]] = []
         # Don't really need a backward pass here, so we can make the calculation MUCH faster.
-        # Contar total de batches primeiro
-        total_batches = len(self.data_loader.get_data_loader())
-        
-        with torch.inference_mode():
-            with ProgressContext("Calculando losses", total_batches) as progress:
-                for batch in self.data_loader.get_data_loader():
-                    model_output_data = self.model_setup.predict(
-                        self.model,
-                        batch,
-                        self.config,
-                        self.model.train_progress,
-                        deterministic=True,
-                    )
-                    loss = self.model_setup.calculate_loss(
-                        self.model,
-                        batch,
-                        model_output_data,
-                        self.config,
-                        self.progress,
-                    )
-                    filename_loss_list.append((batch["image_path"][0], float(loss)))
+        with torch.inference_mode(), ProgressContext("Calculando losses", approximate_num_steps) as progress:
+            for batch in self.data_loader.get_data_loader():
+                model_output_data = self.model_setup.predict(
+                    self.model,
+                    batch,
+                    self.config,
+                    self.model.train_progress,
+                    deterministic=True,
+                )
+                loss = self.model_setup.calculate_loss(
+                    self.model,
+                    batch,
+                    model_output_data,
+                    self.config,
+                )
+                filename_loss_list.append((batch["image_path"][0], float(loss)))
                 progress.update(1)
 
         # Sort such that highest loss comes first

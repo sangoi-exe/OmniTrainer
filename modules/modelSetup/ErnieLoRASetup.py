@@ -17,10 +17,10 @@ class ErnieLoRASetup(
     BaseErnieSetup,
 ):
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            debug_mode: bool,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        debug_mode: bool,
     ):
         super().__init__(
             train_device=train_device,
@@ -29,28 +29,32 @@ class ErnieLoRASetup(
         )
 
     def create_parameters(
-            self,
-            model: ErnieModel,
-            config: TrainConfig,
+        self,
+        model: ErnieModel,
+        config: TrainConfig,
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
-        self._create_model_part_parameters(parameter_group_collection, "transformer", model.transformer_lora, config.transformer)
+        self._create_model_part_parameters(
+            parameter_group_collection, "transformer", model.transformer_lora, config.transformer
+        )
         return parameter_group_collection
 
     def __setup_requires_grad(
-            self,
-            model: ErnieModel,
-            config: TrainConfig,
+        self,
+        model: ErnieModel,
+        config: TrainConfig,
     ):
         model.text_encoder.requires_grad_(False)
         model.transformer.requires_grad_(False)
         model.vae.requires_grad_(False)
-        self._setup_model_part_requires_grad("transformer", model.transformer_lora, config.transformer, model.train_progress)
+        self._setup_model_part_requires_grad(
+            "transformer", model.transformer_lora, config.transformer, model.train_progress
+        )
 
     def setup_model(
-            self,
-            model: ErnieModel,
-            config: TrainConfig,
+        self,
+        model: ErnieModel,
+        config: TrainConfig,
     ):
         model.transformer_lora = LoRAModuleWrapper(
             model.transformer, "transformer", config, config.layer_filter.split(",")
@@ -67,11 +71,12 @@ class ErnieLoRASetup(
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
+        self._export_lora_key_manifest(model, config)
 
     def setup_train_device(
-            self,
-            model: ErnieModel,
-            config: TrainConfig,
+        self,
+        model: ErnieModel,
+        config: TrainConfig,
     ):
         vae_on_train_device = not config.latent_caching
         text_encoder_on_train_device = not config.latent_caching
@@ -89,10 +94,10 @@ class ErnieLoRASetup(
             model.transformer.eval()
 
     def after_optimizer_step(
-            self,
-            model: ErnieModel,
-            config: TrainConfig,
-            train_progress: TrainProgress,
+        self,
+        model: ErnieModel,
+        config: TrainConfig,
+        train_progress: TrainProgress,
     ):
         self.__setup_requires_grad(model, config)
 

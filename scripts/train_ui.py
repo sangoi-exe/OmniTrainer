@@ -1,11 +1,12 @@
 from util.import_util import script_imports
 
-script_imports(allow_zluda=False)
+script_imports()
 
 # remover import estático da UI para lazy-load ---
 # from modules.ui.TrainUI import TrainUI
 
 global_ui = None
+
 
 def main():
     # import da UI só quando for realmente instanciar a janela
@@ -15,5 +16,6 @@ def main():
     global_ui = TrainUI()
     global_ui.mainloop()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

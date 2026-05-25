@@ -2,8 +2,9 @@
 
 set -e
 
-# Change our working dir to the root of the project.
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+# Load the current function library before mutating the checkout. This preserves
+# fail-loud handling for removed bootstrap environment variables.
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.include.sh"
 
 # Pull the latest changes via Git.
 echo "[OneTrainer] Updating OneTrainer to latest version from Git repository..."

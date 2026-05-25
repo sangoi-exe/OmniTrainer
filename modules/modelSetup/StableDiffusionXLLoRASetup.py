@@ -3,7 +3,7 @@ from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.sangoi.logFun import logFun
-from modules.sangoi.TrainGPS import TrainGPS
+from modules.sangoi.TrainGPS import TrainGPS, validate_train_gps_support
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
@@ -20,10 +20,10 @@ class StableDiffusionXLLoRASetup(
     BaseStableDiffusionXLSetup,
 ):
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            debug_mode: bool,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        debug_mode: bool,
     ):
         super().__init__(
             train_device=train_device,
@@ -32,26 +32,34 @@ class StableDiffusionXLLoRASetup(
         )
 
     def create_parameters(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
-        self._create_model_part_parameters(parameter_group_collection, "text_encoder_1_lora", model.text_encoder_1_lora, config.text_encoder)
-        self._create_model_part_parameters(parameter_group_collection, "text_encoder_2_lora", model.text_encoder_2_lora, config.text_encoder_2)
+        self._create_model_part_parameters(
+            parameter_group_collection, "text_encoder_1_lora", model.text_encoder_1_lora, config.text_encoder
+        )
+        self._create_model_part_parameters(
+            parameter_group_collection, "text_encoder_2_lora", model.text_encoder_2_lora, config.text_encoder_2
+        )
 
         if config.train_any_embedding() or config.train_any_output_embedding():
             if config.text_encoder.train_embedding:
                 self._add_embedding_param_groups(
-                    model.all_text_encoder_1_embeddings(), parameter_group_collection, config.embedding_learning_rate,
-                    "embeddings_1"
+                    model.all_text_encoder_1_embeddings(),
+                    parameter_group_collection,
+                    config.embedding_learning_rate,
+                    "embeddings_1",
                 )
 
             if config.text_encoder_2.train_embedding:
                 self._add_embedding_param_groups(
-                    model.all_text_encoder_2_embeddings(), parameter_group_collection, config.embedding_learning_rate,
-                    "embeddings_2"
+                    model.all_text_encoder_2_embeddings(),
+                    parameter_group_collection,
+                    config.embedding_learning_rate,
+                    "embeddings_2",
                 )
 
         self._create_model_part_parameters(parameter_group_collection, "unet_lora", model.unet_lora, config.unet)
@@ -59,9 +67,9 @@ class StableDiffusionXLLoRASetup(
         return parameter_group_collection
 
     def __setup_requires_grad(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ):
         self._setup_embeddings_requires_grad(model, config)
         model.text_encoder_1.requires_grad_(False)
@@ -69,29 +77,27 @@ class StableDiffusionXLLoRASetup(
         model.unet.requires_grad_(False)
         model.vae.requires_grad_(False)
 
-        self._setup_model_part_requires_grad("text_encoder_1_lora", model.text_encoder_1_lora, config.text_encoder, model.train_progress)
-        self._setup_model_part_requires_grad("text_encoder_2_lora", model.text_encoder_2_lora, config.text_encoder_2, model.train_progress)
+        self._setup_model_part_requires_grad(
+            "text_encoder_1_lora", model.text_encoder_1_lora, config.text_encoder, model.train_progress
+        )
+        self._setup_model_part_requires_grad(
+            "text_encoder_2_lora", model.text_encoder_2_lora, config.text_encoder_2, model.train_progress
+        )
         self._setup_model_part_requires_grad("unet_lora", model.unet_lora, config.unet, model.train_progress)
 
     def setup_model(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ):
         create_te1 = config.text_encoder.train or state_dict_has_prefix(model.lora_state_dict, "lora_te1")
         create_te2 = config.text_encoder_2.train or state_dict_has_prefix(model.lora_state_dict, "lora_te2")
 
-        model.text_encoder_1_lora = LoRAModuleWrapper(
-            model.text_encoder_1, "lora_te1", config
-        ) if create_te1 else None
+        model.text_encoder_1_lora = LoRAModuleWrapper(model.text_encoder_1, "lora_te1", config) if create_te1 else None
 
-        model.text_encoder_2_lora = LoRAModuleWrapper(
-            model.text_encoder_2, "lora_te2", config
-        ) if create_te2 else None
+        model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
 
-        model.unet_lora = LoRAModuleWrapper(
-            model.unet, "lora_unet", config, config.layer_filter.split(",")
-        )
+        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.layer_filter.split(","))
 
         if model.lora_state_dict:
             if create_te1:
@@ -130,15 +136,18 @@ class StableDiffusionXLLoRASetup(
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
+        self._export_lora_key_manifest(model, config)
         model.train_gps = None
 
         if config.train_gps_save_it or config.train_gps_use_it:
+            validate_train_gps_support(config)
             if not params.parameters():
                 raise ValueError("TrainGPS cannot initialize without trainable parameters")
 
             model.train_gps = TrainGPS(
                 model=model,
                 param_collection=params,
+                penalty_metric=config.train_gps_penalty_metric,
             )
 
             if config.train_gps_save_it:
@@ -150,17 +159,13 @@ class StableDiffusionXLLoRASetup(
             logFun("[TrainGPS] Initialized successfully.", lvl="success")
 
     def setup_train_device(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
     ):
         vae_on_train_device = not config.latent_caching
-        text_encoder_1_on_train_device = \
-            config.train_text_encoder_or_embedding()\
-            or not config.latent_caching
-        text_encoder_2_on_train_device = \
-            config.train_text_encoder_2_or_embedding() \
-            or not config.latent_caching
+        text_encoder_1_on_train_device = config.train_text_encoder_or_embedding() or not config.latent_caching
+        text_encoder_2_on_train_device = config.train_text_encoder_2_or_embedding() or not config.latent_caching
 
         model.text_encoder_1_to(self.train_device if text_encoder_1_on_train_device else self.temp_device)
         model.text_encoder_2_to(self.train_device if text_encoder_2_on_train_device else self.temp_device)
@@ -184,12 +189,7 @@ class StableDiffusionXLLoRASetup(
         else:
             model.unet.eval()
 
-    def after_optimizer_step(
-            self,
-            model: StableDiffusionXLModel,
-            config: TrainConfig,
-            train_progress: TrainProgress
-    ):
+    def after_optimizer_step(self, model: StableDiffusionXLModel, config: TrainConfig, train_progress: TrainProgress):
         if config.preserve_embedding_norm:
             self._normalize_output_embeddings(model.all_text_encoder_1_embeddings())
             self._normalize_output_embeddings(model.all_text_encoder_2_embeddings())
@@ -197,5 +197,8 @@ class StableDiffusionXLLoRASetup(
             model.embedding_wrapper_2.normalize_embeddings()
         self.__setup_requires_grad(model, config)
 
+
 factory.register(BaseModelSetup, StableDiffusionXLLoRASetup, ModelType.STABLE_DIFFUSION_XL_10_BASE, TrainingMethod.LORA)
-factory.register(BaseModelSetup, StableDiffusionXLLoRASetup, ModelType.STABLE_DIFFUSION_XL_10_BASE_INPAINTING, TrainingMethod.LORA)
+factory.register(
+    BaseModelSetup, StableDiffusionXLLoRASetup, ModelType.STABLE_DIFFUSION_XL_10_BASE_INPAINTING, TrainingMethod.LORA
+)

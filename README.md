@@ -34,26 +34,22 @@ OneTrainer is a one-stop solution for all your Diffusion training needs.
 ## Installation
 
 > [!IMPORTANT]
-> Installing OneTrainer requires Python >=3.10 and <3.14.
-> You can download Python at https://www.python.org/downloads/windows/.
-> Then follow the below steps.
+> On Linux and Mac, `install.sh` installs repo-local `uv`, installs managed Python, creates `.venv`, and installs requirements.
+> Windows still uses the Windows batch installer.
 
 #### Automatic installation
 
-1. Clone the repository `git clone https://github.com/Nerogar/OneTrainer.git`
+1. Clone or copy the OneTrainer source checkout you intend to run.
 2. Run:
     - Windows: Double click or execute `install.bat`
     - Linux and Mac: Execute `install.sh`
 
 #### Manual installation
 
-1. Clone the repository `git clone https://github.com/Nerogar/OneTrainer.git`
-2. Navigate into the cloned directory `cd OneTrainer`
-3. Set up a virtual environment `python -m venv venv`
-4. Activate the new venv:
-    - Windows: `venv\scripts\activate`
-    - Linux and Mac: Depends on your shell, activate the venv accordingly
-5. Install the requirements `pip install -r requirements.txt`
+1. Clone or copy the OneTrainer source checkout you intend to run.
+2. Navigate into the cloned or copied source directory.
+3. Linux and Mac: run `./install.sh` to create the uv-managed `.venv`
+4. Windows: run `install.bat`
 
 > [!Tip]
 > Some Linux distributions are missing required packages for instance: On Ubuntu you must install `libGL`:
@@ -75,8 +71,8 @@ OneTrainer is a one-stop solution for all your Diffusion training needs.
 
 1. Cd to folder containing the repo `cd OneTrainer`
 2. Pull changes `git pull`
-3. Activate the venv `venv/scripts/activate`
-4. Re-install all requirements `pip install -r requirements.txt --force-reinstall`
+3. Linux and Mac: run `./update.sh` to pull Git changes and refresh the uv-managed `.venv`; use `./install.sh` for first install or after deleting a broken `.venv`
+4. Windows: run `update.bat`
 
 ## Usage
 
@@ -96,7 +92,7 @@ For a technically focused quick start, see the [Quick Start Guide](docs/QuickSta
 
 ### CLI Mode
 
-If you need more control or a headless approach OT also supports the command-line interface. All commands **need** to be run inside the active venv created during installation.
+If you need more control or a headless approach OT also supports the command-line interface. On Linux and Mac, run CLI tasks through `./run-cmd.sh` so the uv-managed environment is prepared before execution.
 
 All functionality is split into different scripts located in the `scripts` directory. This currently includes:
 
@@ -111,7 +107,7 @@ All functionality is split into different scripts located in the `scripts` direc
 -   `generate_masks.py` A utility to automatically create masks for your dataset
 -   `calculate_loss.py` A utility to calculate the training loss of every image in your dataset
 
-To learn more about the different parameters, execute `<script-name> -h`. For example `python scripts\train.py -h`
+To learn more about the different parameters, execute `<script-name> -h`. For example, on Linux and Mac run `./run-cmd.sh train -h`.
 
 If you are on Mac or Linux, you can also read [the launch script documentation](LAUNCH-SCRIPTS.md) for detailed information about how to run OneTrainer and its various scripts on your system.
 
@@ -136,10 +132,19 @@ Contributions are always welcome in any form. For new functionality please open 
 Before you start looking at the code, I recommend reading about the project structure [here](docs/ProjectStructure.md).
 For in depth discussions, you should consider joining the [Discord](https://discord.gg/KwgcQd5scF) server.
 
-You also **NEED** to **install the required developer dependencies** for your current user and enable the Git commit hooks, via the following commands (works on all platforms; Windows, Linux and Mac):
+You also **NEED** to enable the Git commit hooks before contributing.
 
 > [!IMPORTANT]
-> Be sure to run those commands _without activating your venv or Conda environment_, since [pre-commit](https://pre-commit.com/) is supposed to be installed outside any environment.
+> Be sure to run those commands _without activating `.venv`_, since [pre-commit](https://pre-commit.com/) is not part of the training runtime.
+
+Linux and Mac after running `./install.sh`:
+
+```sh
+cd OneTrainer
+./.uv/bin/uv tool run --python 3.13 --from pre-commit pre-commit install
+```
+
+Windows:
 
 ```sh
 cd OneTrainer

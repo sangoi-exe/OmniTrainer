@@ -1,11 +1,11 @@
 from contextlib import nullcontext
 from random import Random
-from typing import List, Union
 
 from modules.model.BaseModel import BaseModel, BaseModelEmbedding
 from modules.model.util.clip_util import encode_clip
 from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.sangoi.TrainGPS import TrainGPS
 from modules.util.convert.rescale_noise_scheduler_to_zero_terminal_snr import (
     rescale_noise_scheduler_to_zero_terminal_snr,
 )
@@ -13,22 +13,20 @@ from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-from modules.sangoi.TrainGPS import TrainGPS
 
 class StableDiffusionXLModelEmbedding:
     def __init__(
-            self,
-            uuid: str,
-            text_encoder_1_vector: Tensor | None,
-            text_encoder_2_vector: Tensor | None,
-            placeholder: str,
-            is_output_embedding: bool,
+        self,
+        uuid: str,
+        text_encoder_1_vector: Tensor | None,
+        text_encoder_2_vector: Tensor | None,
+        placeholder: str,
+        is_output_embedding: bool,
     ):
         self.text_encoder_1_embedding = BaseModelEmbedding(
             uuid=uuid,
@@ -77,8 +75,8 @@ class StableDiffusionXLModel(BaseModel):
     sd_config_filename: str | None
 
     def __init__(
-            self,
-            model_type: ModelType,
+        self,
+        model_type: ModelType,
     ):
         super().__init__(model_type=model_type)
 
@@ -109,23 +107,28 @@ class StableDiffusionXLModel(BaseModel):
         self.sd_config_filename = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
-        return [a for a in [
-            self.text_encoder_1_lora,
-            self.text_encoder_2_lora,
-            self.unet_lora,
-        ] if a is not None]
+        return [
+            a
+            for a in [
+                self.text_encoder_1_lora,
+                self.text_encoder_2_lora,
+                self.unet_lora,
+            ]
+            if a is not None
+        ]
 
     def all_embeddings(self) -> list[StableDiffusionXLModelEmbedding]:
-        return self.additional_embeddings \
-               + ([self.embedding] if self.embedding is not None else [])
+        return self.additional_embeddings + ([self.embedding] if self.embedding is not None else [])
 
     def all_text_encoder_1_embeddings(self) -> list[BaseModelEmbedding]:
-        return [embedding.text_encoder_1_embedding for embedding in self.additional_embeddings] \
-               + ([self.embedding.text_encoder_1_embedding] if self.embedding is not None else [])
+        return [embedding.text_encoder_1_embedding for embedding in self.additional_embeddings] + (
+            [self.embedding.text_encoder_1_embedding] if self.embedding is not None else []
+        )
 
     def all_text_encoder_2_embeddings(self) -> list[BaseModelEmbedding]:
-        return [embedding.text_encoder_2_embedding for embedding in self.additional_embeddings] \
-               + ([self.embedding.text_encoder_2_embedding] if self.embedding is not None else [])
+        return [embedding.text_encoder_2_embedding for embedding in self.additional_embeddings] + (
+            [self.embedding.text_encoder_2_embedding] if self.embedding is not None else []
+        )
 
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)
@@ -181,14 +184,14 @@ class StableDiffusionXLModel(BaseModel):
         )
 
     def force_v_prediction(self):
-        self.noise_scheduler.config.prediction_type = 'v_prediction'
-        self.sd_config['model']['params']['parameterization'] = 'v'
-        self.model_spec.prediction_type = 'v'
+        self.noise_scheduler.config.prediction_type = "v_prediction"
+        self.sd_config["model"]["params"]["parameterization"] = "v"
+        self.model_spec.prediction_type = "v"
 
     def force_epsilon_prediction(self):
-        self.noise_scheduler.config.prediction_type = 'epsilon'
-        self.sd_config['model']['params']['parameterization'] = 'epsilon'
-        self.model_spec.prediction_type = 'epsilon'
+        self.noise_scheduler.config.prediction_type = "epsilon"
+        self.sd_config["model"]["params"]["parameterization"] = "epsilon"
+        self.model_spec.prediction_type = "epsilon"
 
     def rescale_noise_scheduler_to_zero_terminal_snr(self):
         rescale_noise_scheduler_to_zero_terminal_snr(self.noise_scheduler)
@@ -200,25 +203,25 @@ class StableDiffusionXLModel(BaseModel):
         return self._add_embeddings_to_prompt(self.all_text_encoder_2_embeddings(), prompt)
 
     def encode_text(
-            self,
-            train_device: torch.device,
-            batch_size: int = 1,
-            rand: Random | None = None,
-            text: str = None,
-            tokens_1: Tensor = None,
-            tokens_2: Tensor = None,
-            text_encoder_1_layer_skip: int = 0,
-            text_encoder_2_layer_skip: int = 0,
-            text_encoder_1_output: Tensor = None,
-            text_encoder_2_output: Tensor = None,
-            text_encoder_1_dropout_probability: float | None = None,
-            text_encoder_2_dropout_probability: float | None = None,
-            pooled_text_encoder_2_output: Tensor = None,
+        self,
+        train_device: torch.device,
+        batch_size: int = 1,
+        rand: Random | None = None,
+        text: str = None,
+        tokens_1: Tensor = None,
+        tokens_2: Tensor = None,
+        text_encoder_1_layer_skip: int = 0,
+        text_encoder_2_layer_skip: int = 0,
+        text_encoder_1_output: Tensor = None,
+        text_encoder_2_output: Tensor = None,
+        text_encoder_1_dropout_probability: float | None = None,
+        text_encoder_2_dropout_probability: float | None = None,
+        pooled_text_encoder_2_output: Tensor = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         if tokens_1 is None and text is not None:
             tokenizer_output = self.tokenizer_1(
                 self.add_text_encoder_1_embeddings_to_prompt(text),
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 max_length=77,
                 return_tensors="pt",
@@ -228,7 +231,7 @@ class StableDiffusionXLModel(BaseModel):
         if tokens_2 is None and text is not None:
             tokenizer_output = self.tokenizer_2(
                 self.add_text_encoder_2_embeddings_to_prompt(text),
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 max_length=77,
                 return_tensors="pt",
@@ -274,25 +277,29 @@ class StableDiffusionXLModel(BaseModel):
 
         # apply dropout
         if text_encoder_1_dropout_probability is not None:
-            dropout_text_encoder_1_mask = (torch.tensor(
-                [rand.random() > text_encoder_1_dropout_probability for _ in range(batch_size)],
-                device=train_device)).float()
+            dropout_text_encoder_1_mask = (
+                torch.tensor(
+                    [rand.random() > text_encoder_1_dropout_probability for _ in range(batch_size)], device=train_device
+                )
+            ).float()
             text_encoder_1_output = text_encoder_1_output * dropout_text_encoder_1_mask[:, None, None]
 
         if text_encoder_2_dropout_probability is not None:
-            dropout_text_encoder_2_mask = (torch.tensor(
-                [rand.random() > text_encoder_2_dropout_probability for _ in range(batch_size)],
-                device=train_device)).float()
+            dropout_text_encoder_2_mask = (
+                torch.tensor(
+                    [rand.random() > text_encoder_2_dropout_probability for _ in range(batch_size)], device=train_device
+                )
+            ).float()
             pooled_text_encoder_2_output = pooled_text_encoder_2_output * dropout_text_encoder_2_mask[:, None]
             text_encoder_2_output = text_encoder_2_output * dropout_text_encoder_2_mask[:, None, None]
 
         return text_encoder_1_output, text_encoder_2_output, pooled_text_encoder_2_output
 
     def combine_text_encoder_output(
-            self,
-            text_encoder_1_output: Tensor,
-            text_encoder_2_output: Tensor,
-            pooled_text_encoder_2_output: Tensor,
+        self,
+        text_encoder_1_output: Tensor,
+        text_encoder_2_output: Tensor,
+        pooled_text_encoder_2_output: Tensor,
     ) -> tuple[Tensor, Tensor]:
         text_encoder_output = torch.concat([text_encoder_1_output, text_encoder_2_output], dim=-1)
         return text_encoder_output, pooled_text_encoder_2_output

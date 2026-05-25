@@ -7,13 +7,15 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
 from modules.util.enum.LossMode import LossMode
 from modules.util.enum.LossWeight import LossWeight
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.loss.masked_loss import masked_losses, masked_losses_with_prior, sangoi_masked_loss
 from modules.util.loss.vb_loss import vb_losses
 
-from pytorch_msssim import ssim
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from pytorch_msssim import ssim
 
 
 class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
@@ -34,22 +36,24 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.__dynamic_loss_config_key = None
 
     def __log_cosh_loss(
-            self,
-            pred: torch.Tensor,
-            target: torch.Tensor,
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
     ) -> Tensor:
         diff = pred - target
-        loss = diff + torch.nn.functional.softplus(-2.0 * diff) - torch.log(
-            torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device)
+        loss = (
+            diff
+            + torch.nn.functional.softplus(-2.0 * diff)
+            - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
         )
         return loss
 
     def __sangoi_huber_loss(
-            self,
-            pred: Tensor,
-            target: Tensor,
-            timesteps: Tensor,
-            huber_c: float = 0.1,
+        self,
+        pred: Tensor,
+        target: Tensor,
+        timesteps: Tensor,
+        huber_c: float = 0.1,
     ) -> Tensor:
         diff = pred - target
         snr = self.__snr(timesteps, diff.device).to(device=diff.device, dtype=torch.float32)
@@ -63,29 +67,29 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         )
 
     def __sangoi_charbonnier_loss(
-            self,
-            pred: Tensor,
-            target: Tensor,
-            eps: float = 1e-3,
-            alpha: float = 0.5,
+        self,
+        pred: Tensor,
+        target: Tensor,
+        eps: float = 1e-3,
+        alpha: float = 0.5,
     ) -> Tensor:
         return torch.pow(torch.square(pred - target) + eps * eps, alpha)
 
     @staticmethod
     def __zero_losses(data: dict) -> Tensor:
         return torch.zeros(
-            data['predicted'].shape[0],
-            device=data['predicted'].device,
+            data["predicted"].shape[0],
+            device=data["predicted"].device,
             dtype=torch.float32,
         )
 
     @staticmethod
     def __mean_dim(data: dict) -> list[int]:
-        return list(range(1, data['predicted'].ndim))
+        return list(range(1, data["predicted"].ndim))
 
     @staticmethod
     def __latent_mask(batch: dict, data: dict) -> Tensor:
-        return batch['latent_mask'].to(device=data['predicted'].device, dtype=torch.float32)
+        return batch["latent_mask"].to(device=data["predicted"].device, dtype=torch.float32)
 
     @staticmethod
     def __train_progress_fraction(train_progress: Any, total_epochs: int, single_epoch_value: float) -> float:
@@ -97,26 +101,23 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     @staticmethod
     def __write_scalar(
-            tensorboard: Any | None,
-            train_progress: Any,
-            name: str,
-            value: Tensor | float,
+        tensorboard: Any | None,
+        train_progress: Any,
+        name: str,
+        value: Tensor | float,
     ) -> None:
         if tensorboard is None:
             return
 
-        if isinstance(value, Tensor):
-            scalar_value = value.detach().mean().item()
-        else:
-            scalar_value = float(value)
+        scalar_value = value.detach().mean().item() if isinstance(value, Tensor) else float(value)
 
         tensorboard.add_scalar(name, scalar_value, train_progress.global_step)
 
     def __write_model_scalar(
-            self,
-            model: Any | None,
-            name: str,
-            value: Tensor | float,
+        self,
+        model: Any | None,
+        name: str,
+        value: Tensor | float,
     ) -> None:
         if model is None:
             return
@@ -163,25 +164,27 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.__dynamic_loss_config_key = config_key
 
     def __masked_base_loss_components(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
-            compute_mse: bool,
-            compute_mae: bool,
-            compute_log_cosh: bool,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        compute_mse: bool,
+        compute_mae: bool,
+        compute_log_cosh: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
         mean_dim = self.__mean_dim(data)
         latent_mask = self.__latent_mask(batch, data)
-        predicted = data['predicted'].to(dtype=torch.float32)
-        target = data['target'].to(dtype=torch.float32)
-        prior_target = data['prior_target'].to(dtype=torch.float32) if 'prior_target' in data else None
+        predicted = data["predicted"].to(dtype=torch.float32)
+        target = data["target"].to(dtype=torch.float32)
+        prior_target = data["prior_target"].to(dtype=torch.float32) if "prior_target" in data else None
         zero_losses = self.__zero_losses(data)
 
         if compute_mse:
             mse_losses = masked_losses_with_prior(
-                losses=F.mse_loss(predicted, target, reduction='none'),
-                prior_losses=F.mse_loss(predicted, prior_target, reduction='none') if prior_target is not None else None,
+                losses=F.mse_loss(predicted, target, reduction="none"),
+                prior_losses=F.mse_loss(predicted, prior_target, reduction="none")
+                if prior_target is not None
+                else None,
                 mask=latent_mask,
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -192,8 +195,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         if compute_mae:
             mae_losses = masked_losses_with_prior(
-                losses=F.l1_loss(predicted, target, reduction='none'),
-                prior_losses=F.l1_loss(predicted, prior_target, reduction='none') if prior_target is not None else None,
+                losses=F.l1_loss(predicted, target, reduction="none"),
+                prior_losses=F.l1_loss(predicted, prior_target, reduction="none") if prior_target is not None else None,
                 mask=latent_mask,
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -217,30 +220,30 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         return mse_losses, mae_losses, log_cosh_losses
 
     def __unmasked_base_loss_components(
-            self,
-            data: dict,
-            compute_mse: bool,
-            compute_mae: bool,
-            compute_log_cosh: bool,
+        self,
+        data: dict,
+        compute_mse: bool,
+        compute_mae: bool,
+        compute_log_cosh: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
         mean_dim = self.__mean_dim(data)
-        predicted = data['predicted'].to(dtype=torch.float32)
-        target = data['target'].to(dtype=torch.float32)
+        predicted = data["predicted"].to(dtype=torch.float32)
+        target = data["target"].to(dtype=torch.float32)
         zero_losses = self.__zero_losses(data)
 
-        mse_losses = F.mse_loss(predicted, target, reduction='none').mean(mean_dim) if compute_mse else zero_losses
-        mae_losses = F.l1_loss(predicted, target, reduction='none').mean(mean_dim) if compute_mae else zero_losses
+        mse_losses = F.mse_loss(predicted, target, reduction="none").mean(mean_dim) if compute_mse else zero_losses
+        mae_losses = F.l1_loss(predicted, target, reduction="none").mean(mean_dim) if compute_mae else zero_losses
         log_cosh_losses = self.__log_cosh_loss(predicted, target).mean(mean_dim) if compute_log_cosh else zero_losses
 
         return mse_losses, mae_losses, log_cosh_losses
 
     def __original_base_losses(
-            self,
-            mse_losses: Tensor,
-            mae_losses: Tensor,
-            log_cosh_losses: Tensor,
-            data: dict,
-            config: TrainConfig,
+        self,
+        mse_losses: Tensor,
+        mae_losses: Tensor,
+        log_cosh_losses: Tensor,
+        data: dict,
+        config: TrainConfig,
     ) -> Tensor:
         losses = self.__zero_losses(data)
 
@@ -254,20 +257,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         return losses
 
     def __dynamic_base_losses(
-            self,
-            mse_losses: Tensor,
-            mae_losses: Tensor,
-            log_cosh_losses: Tensor,
-            data: dict,
-            config: TrainConfig,
-            train_progress: Any,
-            tensorboard: Any | None,
+        self,
+        mse_losses: Tensor,
+        mae_losses: Tensor,
+        log_cosh_losses: Tensor,
+        data: dict,
+        config: TrainConfig,
+        train_progress: Any,
+        tensorboard: Any | None,
     ) -> Tensor:
         self.__sync_dynamic_loss_state(config)
         if self.__loss_tracker is None or self.__dynamic_loss_control is None:
             raise RuntimeError("Dynamic loss state was not initialized")
 
-        mutate_state = torch.is_grad_enabled() and data['predicted'].requires_grad
+        mutate_state = torch.is_grad_enabled() and data["predicted"].requires_grad
         if mutate_state:
             self.__loss_tracker.update(mse_losses, mae_losses, log_cosh_losses)
 
@@ -292,13 +295,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         )
 
     def __base_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
-            masked: bool,
-            train_progress: Any | None,
-            tensorboard: Any | None,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        masked: bool,
+        train_progress: Any | None,
+        tensorboard: Any | None,
     ) -> Tensor:
         dynamic_mode = config.loss_mode_fn == LossMode.SANGOI
         compute_mse = dynamic_mode or config.mse_strength != 0
@@ -341,103 +344,128 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         raise NotImplementedError(f"Loss mode {config.loss_mode_fn} is not implemented")
 
     def __masked_additive_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
     ) -> Tensor:
         losses = self.__zero_losses(data)
         mean_dim = self.__mean_dim(data)
         latent_mask = self.__latent_mask(batch, data)
-        predicted = data['predicted'].to(dtype=torch.float32)
-        target = data['target'].to(dtype=torch.float32)
-        prior_target = data['prior_target'].to(dtype=torch.float32) if 'prior_target' in data else None
+        predicted = data["predicted"].to(dtype=torch.float32)
+        target = data["target"].to(dtype=torch.float32)
+        prior_target = data["prior_target"].to(dtype=torch.float32) if "prior_target" in data else None
 
         if config.huber_strength != 0:
-            losses += masked_losses_with_prior(
-                losses=F.huber_loss(predicted, target, reduction='none', delta=config.huber_delta),
-                prior_losses=F.huber_loss(predicted, prior_target, reduction='none', delta=config.huber_delta)
-                if prior_target is not None else None,
-                mask=latent_mask,
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-                masked_prior_preservation_weight=config.masked_prior_preservation_weight,
-            ).mean(mean_dim) * config.huber_strength
+            losses += (
+                masked_losses_with_prior(
+                    losses=F.huber_loss(predicted, target, reduction="none", delta=config.huber_delta),
+                    prior_losses=F.huber_loss(predicted, prior_target, reduction="none", delta=config.huber_delta)
+                    if prior_target is not None
+                    else None,
+                    mask=latent_mask,
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss,
+                    masked_prior_preservation_weight=config.masked_prior_preservation_weight,
+                ).mean(mean_dim)
+                * config.huber_strength
+            )
 
         if config.sangoi_huber_strength != 0:
-            losses += sangoi_masked_loss(
-                losses=self.__sangoi_huber_loss(predicted, target, data['timestep']),
-                mask=latent_mask,
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean(mean_dim) * config.sangoi_huber_strength
+            losses += (
+                sangoi_masked_loss(
+                    losses=self.__sangoi_huber_loss(predicted, target, data["timestep"]),
+                    mask=latent_mask,
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss,
+                ).mean(mean_dim)
+                * config.sangoi_huber_strength
+            )
 
         if config.sangoi_charbonnier_strength != 0:
-            losses += sangoi_masked_loss(
-                losses=self.__sangoi_charbonnier_loss(predicted, target),
-                mask=latent_mask,
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean(mean_dim) * config.sangoi_charbonnier_strength
+            losses += (
+                sangoi_masked_loss(
+                    losses=self.__sangoi_charbonnier_loss(predicted, target),
+                    mask=latent_mask,
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss,
+                ).mean(mean_dim)
+                * config.sangoi_charbonnier_strength
+            )
 
-        if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
-            losses += masked_losses(
-                losses=vb_losses(
-                    coefficients=self.__coefficients,
-                    x_0=data['scaled_latent_image'].to(dtype=torch.float32),
-                    x_t=data['noisy_latent_image'].to(dtype=torch.float32),
-                    t=data['timestep'],
-                    predicted_eps=predicted,
-                    predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
-                ),
-                mask=latent_mask,
-                unmasked_weight=config.unmasked_weight,
-                normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean(mean_dim) * config.vb_loss_strength
+        if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
+            losses += (
+                masked_losses(
+                    losses=vb_losses(
+                        coefficients=self.__coefficients,
+                        x_0=data["scaled_latent_image"].to(dtype=torch.float32),
+                        x_t=data["noisy_latent_image"].to(dtype=torch.float32),
+                        t=data["timestep"],
+                        predicted_eps=predicted,
+                        predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
+                    ),
+                    mask=latent_mask,
+                    unmasked_weight=config.unmasked_weight,
+                    normalize_masked_area_loss=config.normalize_masked_area_loss,
+                ).mean(mean_dim)
+                * config.vb_loss_strength
+            )
 
         return losses
 
     def __unmasked_additive_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
     ) -> Tensor:
         losses = self.__zero_losses(data)
         mean_dim = self.__mean_dim(data)
-        predicted = data['predicted'].to(dtype=torch.float32)
-        target = data['target'].to(dtype=torch.float32)
+        predicted = data["predicted"].to(dtype=torch.float32)
+        target = data["target"].to(dtype=torch.float32)
 
         if config.huber_strength != 0:
-            losses += F.huber_loss(
-                predicted,
-                target,
-                reduction='none',
-                delta=config.huber_delta,
-            ).mean(mean_dim) * config.huber_strength
+            losses += (
+                F.huber_loss(
+                    predicted,
+                    target,
+                    reduction="none",
+                    delta=config.huber_delta,
+                ).mean(mean_dim)
+                * config.huber_strength
+            )
 
         if config.sangoi_huber_strength != 0:
-            losses += self.__sangoi_huber_loss(
-                predicted,
-                target,
-                data['timestep'],
-            ).mean(mean_dim) * config.sangoi_huber_strength
+            losses += (
+                self.__sangoi_huber_loss(
+                    predicted,
+                    target,
+                    data["timestep"],
+                ).mean(mean_dim)
+                * config.sangoi_huber_strength
+            )
 
         if config.sangoi_charbonnier_strength != 0:
-            losses += self.__sangoi_charbonnier_loss(
-                predicted,
-                target,
-            ).mean(mean_dim) * config.sangoi_charbonnier_strength
+            losses += (
+                self.__sangoi_charbonnier_loss(
+                    predicted,
+                    target,
+                ).mean(mean_dim)
+                * config.sangoi_charbonnier_strength
+            )
 
-        if config.vb_loss_strength != 0 and 'predicted_var_values' in data:
-            losses += vb_losses(
-                coefficients=self.__coefficients,
-                x_0=data['scaled_latent_image'].to(dtype=torch.float32),
-                x_t=data['noisy_latent_image'].to(dtype=torch.float32),
-                t=data['timestep'],
-                predicted_eps=predicted,
-                predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
-            ).mean(mean_dim) * config.vb_loss_strength
+        if config.vb_loss_strength != 0 and "predicted_var_values" in data:
+            losses += (
+                vb_losses(
+                    coefficients=self.__coefficients,
+                    x_0=data["scaled_latent_image"].to(dtype=torch.float32),
+                    x_t=data["noisy_latent_image"].to(dtype=torch.float32),
+                    t=data["timestep"],
+                    predicted_eps=predicted,
+                    predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
+                ).mean(mean_dim)
+                * config.vb_loss_strength
+            )
 
         if config.masked_training and config.normalize_masked_area_loss:
             clamped_mask = torch.clamp(self.__latent_mask(batch, data), config.unmasked_weight, 1)
@@ -446,12 +474,12 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         return losses
 
     def __masked_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
-            train_progress: Any | None,
-            tensorboard: Any | None,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        train_progress: Any | None,
+        tensorboard: Any | None,
     ) -> Tensor:
         return self.__base_losses(
             batch=batch,
@@ -463,12 +491,12 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         ) + self.__masked_additive_losses(batch, data, config)
 
     def __unmasked_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
-            train_progress: Any | None,
-            tensorboard: Any | None,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        train_progress: Any | None,
+        tensorboard: Any | None,
     ) -> Tensor:
         return self.__base_losses(
             batch=batch,
@@ -481,8 +509,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     def __snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
         if self.__coefficients:
-            all_snr = (self.__coefficients.sqrt_alphas_cumprod /
-                       self.__coefficients.sqrt_one_minus_alphas_cumprod) ** 2
+            all_snr = (self.__coefficients.sqrt_alphas_cumprod / self.__coefficients.sqrt_one_minus_alphas_cumprod) ** 2
             all_snr = all_snr.to(device)
             snr = all_snr[timesteps]
         else:
@@ -491,13 +518,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         return snr
 
-    def __min_snr_weight(
-            self,
-            timesteps: Tensor,
-            gamma: float,
-            v_prediction: bool,
-            device: torch.device
-    ) -> Tensor:
+    def __min_snr_weight(self, timesteps: Tensor, gamma: float, v_prediction: bool, device: torch.device) -> Tensor:
         snr = self.__snr(timesteps, device)
         min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
         # Denominator of the snr_weight increased by 1 if v-prediction is being used.
@@ -506,12 +527,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         snr_weight = (min_snr_gamma / snr).to(device)
         return snr_weight
 
-    def __debiased_estimation_weight(
-        self,
-        timesteps: Tensor,
-        v_prediction: bool,
-        device: torch.device
-    ) -> Tensor:
+    def __debiased_estimation_weight(self, timesteps: Tensor, v_prediction: bool, device: torch.device) -> Tensor:
         snr = self.__snr(timesteps, device)
         weight = snr
         # The line below is a departure from the original paper.
@@ -543,15 +559,15 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         return self.__sigmas[timesteps].to(device=device)
 
     def __sangoi_loss_weighting(
-            self,
-            timesteps: Tensor,
-            predicted: Tensor,
-            target: Tensor,
-            train_progress: Any,
-            total_epochs: int,
-            tensorboard: Any | None,
-            gamma: float,
-            device: torch.device,
+        self,
+        timesteps: Tensor,
+        predicted: Tensor,
+        target: Tensor,
+        train_progress: Any,
+        total_epochs: int,
+        tensorboard: Any | None,
+        gamma: float,
+        device: torch.device,
     ) -> Tensor:
         snr = self.__snr(timesteps, device).to(device=device, dtype=torch.float32)
         epsilon = 1e-8
@@ -580,16 +596,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         return reward
 
     def _diffusion_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
-            train_device: torch.device,
-            model: Any | None = None,
-            betas: Tensor | None = None,
-            alphas_cumprod_fun: Callable[[Tensor, int], Tensor] | None = None,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        train_device: torch.device,
+        model: Any | None = None,
+        betas: Tensor | None = None,
+        alphas_cumprod_fun: Callable[[Tensor, int], Tensor] | None = None,
     ) -> Tensor:
-        loss_weight = batch['loss_weight']
+        loss_weight = batch["loss_weight"]
         if self.__coefficients is None and betas is not None:
             self.__coefficients = DiffusionScheduleCoefficients.from_betas(betas.to(train_device))
 
@@ -599,7 +615,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.loss_mode_fn == LossMode.SANGOI:
             train_progress = self.__require_train_progress(model, "LossMode.SANGOI")
 
-        if data['loss_type'] == 'target':
+        if data["loss_type"] == "target":
             # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
             #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
             if config.masked_training and not config.model_type.has_conditioning_image_input():
@@ -608,29 +624,35 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 losses = self.__unmasked_losses(batch, data, config, train_progress, tensorboard)
 
         # Scale Losses by Batch and/or GA (if enabled)
-        losses = losses * config.loss_scaler.get_scale(batch_size=config.batch_size, accumulation_steps=config.gradient_accumulation_steps)
+        losses = losses * config.loss_scaler.get_scale(
+            batch_size=config.batch_size, accumulation_steps=config.gradient_accumulation_steps
+        )
 
         losses *= loss_weight.to(device=losses.device, dtype=losses.dtype)
 
         # Apply timestep based loss weighting.
-        if 'timestep' in data:
-            v_pred = data.get('prediction_type', '') == 'v_prediction'
+        if "timestep" in data:
+            v_pred = data.get("prediction_type", "") == "v_prediction"
             match config.loss_weight_fn:
                 case LossWeight.CONSTANT:
                     pass
                 case LossWeight.MIN_SNR_GAMMA:
-                    losses *= self.__min_snr_weight(data['timestep'], config.loss_weight_strength, v_pred, losses.device)
+                    losses *= self.__min_snr_weight(
+                        data["timestep"], config.loss_weight_strength, v_pred, losses.device
+                    )
                 case LossWeight.DEBIASED_ESTIMATION:
-                    losses *= self.__debiased_estimation_weight(data['timestep'], v_pred, losses.device)
+                    losses *= self.__debiased_estimation_weight(data["timestep"], v_pred, losses.device)
                 case LossWeight.P2:
-                    losses *= self.__p2_loss_weight(data['timestep'], config.loss_weight_strength, v_pred, losses.device)
+                    losses *= self.__p2_loss_weight(
+                        data["timestep"], config.loss_weight_strength, v_pred, losses.device
+                    )
                 case LossWeight.SANGOI:
                     weight_progress = train_progress or self.__require_train_progress(model, "LossWeight.SANGOI")
                     self.__write_model_scalar(model, "sangoi/loss_b4_sangoi", losses)
                     losses *= self.__sangoi_loss_weighting(
-                        timesteps=data['timestep'],
-                        predicted=data['predicted'].to(dtype=torch.float32),
-                        target=data['target'].to(dtype=torch.float32),
+                        timesteps=data["timestep"],
+                        predicted=data["predicted"].to(dtype=torch.float32),
+                        target=data["target"].to(dtype=torch.float32),
                         train_progress=weight_progress,
                         total_epochs=config.epochs,
                         tensorboard=tensorboard,
@@ -639,7 +661,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     ).to(device=losses.device, dtype=losses.dtype)
                     self.__write_model_scalar(model, "sangoi/loss_after_sangoi", losses)
                 case _:
-                    raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for diffusion models")
+                    raise NotImplementedError(
+                        f"Loss weight function {config.loss_weight_fn} not implemented for diffusion models"
+                    )
+
+        if config.timestep_distribution == TimestepDistribution.PRIORITY_SAMPLING:
+            model_output_data = data
+            model_output_data["loss_per_sample"] = losses.detach()
 
         train_gps = getattr(model, "train_gps", None) if model is not None else None
         if config.train_gps_use_it:
@@ -654,23 +682,25 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         return losses
 
     def _flow_matching_losses(
-            self,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
-            train_device: torch.device,
-            sigmas: Tensor | None = None,
+        self,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        train_device: torch.device,
+        sigmas: Tensor | None = None,
     ) -> Tensor:
         if config.loss_mode_fn == LossMode.SANGOI:
             raise ValueError("LossMode.SANGOI is only supported for diffusion losses")
+        if config.loss_weight_fn == LossWeight.SANGOI:
+            raise ValueError("LossWeight.SANGOI is only supported for diffusion losses")
 
-        loss_weight = batch['loss_weight']
+        loss_weight = batch["loss_weight"]
         if self.__sigmas is None and sigmas is not None:
             num_timesteps = sigmas.shape[0]
             all_timesteps = torch.arange(start=1, end=num_timesteps + 1, step=1, dtype=torch.int32, device=train_device)
             self.__sigmas = all_timesteps / num_timesteps
 
-        if data['loss_type'] == 'target':
+        if data["loss_type"] == "target":
             # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
             #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
             if config.masked_training and not config.model_type.has_conditioning_image_input():
@@ -683,14 +713,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         losses *= loss_weight.to(device=losses.device, dtype=losses.dtype)
 
         # Apply timestep based loss weighting.
-        if 'timestep' in data:
+        if "timestep" in data:
             match config.loss_weight_fn:
                 case LossWeight.CONSTANT:
                     pass
                 case LossWeight.SIGMA:
-                    losses *= self.__sigma_loss_weight(data['timestep'], losses.device)
+                    losses *= self.__sigma_loss_weight(data["timestep"], losses.device)
                 case _:
-                    raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models")
+                    raise NotImplementedError(
+                        f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models"
+                    )
 
         return losses
 

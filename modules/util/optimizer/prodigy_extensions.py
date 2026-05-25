@@ -1,12 +1,12 @@
 import math
 import traceback
-import torch
-import torch.distributed as dist
 
 from modules.util.bf16_stochastic_rounding import (
-    add_stochastic_,
     addcdiv_stochastic_,
 )
+
+import torch
+import torch.distributed as dist
 
 from prodigyopt.prodigy import Prodigy
 
@@ -24,7 +24,6 @@ def step_prodigy(self, closure=None):
         loss = closure()
 
     if not hasattr(self, "_stats_buffer"):
-
         self._stats_buffer = ProdigyStatsBuffer()
     # limpa o buffer no primeiro grupo da step
 
@@ -55,10 +54,7 @@ def step_prodigy(self, closure=None):
         # group's iteration counter (k)
         k = group["k"]
 
-        if use_bias_correction:
-            bias_correction = ((1 - beta2 ** (k + 1)) ** 0.5) / (1 - beta1 ** (k + 1))
-        else:
-            bias_correction = 1.0
+        bias_correction = ((1 - beta2 ** (k + 1)) ** 0.5) / (1 - beta1 ** (k + 1)) if use_bias_correction else 1.0
 
         dlr = d * lr * bias_correction
 
@@ -160,14 +156,14 @@ def step_prodigy(self, closure=None):
             group["d_denom"] = global_d_denom
 
         self._stats_buffer.push(
-            group_idx = group_idx,
-            name = group["name"],
-            step = group["k"],
-            d_num = group["d_numerator"],
-            d_den = group["d_denom"],
-            dlr = d * lr * bias_correction,
+            group_idx=group_idx,
+            name=group["name"],
+            step=group["k"],
+            d_num=group["d_numerator"],
+            d_den=group["d_denom"],
+            dlr=d * lr * bias_correction,
         )
-        
+
         # buceta = group["name"]
         # if "dora" in buceta:
         #     print(f"tem alpha na {buceta}")
@@ -214,14 +210,14 @@ def step_prodigy(self, closure=None):
                     p.data.addcdiv_(grad, denom, value=-dlr * d)
 
         # Increment the group's k
-        #print(f"[PRODIGY DEBUG] Group {group_idx} d={group['d']} d_numerator={group['d_numerator']} d_denom={group['d_denom']}")
+        # print(f"[PRODIGY DEBUG] Group {group_idx} d={group['d']} d_numerator={group['d_numerator']} d_denom={group['d_denom']}")
         group["k"] = k + 1
 
     # --- INÍCIO DA LÓGICA DE ATUALIZAÇÃO COM WARMUP ---
     # Esta seção prepara os hiperparâmetros para a PRÓXIMA chamada.
     # Usaremos o contador do primeiro grupo como referência global para o warmup.
     # Isso assume que todos os grupos avançam juntos.
-    # global_step = self.param_groups[0].get('k', 0) 
+    # global_step = self.param_groups[0].get('k', 0)
     # warmup_steps = getattr(self, 'dcoef_warmup_steps', 1000) # Pega o valor do objeto optimizer
 
     # for group_idx, group in enumerate(self.param_groups):
@@ -236,17 +232,17 @@ def step_prodigy(self, closure=None):
     #         if p.grad is not None:
     #             total_norm += p.grad.detach().abs().sum()
     #             num_elements += p.grad.numel()
-        
+
     #     avg_grad_norm = (total_norm / (num_elements + 1e-9))
-        
+
     #     # 2. Gerenciar o estado da EMA (sempre)
     #     dcoef_state = self.state.setdefault('_dcoef_state', {})
     #     ema_state_key = f'group_{group_idx}_ema_norm'
-        
+
     #     # Se a EMA não existe, inicialize-a com a primeira medição.
     #     if ema_state_key not in dcoef_state:
     #         dcoef_state[ema_state_key] = avg_grad_norm
-        
+
     #     ema_prev = dcoef_state[ema_state_key]
     #     beta_dc = group.get("dcoef_beta", 0.9)
     #     ema_curr = beta_dc * ema_prev + (1 - beta_dc) * avg_grad_norm
@@ -261,10 +257,10 @@ def step_prodigy(self, closure=None):
 
     #         new_dcoef = target / (ema_curr.item() + 1e-9)
     #         clamped_dcoef = torch.clamp(torch.tensor(new_dcoef), dc_min, dc_max).item()
-            
+
     #         # ATUALIZA O VALOR NO GRUPO PARA A PRÓXIMA ITERAÇÃO
     #         group['d_coef'] = clamped_dcoef
-            
+
     #         # Opcional: Logar quando a adaptação começa
     #         if global_step == warmup_steps + 1:
     #             print(f"INFO: DCoeff adaptation started for group {group_idx} at step {global_step}.")
@@ -285,6 +281,7 @@ def patch_prodigy(optimizer: Prodigy, stochastic_rounding: bool):
         print(f"Failed to set options in patch_prodigy: {e}")
         traceback.print_exc()
 
+
 def _pop_prodigy_stats(self):
     """
     Retorna e esvazia o buffer das estatísticas mais recentes.
@@ -292,11 +289,13 @@ def _pop_prodigy_stats(self):
     """
     return getattr(self, "_stats_buffer", []).pop_all()
 
+
 class ProdigyStatsBuffer(list):
     """
     Coleciona dicts de estatísticas por grupo a cada .step().
     Chamou .pop_all() => devolve lista acumulada e limpa o buffer.
     """
+
     def push(self, **kwargs):
         self.append(kwargs)
 

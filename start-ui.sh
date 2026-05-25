@@ -2,7 +2,7 @@
 
 set -e
 
-source "${BASH_SOURCE[0]%/*}/lib.include.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.include.sh"
 
 # Xet is buggy. Disabled by default unless already defined - https://github.com/Nerogar/OneTrainer/issues/949
 if [[ -z "${HF_HUB_DISABLE_XET+x}" ]]; then

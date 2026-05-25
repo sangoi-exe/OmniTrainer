@@ -2,6 +2,6 @@
 
 set -e
 
-source "${BASH_SOURCE[0]%/*}/lib.include.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.include.sh"
 
-prepare_runtime_environment
+prepare_runtime_environment upgrade

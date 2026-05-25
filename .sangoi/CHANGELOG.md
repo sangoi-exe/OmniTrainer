@@ -1,5 +1,14 @@
 # Sangoi Changelog
 
+## 2026-05-24 - Sangoi mod cleanup and uv-managed bootstrap
+
+- Cleaned the handmade Sangoi mod surface on `master-update` by removing stale config/UI/debug fields and unsupported orphan modules while preserving supported SDXL training behavior.
+- Added repo-local uv-managed POSIX bootstrap with `.uv/bin/uv`, managed Python 3.13, fixed `.venv`, `.python-version`, local uv tool dirs, and WSL CPU validation via `requirements-default.txt`.
+- Added root `AGENTS.md` and `.dockerignore`; updated Docker/cloud fan-in so current-source builds and remote installs do not silently clone or update upstream OneTrainer.
+- Repaired training contracts for parabolic LR scheduling, Prodigy fused-back-pass rejection, per-sample priority timestep losses, flow-matching Sangoi loss rejection, TrainGPS schema/metric/group handling, DataRecorder schema, and deterministic LoRA key export.
+- Replaced editable remote Git requirements with PEP 508 direct URLs for uv, and moved CPU torch wheel selection into `uv pip --torch-backend cpu`.
+- Validation performed: local uv bootstrap passed, formal plan validation script passed with pre-commit, compileall, dependency imports, source-contract scans, and targeted Python smokes. Docker builds, cloud runs, CUDA validation, and rendered Tk UI inspection were not run.
+
 ## 2026-05-24 - SotA Sangoi loss and masked-gradient port
 
 - Ported the requested SotA training-impact items from `origin/SotA04022025+Mods` into `master-update`: dynamic Sangoi loss behavior and masked-training prediction-gradient suppression.

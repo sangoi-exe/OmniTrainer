@@ -52,11 +52,11 @@ class LossTracker:
 
 class DynamicLossControl:
     def __init__(
-            self,
-            use_ema: bool = False,
-            ema_decay: float = 0.9,
-            outlier_threshold: float = 3.0,
-            schedule_params: Mapping[str, Mapping[str, float]] | None = None,
+        self,
+        use_ema: bool = False,
+        ema_decay: float = 0.9,
+        outlier_threshold: float = 3.0,
+        schedule_params: Mapping[str, Mapping[str, float]] | None = None,
     ) -> None:
         self.use_ema = use_ema
         self.ema_decay = ema_decay
@@ -66,12 +66,12 @@ class DynamicLossControl:
         self.initialized = False
 
     def adjust_weights(
-            self,
-            mse_z: float,
-            mae_z: float,
-            log_cosh_z: float,
-            progress_fraction: float,
-            mutate_ema: bool = True,
+        self,
+        mse_z: float,
+        mae_z: float,
+        log_cosh_z: float,
+        progress_fraction: float,
+        mutate_ema: bool = True,
     ) -> tuple[float, float, float]:
         z_scores = {
             "mse": min(abs(mse_z), self.outlier_threshold),
@@ -92,10 +92,9 @@ class DynamicLossControl:
                 else:
                     alpha = 1.0 - self.ema_decay
                     for loss_name in self.ema_weights:
-                        self.ema_weights[loss_name] = (
-                            (1.0 - alpha) * self.ema_weights[loss_name]
-                            + alpha * base_weights[loss_name]
-                        )
+                        self.ema_weights[loss_name] = (1.0 - alpha) * self.ema_weights[
+                            loss_name
+                        ] + alpha * base_weights[loss_name]
 
             if self.initialized:
                 total_ema = max(sum(self.ema_weights.values()), 1e-8)
@@ -106,10 +105,7 @@ class DynamicLossControl:
             loss_name: params["start"] * (1.0 - progress_fraction) + params["end"] * progress_fraction
             for loss_name, params in self.schedule_params.items()
         }
-        weighted = {
-            loss_name: base_weights[loss_name] * scheduled_factors[loss_name]
-            for loss_name in base_weights
-        }
+        weighted = {loss_name: base_weights[loss_name] * scheduled_factors[loss_name] for loss_name in base_weights}
         total_weighted = max(sum(weighted.values()), 1e-8)
         final_weights = {loss_name: weight / total_weighted for loss_name, weight in weighted.items()}
 
@@ -117,7 +113,7 @@ class DynamicLossControl:
 
     @staticmethod
     def __initialize_schedule_params(
-            schedule_params: Mapping[str, Mapping[str, float]] | None,
+        schedule_params: Mapping[str, Mapping[str, float]] | None,
     ) -> dict[str, dict[str, float]]:
         defaults = {
             "mae": {"start": 0.6, "end": 0.0},

@@ -41,8 +41,8 @@ class ErnieModel(BaseModel):
     lora_state_dict: dict | None
 
     def __init__(
-            self,
-            model_type: ModelType,
+        self,
+        model_type: ModelType,
     ):
         super().__init__(
             model_type=model_type,
@@ -63,24 +63,32 @@ class ErnieModel(BaseModel):
         self.lora_state_dict = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
-        return [a for a in [
-            self.transformer_lora,
-        ] if a is not None]
+        return [
+            a
+            for a in [
+                self.transformer_lora,
+            ]
+            if a is not None
+        ]
 
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)
 
     def text_encoder_to(self, device: torch.device):
         if self.text_encoder is not None:
-            if self.text_encoder_offload_conductor is not None and \
-                    self.text_encoder_offload_conductor.layer_offload_activated():
+            if (
+                self.text_encoder_offload_conductor is not None
+                and self.text_encoder_offload_conductor.layer_offload_activated()
+            ):
                 self.text_encoder_offload_conductor.to(device)
             else:
                 self.text_encoder.to(device=device)
 
     def transformer_to(self, device: torch.device):
-        if self.transformer_offload_conductor is not None and \
-                self.transformer_offload_conductor.layer_offload_activated():
+        if (
+            self.transformer_offload_conductor is not None
+            and self.transformer_offload_conductor.layer_offload_activated()
+        ):
             self.transformer_offload_conductor.to(device)
         else:
             self.transformer.to(device=device)
@@ -109,15 +117,15 @@ class ErnieModel(BaseModel):
         )
 
     def encode_text(
-            self,
-            train_device: torch.device,
-            batch_size: int = 1,
-            rand: Random | None = None,
-            text: str | list[str] | None = None,
-            tokens: Tensor | None = None,
-            tokens_mask: Tensor | None = None,
-            text_encoder_dropout_probability: float | None = None,
-            text_encoder_output: Tensor | None = None,
+        self,
+        train_device: torch.device,
+        batch_size: int = 1,
+        rand: Random | None = None,
+        text: str | list[str] | None = None,
+        tokens: Tensor | None = None,
+        tokens_mask: Tensor | None = None,
+        text_encoder_dropout_probability: float | None = None,
+        text_encoder_output: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if tokens is None and text is not None:
             if isinstance(text, str):
@@ -125,19 +133,19 @@ class ErnieModel(BaseModel):
 
             tokenizer_output = self.tokenizer(
                 text,
-                padding='max_length',
+                padding="max_length",
                 max_length=PROMPT_MAX_LENGTH,
                 truncation=True,
-                return_tensors='pt',
+                return_tensors="pt",
                 add_special_tokens=True,
             )
             tokens = tokenizer_output.input_ids.to(self.text_encoder.device)
             tokens_mask = tokenizer_output.attention_mask.to(self.text_encoder.device)
 
         if text_encoder_output is None and self.text_encoder is not None:
-            #this is different from the diffusers pipeline.
-            #they accumulate the embeddings for each sample without padding or an attention mask. we use padded with an attention mask, because the dataloader pipeline does the same
-            #It has been tested that this is identical.
+            # this is different from the diffusers pipeline.
+            # they accumulate the embeddings for each sample without padding or an attention mask. we use padded with an attention mask, because the dataloader pipeline does the same
+            # It has been tested that this is identical.
             with self.text_encoder_autocast_context:
                 output = self.text_encoder(
                     tokens,
@@ -151,7 +159,7 @@ class ErnieModel(BaseModel):
             raise NotImplementedError  # needs empty-caption conditioning, not zero-out
 
         text_lengths = tokens_mask.sum(dim=1).long()
-        text_encoder_output = text_encoder_output[:, :text_lengths.max().item(), :]
+        text_encoder_output = text_encoder_output[:, : text_lengths.max().item(), :]
         return text_encoder_output, text_lengths
 
     @staticmethod
@@ -170,16 +178,16 @@ class ErnieModel(BaseModel):
 
     def scale_latents(self, latents: Tensor) -> Tensor:
         mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        std = torch.sqrt(
-            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
-        ).to(latents.device, latents.dtype)
+        std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+            latents.device, latents.dtype
+        )
         return (latents - mean) / std
 
     def unscale_latents(self, latents: Tensor) -> Tensor:
         mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        std = torch.sqrt(
-            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
-        ).to(latents.device, latents.dtype)
+        std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+            latents.device, latents.dtype
+        )
         return latents * std + mean
 
     def calculate_timestep_shift(self, latent_height: int, latent_width: int) -> float:

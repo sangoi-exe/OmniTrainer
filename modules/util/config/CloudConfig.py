@@ -28,7 +28,7 @@ class CloudSecretsConfig(BaseConfig):
         data.append(("host", "", str, False))
         data.append(("port", 0, str, False))
         data.append(("user", "root", str, False))
-        data.append(("key_file", "", str, False)) # whilst not a secret, makes more semantic sense here
+        data.append(("key_file", "", str, False))  # whilst not a secret, makes more semantic sense here
         data.append(("password", "", str, False))
         return CloudSecretsConfig(data)
 
@@ -52,8 +52,8 @@ class CloudSecretsConfig(BaseConfig):
 class CloudConfig(BaseConfig):
     enabled: bool
     type: CloudType
-    file_sync : CloudFileSync
-    create : bool
+    file_sync: CloudFileSync
+    create: bool
     name: str
     tensorboard_tunnel: bool
     sub_type: str
@@ -68,16 +68,15 @@ class CloudConfig(BaseConfig):
     install_cmd: str
     detach_trainer: bool
     run_id: str
-    download_sampels : bool
-    download_output_model : bool
-    download_saves : bool
-    download_backups : bool
-    download_tensorboard : bool
+    download_sampels: bool
+    download_output_model: bool
+    download_saves: bool
+    download_backups: bool
+    download_tensorboard: bool
     on_finish: CloudAction
     on_error: CloudAction
     on_detached_finish: CloudAction
     on_detached_error: CloudAction
-
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(data)
@@ -99,7 +98,7 @@ class CloudConfig(BaseConfig):
         data.append(("remote_dir", "/workspace", str, False))
         data.append(("huggingface_cache_dir", "/workspace/huggingface_cache", str, False))
         data.append(("onetrainer_dir", "/workspace/OneTrainer", str, False))
-        data.append(("install_cmd", "git clone https://github.com/Nerogar/OneTrainer", str, False))
+        data.append(("install_cmd", "", str, False))
         data.append(("install_onetrainer", True, bool, False))
         data.append(("update_onetrainer", True, bool, False))
         data.append(("detach_trainer", False, bool, False))

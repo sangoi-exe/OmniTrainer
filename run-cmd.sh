@@ -7,10 +7,10 @@ if [[ -z "${HF_HUB_DISABLE_XET+x}" ]]; then
     export HF_HUB_DISABLE_XET=1
 fi
 
-source "${BASH_SOURCE[0]%/*}/lib.include.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.include.sh"
 
 # Fetch and validate the name of the target script.
-if [[ -z "${1}" ]]; then
+if [[ -z "${1:-}" ]]; then
     print_error "You must provide the name of the script to execute, such as \"train\"."
     exit 1
 fi
