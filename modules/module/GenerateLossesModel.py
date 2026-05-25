@@ -10,6 +10,7 @@ from modules.util import create
 from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
+from modules.util.validation_timestep import validation_noise_seed
 
 import torch
 
@@ -94,7 +95,13 @@ class GenerateLossesModel:
         filename_loss_list: list[tuple[str, float]] = []
         # Don't really need a backward pass here, so we can make the calculation MUCH faster.
         with torch.inference_mode(), ProgressContext("Calculando losses", approximate_num_steps) as progress:
-            for batch in self.data_loader.get_data_loader():
+            for batch_index, batch in enumerate(self.data_loader.get_data_loader()):
+                batch["__validation_timestep_index__"] = batch_index
+                batch["__validation_timestep_count__"] = approximate_num_steps
+                batch["__validation_noise_seed__"] = validation_noise_seed(
+                    batch_index,
+                    self.config.validation_timestep_seed,
+                )
                 model_output_data = self.model_setup.predict(
                     self.model,
                     batch,

@@ -63,6 +63,7 @@ class SampleWindow(ctk.CTkToplevel):
         # get model specific defaults
         model_type = train_config.model_type
         self.sample = SampleConfig.default_values(model_type)
+        self.sample.from_train_config(train_config)
         self.ui_state = UIState(self, self.sample)
 
         if use_external_model:

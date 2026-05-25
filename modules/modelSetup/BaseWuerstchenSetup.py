@@ -118,6 +118,8 @@ class BaseWuerstchenSetup(
         quantize_layers(model.effnet_encoder, self.train_device, model.effnet_encoder_train_dtype, config)
         quantize_layers(model.prior_text_encoder, self.train_device, model.train_dtype, config)
         quantize_layers(model.prior_prior, self.train_device, model.prior_train_dtype, config)
+        self._set_attention_mechanism(model.decoder_decoder, config.attention_mechanism)
+        self._set_attention_mechanism(model.prior_prior, config.attention_mechanism)
 
     def _setup_embeddings(
         self,
@@ -217,7 +219,10 @@ class BaseWuerstchenSetup(
             elif model.model_type.is_stable_cascade():
                 scaled_latent_image = latent_image
 
-            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            if deterministic:
+                batch_seed = int(batch.get("__validation_noise_seed__", 0))
+            else:
+                batch_seed = train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -229,6 +234,8 @@ class BaseWuerstchenSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                validation_index=batch.get("__validation_timestep_index__"),
+                validation_count=batch.get("__validation_timestep_count__"),
             )
 
             if model.model_type.is_wuerstchen_v2():

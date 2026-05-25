@@ -12,6 +12,7 @@ from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.NoiseScheduler import NoiseScheduler
 from modules.util.enum.VideoFormat import VideoFormat
+from modules.util.image_util import load_image
 from modules.util.torch_util import torch_gc
 
 import torch
@@ -48,6 +49,7 @@ class Flux2Sampler(BaseModelSampler):
         diffusion_steps: int,
         cfg_scale: float,
         noise_scheduler: NoiseScheduler,
+        base_image_path: str = "",
         text_encoder_sequence_length: int | None = None,
         on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ) -> ModelSamplerOutput:
@@ -67,10 +69,36 @@ class Flux2Sampler(BaseModelSampler):
             num_latent_channels = 32
             patch_size = 2
 
+            batch_size = 2 if cfg_scale > 1.0 and not transformer.config.guidance_embeds else 1
+
+            if base_image_path:
+                conditioning_image = load_image(base_image_path, convert_mode="RGB")
+                conditioning_image = image_processor.preprocess(
+                    conditioning_image,
+                    height=self.quantize_resolution(
+                        conditioning_image.height, vae_scale_factor * patch_size, mode="floor"
+                    ),
+                    width=self.quantize_resolution(
+                        conditioning_image.width, vae_scale_factor * patch_size, mode="floor"
+                    ),
+                    resize_mode="crop",
+                )
+                self.model.vae_to(self.train_device)
+                conditioning_latents, conditioning_image_ids = self.pipeline.prepare_image_latents(
+                    [conditioning_image],
+                    batch_size,
+                    generator,
+                    self.train_device,
+                    vae.dtype,
+                )
+                self.model.vae_to(self.temp_device)
+            else:
+                conditioning_latents = None
+                conditioning_image_ids = None
+
             # prepare prompt
             self.model.text_encoder_to(self.train_device)
 
-            batch_size = 2 if cfg_scale > 1.0 and not transformer.config.guidance_embeds else 1
             prompt_embedding = self.model.encode_text(
                 text=[prompt, negative_prompt] if batch_size == 2 else prompt,
                 train_device=self.train_device,
@@ -89,7 +117,9 @@ class Flux2Sampler(BaseModelSampler):
             )
 
             latent_image = self.model.patchify_latents(latent_image)
-            image_ids = self.model.prepare_latent_image_ids(latent_image)
+            image_ids = torch.cat([self.model.prepare_latent_image_ids(latent_image)] * batch_size, dim=0)
+            if conditioning_image_ids is not None:
+                image_ids = torch.cat([image_ids, conditioning_image_ids], dim=1)
 
             latent_image = self.model.pack_latents(latent_image)
             image_seq_len = latent_image.shape[1]
@@ -116,7 +146,9 @@ class Flux2Sampler(BaseModelSampler):
             )
             for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
                 latent_model_input = torch.cat([latent_image] * batch_size)
-                expanded_timestep = timestep.expand(latent_model_input.shape[0])
+                if conditioning_latents is not None:
+                    latent_model_input = torch.cat([latent_model_input, conditioning_latents], dim=1)
+                expanded_timestep = timestep.expand(batch_size)
 
                 noise_pred = transformer(
                     hidden_states=latent_model_input.to(dtype=self.model.train_dtype.torch_dtype()),
@@ -127,7 +159,7 @@ class Flux2Sampler(BaseModelSampler):
                     img_ids=image_ids,
                     joint_attention_kwargs=None,
                     return_dict=True,
-                ).sample
+                ).sample[:, : latent_image.shape[1], :]
 
                 if batch_size == 2:
                     noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
@@ -173,6 +205,9 @@ class Flux2Sampler(BaseModelSampler):
         on_sample: Callable[[ModelSamplerOutput], None] = lambda _: None,
         on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ):
+        if sample_config.base_image_path and not sample_config.custom_conditioning_image:
+            raise ValueError("Flux2 base_image_path requires custom_conditioning_image")
+
         sampler_output = self.__sample_base(
             prompt=sample_config.prompt,
             negative_prompt=sample_config.negative_prompt,
@@ -183,6 +218,7 @@ class Flux2Sampler(BaseModelSampler):
             diffusion_steps=sample_config.diffusion_steps,
             cfg_scale=sample_config.cfg_scale,
             noise_scheduler=sample_config.noise_scheduler,
+            base_image_path=sample_config.base_image_path if sample_config.custom_conditioning_image else "",
             text_encoder_sequence_length=sample_config.text_encoder_1_sequence_length,
             on_update_progress=on_update_progress,
         )

@@ -183,6 +183,7 @@ class SampleConfig(BaseConfig):
     transformer_attention_mask: bool
     force_last_timestep: bool
 
+    custom_conditioning_image: bool
     sample_inpainting: bool
     base_image_path: str
     mask_image_path: str
@@ -199,6 +200,8 @@ class SampleConfig(BaseConfig):
         self.text_encoder_4_layer_skip = train_config.text_encoder_4_layer_skip
         self.transformer_attention_mask = train_config.transformer.attention_mask
         self.force_last_timestep = train_config.rescale_noise_scheduler_to_zero_terminal_snr
+        self.custom_conditioning_image = train_config.custom_conditioning_image
+        return self
 
     @staticmethod
     def default_values(model_type=None):
@@ -227,6 +230,7 @@ class SampleConfig(BaseConfig):
         data.append(("transformer_attention_mask", False, bool, False))
         data.append(("force_last_timestep", False, bool, False))
 
+        data.append(("custom_conditioning_image", False, bool, False))
         data.append(("sample_inpainting", False, bool, False))
         data.append(("base_image_path", "", str, False))
         data.append(("mask_image_path", "", str, False))

@@ -1,6 +1,11 @@
 from modules.util.convert.lora.convert_clip import map_clip
 from modules.util.convert.lora.convert_llama import map_llama
-from modules.util.convert.lora.convert_lora_util import LoraConversionKeySet, map_prefix_range
+from modules.util.convert.lora.convert_lora_util import LoraConversionKeySet, convert_to_omi, map_prefix_range
+from modules.util.convert_util import convert as convert_util
+from modules.util.convert_util import lora_qkv_fusion, lora_qkv_mlp_fusion
+
+import torch
+from torch import Tensor
 
 
 def __map_token_refiner_block(key_prefix: LoraConversionKeySet) -> list[LoraConversionKeySet]:
@@ -121,3 +126,78 @@ def convert_hunyuan_video_lora_key_sets() -> list[LoraConversionKeySet]:
     keys += map_clip(LoraConversionKeySet("clip_l", "lora_te2"))
 
     return keys
+
+
+_COMFYUI_QKV_SPLIT_ATTRS = ("linear1", "img_attn_qkv", "txt_attn_qkv")
+_LORA_SUFFIXES = (".lora_down.weight", ".lora_up.weight", ".lora_A.weight", ".lora_B.weight", ".alpha", ".dora_scale")
+
+_COMFYUI_BLOCK_PATTERNS = [
+    (
+        "transformer.double_blocks.{i}",
+        "transformer.double_blocks.{i}",
+        lora_qkv_fusion("img_attn_qkv.0", "img_attn_qkv.1", "img_attn_qkv.2", "img_attn_qkv")
+        + lora_qkv_fusion("txt_attn_qkv.0", "txt_attn_qkv.1", "txt_attn_qkv.2", "txt_attn_qkv")
+        + [
+            ("img_attn_proj", "img_attn_proj"),
+            ("img_mlp.fc0", "img_mlp.fc1"),
+            ("img_mlp.fc2", "img_mlp.fc2"),
+            ("img_mod.linear", "img_mod.linear"),
+            ("txt_attn_proj", "txt_attn_proj"),
+            ("txt_mlp.fc0", "txt_mlp.fc1"),
+            ("txt_mlp.fc2", "txt_mlp.fc2"),
+            ("txt_mod.linear", "txt_mod.linear"),
+        ],
+    ),
+    (
+        "transformer.single_blocks.{i}",
+        "transformer.single_blocks.{i}",
+        lora_qkv_mlp_fusion("linear1.0", "linear1.1", "linear1.2", "linear1.3", "linear1")
+        + [
+            ("linear2", "linear2"),
+            ("modulation.linear", "modulation.linear"),
+        ],
+    ),
+]
+
+
+def convert_hunyuan_video_lora_to_comfyui(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    omi_state_dict = convert_to_omi(state_dict, convert_hunyuan_video_lora_key_sets())
+    block_state_dict = {
+        key: value
+        for key, value in omi_state_dict.items()
+        if ".double_blocks." in key or ".single_blocks." in key
+    }
+
+    dora_scales = {key: value for key, value in block_state_dict.items() if key.endswith(".dora_scale")}
+    main_state_dict = {key: value for key, value in block_state_dict.items() if not key.endswith(".dora_scale")}
+    converted_state_dict: dict[str, Tensor] = convert_util(main_state_dict, _COMFYUI_BLOCK_PATTERNS, strict=False)
+
+    qkv_dora_scales: dict[str, dict[int, Tensor]] = {}
+    for key, value in dora_scales.items():
+        matched_qkv_attr = False
+        for attr in _COMFYUI_QKV_SPLIT_ATTRS:
+            pattern = f".{attr}."
+            if pattern not in key:
+                continue
+
+            pattern_position = key.index(pattern)
+            index_start = pattern_position + len(pattern)
+            index_end = key.index(".", index_start)
+            base_key = key[: pattern_position + len(pattern) - 1]
+            component_index = int(key[index_start:index_end])
+            qkv_dora_scales.setdefault(base_key, {})[component_index] = value
+            matched_qkv_attr = True
+            break
+
+        if not matched_qkv_attr:
+            key = key.replace(".img_mlp.fc0.", ".img_mlp.fc1.")
+            key = key.replace(".txt_mlp.fc0.", ".txt_mlp.fc1.")
+            converted_state_dict[key] = value
+
+    for base_key, components in qkv_dora_scales.items():
+        converted_state_dict[f"{base_key}.dora_scale"] = torch.cat(
+            [components[index] for index in sorted(components.keys())],
+            dim=0,
+        )
+
+    return converted_state_dict

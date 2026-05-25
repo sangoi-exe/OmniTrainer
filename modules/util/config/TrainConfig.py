@@ -9,6 +9,7 @@ from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
@@ -28,10 +29,12 @@ from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainGPSPenaltyMetric import TrainGPSPenaltyMetric
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.enum.ValidationTimestepMode import ValidationTimestepMode
 from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
+from modules.util.validation_timestep import parse_validation_timestep_values
 
 
 class TrainOptimizerConfig(BaseConfig):
@@ -361,6 +364,12 @@ class TrainConfig(BaseConfig):
     validation: bool
     validate_after: float
     validate_after_unit: TimeUnit
+    tensorboard_resume_run: bool
+    patience: bool
+    patience_epochs: int
+    validation_timestep_mode: ValidationTimestepMode
+    validation_timestep_values: str
+    validation_timestep_seed: int
     continue_last_backup: bool
     prevent_overwrites: bool
     include_train_config: ConfigPart
@@ -421,6 +430,7 @@ class TrainConfig(BaseConfig):
     aspect_ratio_bucketing: bool
     latent_caching: bool
     clear_cache_before_training: bool
+    prefetch_next_batch: bool
 
     # training settings
     learning_rate_scheduler: LearningRateScheduler
@@ -447,6 +457,7 @@ class TrainConfig(BaseConfig):
     only_cache: bool
     resolution: str
     frames: str
+    attention_mechanism: AttentionMechanism
     loss_mode_fn: LossMode
     mse_strength: float
     mae_strength: float
@@ -470,6 +481,11 @@ class TrainConfig(BaseConfig):
     offset_noise_weight: float
     generalized_offset_noise: bool
     perturbation_noise_weight: float
+    k_noise_sampling: int
+    cep_enabled: bool
+    cep_gamma: float
+    ciop_noise_weight: float
+    ciop_p: float
     rescale_noise_scheduler_to_zero_terminal_snr: bool
     force_v_prediction: bool
     force_epsilon_prediction: bool
@@ -552,10 +568,26 @@ class TrainConfig(BaseConfig):
     lora_decompose_output_axis: bool
     lora_weight_dtype: DataType
     bundle_additional_embeddings: bool
+    lora_te_scale: float
+    lora_unet_scale: float
 
     # oft
     oft_block_size: int
+    oft_coft: bool
+    coft_eps: float
     oft_block_share: bool
+    scaled_oft: bool
+    dora_oft: bool
+
+    # lokr
+    lokr_dim: int
+    lokr_decompose_both: bool
+    lokr_decompose_factor: int
+    lokr_use_tucker: bool
+    lokr_weight_decompose: bool
+    lokr_dora_on_output: bool
+    lokr_full_matrix: bool
+    lokr_vec_trick: bool
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -820,6 +852,179 @@ class TrainConfig(BaseConfig):
 
         return migrated_data
 
+    @staticmethod
+    def __known_config_keys(config: BaseConfig) -> set[str]:
+        return set(config.types.keys()) | {"__version"}
+
+    @classmethod
+    def __reject_unknown_keys(cls, data: dict, config: BaseConfig, path: str = "TrainConfig"):
+        unknown = sorted(set(data.keys()) - cls.__known_config_keys(config))
+        if unknown:
+            raise ValueError(f"Unknown {path} field(s): {', '.join(unknown)}")
+
+        for name, field_type in config.types.items():
+            if name not in data:
+                continue
+
+            value = data[name]
+            default_value = getattr(config, name)
+            if isinstance(default_value, BaseConfig):
+                if not isinstance(value, dict):
+                    raise ValueError(f"{path}.{name} must be an object")
+                cls.__reject_unknown_keys(value, default_value, f"{path}.{name}")
+            elif field_type is list and name in {"concepts", "samples", "additional_embeddings"} and value is not None:
+                if not isinstance(value, list):
+                    raise ValueError(f"{path}.{name} must be a list")
+
+    @classmethod
+    def __migrated_input(cls, data: dict) -> dict:
+        config = cls.default_values()
+        migrated_data = deepcopy(data)
+        version = migrated_data.get("__version", 0)
+        while version in config.config_migrations:
+            migrated_data = config.config_migrations[version](migrated_data)
+            version += 1
+        return migrated_data
+
+    @staticmethod
+    def __require_enum_value(enum_type, value: Any, field_name: str):
+        if isinstance(value, enum_type):
+            return
+        if isinstance(value, str):
+            try:
+                enum_type[value]
+            except KeyError as exc:
+                raise ValueError(f"Invalid {field_name}: {value}") from exc
+            return
+        raise ValueError(f"Invalid {field_name}: {value}")
+
+    @staticmethod
+    def __require_bool(value: Any, field_name: str):
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+
+    @staticmethod
+    def __require_int(value: Any, field_name: str):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name} must be an integer")
+
+    @staticmethod
+    def __require_float(value: Any, field_name: str):
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"{field_name} must be a number")
+
+    @staticmethod
+    def __require_str(value: Any, field_name: str):
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+
+    def __validate_raw_dict(self, data: dict):
+        migrated_data = self.__migrated_input(data)
+        self.__reject_unknown_keys(migrated_data, self)
+
+        for field_name, enum_type in [
+            ("model_type", ModelType),
+            ("training_method", TrainingMethod),
+            ("timestep_distribution", TimestepDistribution),
+            ("validation_timestep_mode", ValidationTimestepMode),
+            ("attention_mechanism", AttentionMechanism),
+            ("peft_type", PeftType),
+        ]:
+            if field_name in migrated_data:
+                self.__require_enum_value(enum_type, migrated_data[field_name], field_name)
+
+        strict_fields = {
+            "tensorboard_resume_run": self.__require_bool,
+            "patience": self.__require_bool,
+            "patience_epochs": self.__require_int,
+            "validation_timestep_values": self.__require_str,
+            "validation_timestep_seed": self.__require_int,
+            "prefetch_next_batch": self.__require_bool,
+            "k_noise_sampling": self.__require_int,
+            "cep_enabled": self.__require_bool,
+            "cep_gamma": self.__require_float,
+            "ciop_noise_weight": self.__require_float,
+            "ciop_p": self.__require_float,
+            "lora_te_scale": self.__require_float,
+            "lora_unet_scale": self.__require_float,
+            "scaled_oft": self.__require_bool,
+            "dora_oft": self.__require_bool,
+            "oft_coft": self.__require_bool,
+            "coft_eps": self.__require_float,
+            "lokr_dim": self.__require_int,
+            "lokr_decompose_both": self.__require_bool,
+            "lokr_decompose_factor": self.__require_int,
+            "lokr_use_tucker": self.__require_bool,
+            "lokr_weight_decompose": self.__require_bool,
+            "lokr_dora_on_output": self.__require_bool,
+            "lokr_full_matrix": self.__require_bool,
+            "lokr_vec_trick": self.__require_bool,
+        }
+        for field_name, validator in strict_fields.items():
+            if field_name in migrated_data:
+                validator(migrated_data[field_name], field_name)
+
+        if "validation_timestep_values" in migrated_data:
+            parse_validation_timestep_values(migrated_data["validation_timestep_values"])
+
+    def from_dict(self, data: dict) -> "TrainConfig":
+        self.__validate_raw_dict(data)
+        super().from_dict(data)
+        self.validate_for_training()
+        return self
+
+    def validate_for_training(self):
+        if self.patience and not self.validation:
+            raise ValueError("patience requires validation")
+        if self.patience_epochs < 1:
+            raise ValueError("patience_epochs must be at least 1")
+
+        if self.validation_timestep_mode != ValidationTimestepMode.AUTO:
+            parse_validation_timestep_values(self.validation_timestep_values)
+        if self.validation_timestep_seed < 0:
+            raise ValueError("validation_timestep_seed must be non-negative")
+
+        if self.prefetch_next_batch:
+            if not self.latent_caching:
+                raise ValueError("prefetch_next_batch requires latent_caching")
+            if self.only_cache:
+                raise ValueError("prefetch_next_batch is not supported while only_cache is enabled")
+            if self.train_text_encoder_or_embedding():
+                raise ValueError("prefetch_next_batch requires fully cached text encoder inputs")
+
+        if self.k_noise_sampling < 1:
+            raise ValueError("k_noise_sampling must be at least 1")
+        if self.cep_gamma < 0:
+            raise ValueError("cep_gamma must be non-negative")
+        if self.ciop_noise_weight < 0:
+            raise ValueError("ciop_noise_weight must be non-negative")
+        if self.ciop_p < 0 or self.ciop_p > 1:
+            raise ValueError("ciop_p must be between 0 and 1")
+
+        if self.lokr_dim < 1:
+            raise ValueError("lokr_dim must be at least 1")
+        if self.oft_block_size < 1:
+            raise ValueError("oft_block_size must be at least 1")
+        if self.coft_eps <= 0:
+            raise ValueError("coft_eps must be positive")
+        if self.lokr_decompose_factor < -1 or self.lokr_decompose_factor == 0:
+            raise ValueError("lokr_decompose_factor must be -1 or a positive integer")
+        if self.lora_te_scale < 0 or self.lora_unet_scale < 0:
+            raise ValueError("lora_te_scale and lora_unet_scale must be non-negative")
+        if self.timestep_distribution == TimestepDistribution.BETA and (
+            self.noising_weight < 0 or self.noising_bias < 0
+        ):
+            raise ValueError("BETA timestep distribution requires non-negative noising_weight and noising_bias")
+
+        if self.model_type == ModelType.FLUX_2 and self.text_encoder.dropout_probability > 0:
+            raise ValueError("Flux2 text_encoder.dropout_probability is not supported")
+
+        if self.model_type.is_flow_matching() and self.timestep_distribution in [
+            TimestepDistribution.BETA,
+            TimestepDistribution.SPEED,
+        ]:
+            raise ValueError(f"{self.timestep_distribution} timestep distribution is only supported for diffusion models")
+
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
             self.train_dtype,
@@ -991,6 +1196,12 @@ class TrainConfig(BaseConfig):
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
+        data.append(("tensorboard_resume_run", True, bool, False))
+        data.append(("patience", False, bool, False))
+        data.append(("patience_epochs", 5, int, False))
+        data.append(("validation_timestep_mode", ValidationTimestepMode.AUTO, ValidationTimestepMode, False))
+        data.append(("validation_timestep_values", "500", str, False))
+        data.append(("validation_timestep_seed", 0, int, False))
         data.append(("continue_last_backup", False, bool, False))
         data.append(("prevent_overwrites", False, bool, False))
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
@@ -1053,6 +1264,7 @@ class TrainConfig(BaseConfig):
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", True, bool, False))
+        data.append(("prefetch_next_batch", False, bool, False))
 
         # training settings
         data.append(("learning_rate_scheduler", LearningRateScheduler.CONSTANT, LearningRateScheduler, False))
@@ -1077,6 +1289,7 @@ class TrainConfig(BaseConfig):
         data.append(("only_cache", False, bool, False))
         data.append(("resolution", "512", str, False))
         data.append(("frames", "25", str, False))
+        data.append(("attention_mechanism", AttentionMechanism.SDP, AttentionMechanism, False))
         data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
@@ -1095,6 +1308,11 @@ class TrainConfig(BaseConfig):
         data.append(("offset_noise_weight", 0.0, float, False))
         data.append(("generalized_offset_noise", False, bool, False))
         data.append(("perturbation_noise_weight", 0.0, float, False))
+        data.append(("k_noise_sampling", 1, int, False))
+        data.append(("cep_enabled", False, bool, False))
+        data.append(("cep_gamma", 1.0, float, False))
+        data.append(("ciop_noise_weight", 0.0, float, False))
+        data.append(("ciop_p", 0.8, float, False))
         data.append(("rescale_noise_scheduler_to_zero_terminal_snr", False, bool, False))
         data.append(("force_v_prediction", False, bool, False))
         data.append(("force_epsilon_prediction", False, bool, False))
@@ -1227,10 +1445,26 @@ class TrainConfig(BaseConfig):
         data.append(("lora_decompose_output_axis", False, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("bundle_additional_embeddings", True, bool, False))
+        data.append(("lora_te_scale", 1.0, float, False))
+        data.append(("lora_unet_scale", 1.0, float, False))
 
         # oft
         data.append(("oft_block_size", 32, int, False))
+        data.append(("oft_coft", False, bool, False))
+        data.append(("coft_eps", 1e-4, float, False))
         data.append(("oft_block_share", False, bool, False))
+        data.append(("scaled_oft", False, bool, False))
+        data.append(("dora_oft", False, bool, False))
+
+        # lokr
+        data.append(("lokr_dim", 16, int, False))
+        data.append(("lokr_decompose_both", False, bool, False))
+        data.append(("lokr_decompose_factor", -1, int, False))
+        data.append(("lokr_use_tucker", False, bool, False))
+        data.append(("lokr_weight_decompose", False, bool, False))
+        data.append(("lokr_dora_on_output", True, bool, False))
+        data.append(("lokr_full_matrix", False, bool, False))
+        data.append(("lokr_vec_trick", True, bool, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))

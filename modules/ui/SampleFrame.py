@@ -25,6 +25,7 @@ class SampleFrame(ctk.CTkFrame):
 
         is_flow_matching = model_type.is_flow_matching()
         is_inpainting_model = model_type.has_conditioning_image_input()
+        uses_base_image = is_inpainting_model or (model_type.is_flux_2() and sample.custom_conditioning_image)
         is_video_model = model_type.is_video_model()
 
         if include_prompt and include_prompt:
@@ -120,22 +121,18 @@ class SampleFrame(ctk.CTkFrame):
             components.label(bottom_frame, 4, 0, "steps:")
             components.entry(bottom_frame, 4, 1, self.ui_state, "diffusion_steps")
 
-            # inpainting
-            if is_inpainting_model:
+            if uses_base_image:
+                # base image path
                 components.label(
                     bottom_frame,
                     5,
                     0,
-                    "inpainting:",
-                    tooltip="Enables inpainting sampling. Only available when sampling from an inpainting model.",
+                    "base image path:",
+                    tooltip="The base image used when inpainting or as the Flux 2 reference image.",
                 )
-                components.switch(bottom_frame, 5, 1, self.ui_state, "sample_inpainting")
-
-                # base image path
-                components.label(bottom_frame, 6, 0, "base image path:", tooltip="The base image used when inpainting.")
                 components.path_entry(
                     bottom_frame,
-                    6,
+                    5,
                     1,
                     self.ui_state,
                     "base_image_path",
@@ -143,6 +140,17 @@ class SampleFrame(ctk.CTkFrame):
                     allow_model_files=False,
                     allow_image_files=True,
                 )
+
+            # inpainting
+            if is_inpainting_model:
+                components.label(
+                    bottom_frame,
+                    6,
+                    0,
+                    "inpainting:",
+                    tooltip="Enables inpainting sampling. Only available when sampling from an inpainting model.",
+                )
+                components.switch(bottom_frame, 6, 1, self.ui_state, "sample_inpainting")
 
                 # mask image path
                 components.label(bottom_frame, 6, 2, "mask image path:", tooltip="The mask used when inpainting.")

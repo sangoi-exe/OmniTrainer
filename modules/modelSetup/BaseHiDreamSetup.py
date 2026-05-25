@@ -112,6 +112,7 @@ class BaseHiDreamSetup(
         quantize_layers(model.text_encoder_4, self.train_device, model.train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.transformer_train_dtype, config)
+        self._set_attention_mechanism(model.transformer, config.attention_mechanism)
 
     def _setup_embeddings(
         self,
@@ -311,7 +312,10 @@ class BaseHiDreamSetup(
         deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step
+            if deterministic:
+                batch_seed = int(batch.get("__validation_noise_seed__", 0))
+            else:
+                batch_seed = train_progress.global_step
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -378,6 +382,8 @@ class BaseHiDreamSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                validation_index=batch.get("__validation_timestep_index__"),
+                validation_count=batch.get("__validation_timestep_count__"),
             )
 
             scaled_noisy_latent_image, sigma = self._add_noise_discrete(

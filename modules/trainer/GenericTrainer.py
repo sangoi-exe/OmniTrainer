@@ -1,12 +1,15 @@
 import contextlib
 import copy
+import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +30,7 @@ from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.dataset_fingerprint import compute_concept_fingerprint, normalize_config_for_fingerprint
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.EMAMode import EMAMode
@@ -35,10 +39,12 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.PrefetchIterator import PrefetchIterator
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
+from modules.util.validation_timestep import validation_noise_seed
 
 import torch
 from torch import Tensor, nn
@@ -48,8 +54,16 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
+import numpy as np
 from requests.exceptions import ConnectionError
 from tqdm import tqdm
+
+
+@dataclass(frozen=True)
+class ValidationMetrics:
+    average_loss_per_concept: dict[int, float]
+    label_by_concept_seed: dict[int, str]
+    total_average_loss: float
 
 
 class GenericTrainer(BaseTrainer):
@@ -81,9 +95,6 @@ class GenericTrainer(BaseTrainer):
         if multi.is_master():
             tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
             os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
-            self.tensorboard = SummaryWriter(
-                os.path.join(tensorboard_log_dir, f"{config.save_filename_prefix}{get_string_timestamp()}")
-            )
             if config.tensorboard and not config.tensorboard_always_on:
                 super()._start_tensorboard()
 
@@ -93,6 +104,13 @@ class GenericTrainer(BaseTrainer):
         self.recorder = DataRecorder() if multi.is_master() and config.data_recorder else None
         self.is_paused = False
         self.pause_requested_at_epoch_end = False
+        self._patience_counter = 0
+        self._patience_best_loss = float("inf")
+        self._patience_best_step = -1
+        self._patience_best_state_path: str | None = None
+        self._active_has_gradient = False
+        self._active_accumulated_loss: Tensor | None = None
+        self._active_scaler = None
 
     @staticmethod
     def stop_grad_outside_mask(tensor: torch.Tensor, mask: torch.Tensor) -> None:
@@ -138,6 +156,8 @@ class GenericTrainer(BaseTrainer):
         return prepared_mask
 
     def start(self):
+        self.config.validate_for_training()
+
         if multi.is_master():
             self.__save_config_to_workspace()
 
@@ -192,7 +212,9 @@ class GenericTrainer(BaseTrainer):
             quantization=self.config.quantization,
         )
         self.model.train_config = self.config
-        self.model.tensorboard = self.tensorboard if multi.is_master() else None
+        if multi.is_master():
+            self.__init_tensorboard_writer()
+            self.model.tensorboard = self.tensorboard
 
         self.callbacks.on_update_status("running model setup")
 
@@ -218,6 +240,25 @@ class GenericTrainer(BaseTrainer):
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
+
+    def __init_tensorboard_writer(self):
+        tensorboard_log_dir = os.path.join(self.config.workspace_dir, "tensorboard")
+        os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
+
+        resumed_subdir = self.model.resumed_tensorboard_subdir if self.config.tensorboard_resume_run else None
+        if resumed_subdir is not None:
+            resumed_path = os.path.join(tensorboard_log_dir, resumed_subdir)
+            if os.path.isdir(resumed_path):
+                self.model.tensorboard_subdir = resumed_subdir
+                self.tensorboard = SummaryWriter(
+                    resumed_path,
+                    purge_step=self.model.train_progress.global_step,
+                )
+                return
+
+        tensorboard_subdir = f"{self.config.save_filename_prefix}{get_string_timestamp()}"
+        self.model.tensorboard_subdir = tensorboard_subdir
+        self.tensorboard = SummaryWriter(os.path.join(tensorboard_log_dir, tensorboard_subdir))
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -411,82 +452,171 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
-    def __validate(self, train_progress: TrainProgress):
-        if self.__needs_validate(train_progress):
-            self.validation_data_loader.get_data_set().start_next_epoch()
-            current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+    @staticmethod
+    def __build_validation_metrics(
+        accumulated_loss_per_concept: dict[int, float],
+        concept_counts: dict[int, int],
+        label_by_concept_seed: dict[int, str],
+    ) -> ValidationMetrics:
+        if not concept_counts:
+            raise ValueError("validation metrics require at least one validation batch")
 
-            if current_epoch_length_validation == 0:
-                return
+        average_loss_per_concept = {
+            concept_seed: accumulated_loss_per_concept[concept_seed] / concept_counts[concept_seed]
+            for concept_seed in concept_counts
+        }
+        total_loss = sum(accumulated_loss_per_concept[concept_seed] for concept_seed in concept_counts)
+        total_count = sum(concept_counts.values())
 
-            self.callbacks.on_update_status("Calculating validation loss")
-            self.model_setup.setup_train_device(self.model, self.config)
+        return ValidationMetrics(
+            average_loss_per_concept=average_loss_per_concept,
+            label_by_concept_seed=label_by_concept_seed,
+            total_average_loss=total_loss / total_count,
+        )
 
-            torch_gc()
-
-            step_tqdm_validation = tqdm(
-                self.validation_data_loader.get_data_loader(),
-                desc="validation_step",
-                total=current_epoch_length_validation,
+    def __write_validation_metrics(self, metrics: ValidationMetrics, train_progress: TrainProgress):
+        for concept_seed, average_loss in metrics.average_loss_per_concept.items():
+            self.tensorboard.add_scalar(
+                f"loss/validation_step/{metrics.label_by_concept_seed[concept_seed]}",
+                average_loss,
+                train_progress.global_step,
             )
 
-            accumulated_loss_per_concept = {}
-            concept_counts = {}
-            mapping_seed_to_label = {}
-            mapping_label_to_seed = {}
+        self.tensorboard.add_scalar(
+            "loss/validation_step/total_average",
+            metrics.total_average_loss,
+            train_progress.global_step,
+        )
 
-            for validation_batch in step_tqdm_validation:
-                if self.__needs_gc(train_progress):
-                    torch_gc()
+    def __validate(self, train_progress: TrainProgress) -> ValidationMetrics | None:
+        if not self.__needs_validate(train_progress):
+            return None
 
-                with torch.no_grad():
-                    model_output_data = self.model_setup.predict(
-                        self.model, validation_batch, self.config, train_progress, deterministic=True
-                    )
-                    loss_validation = self.model_setup.calculate_loss(
-                        self.model, validation_batch, model_output_data, self.config
-                    )
+        metrics = self.__calculate_validation_metrics(train_progress)
+        if metrics is None:
+            return None
 
-                # since validation batch size = 1
-                concept_name = validation_batch["concept_name"][0]
-                concept_path = validation_batch["concept_path"][0]
-                concept_seed = validation_batch["concept_seed"].item()
-                loss = loss_validation.item()
+        self.__write_validation_metrics(metrics, train_progress)
+        if self.config.patience:
+            self.__update_patience(metrics.total_average_loss, train_progress)
 
-                label = concept_name if concept_name else os.path.basename(concept_path)
-                # check and fix collision to display both graphs in tensorboard
-                if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
-                    suffix = 1
+        return metrics
+
+    def __calculate_validation_metrics(self, train_progress: TrainProgress) -> ValidationMetrics | None:
+        self.validation_data_loader.get_data_set().start_next_epoch()
+        current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+
+        if current_epoch_length_validation == 0:
+            if self.config.patience:
+                raise ValueError("patience requires at least one validation batch")
+            return None
+
+        self.callbacks.on_update_status("Calculating validation loss")
+        self.model_setup.setup_train_device(self.model, self.config)
+
+        torch_gc()
+
+        step_tqdm_validation = tqdm(
+            self.validation_data_loader.get_data_loader(),
+            desc="validation_step",
+            total=current_epoch_length_validation,
+        )
+
+        accumulated_loss_per_concept = {}
+        concept_counts = {}
+        mapping_seed_to_label = {}
+        mapping_label_to_seed = {}
+
+        for validation_index, validation_batch in enumerate(step_tqdm_validation):
+            if self.__needs_gc(train_progress):
+                torch_gc()
+
+            validation_batch["__validation_timestep_index__"] = validation_index
+            validation_batch["__validation_timestep_count__"] = current_epoch_length_validation
+            validation_batch["__validation_noise_seed__"] = validation_noise_seed(
+                validation_index,
+                self.config.validation_timestep_seed,
+            )
+
+            with torch.no_grad():
+                model_output_data = self.model_setup.predict(
+                    self.model, validation_batch, self.config, train_progress, deterministic=True
+                )
+                loss_validation = self.model_setup.calculate_loss(
+                    self.model, validation_batch, model_output_data, self.config
+                )
+
+            # since validation batch size = 1
+            concept_name = validation_batch["concept_name"][0]
+            concept_path = validation_batch["concept_path"][0]
+            concept_seed = validation_batch["concept_seed"].item()
+            loss = loss_validation.item()
+
+            label = concept_name if concept_name else os.path.basename(concept_path)
+            # check and fix collision to display both graphs in tensorboard
+            if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
+                suffix = 1
+                new_label = f"{label}({suffix})"
+                while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
+                    suffix += 1
                     new_label = f"{label}({suffix})"
-                    while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
-                        suffix += 1
-                        new_label = f"{label}({suffix})"
-                    label = new_label
+                label = new_label
 
-                if concept_seed not in mapping_seed_to_label:
-                    mapping_seed_to_label[concept_seed] = label
-                    mapping_label_to_seed[label] = concept_seed
+            if concept_seed not in mapping_seed_to_label:
+                mapping_seed_to_label[concept_seed] = label
+                mapping_label_to_seed[label] = concept_seed
 
-                accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
-                concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
+            accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
+            concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
 
-            for concept_seed, total_loss in accumulated_loss_per_concept.items():
-                average_loss = total_loss / concept_counts[concept_seed]
+        return self.__build_validation_metrics(
+            accumulated_loss_per_concept,
+            concept_counts,
+            mapping_seed_to_label,
+        )
 
-                self.tensorboard.add_scalar(
-                    f"loss/validation_step/{mapping_seed_to_label[concept_seed]}",
-                    average_loss,
-                    train_progress.global_step,
-                )
+    def __update_patience(self, validation_loss: float, train_progress: TrainProgress):
+        if validation_loss < self._patience_best_loss:
+            self._patience_best_loss = validation_loss
+            self._patience_best_step = train_progress.global_step
+            self._patience_counter = 0
+            self._patience_best_state_path = self.__save_patience_best_state(train_progress)
+        else:
+            self._patience_counter += 1
 
-            if len(concept_counts) > 1:
-                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
-                total_count = sum(concept_counts[key] for key in concept_counts)
-                total_average_loss = total_loss / total_count
+        self.tensorboard.add_scalar("patience/counter", self._patience_counter, train_progress.global_step)
+        self.tensorboard.add_scalar("patience/best_validation_loss", self._patience_best_loss, train_progress.global_step)
 
-                self.tensorboard.add_scalar(
-                    "loss/validation_step/total_average", total_average_loss, train_progress.global_step
-                )
+        if self._patience_counter >= self.config.patience_epochs:
+            self.__restore_patience_best_state()
+            print(
+                f"Patience stopped training at step {train_progress.global_step}; "
+                f"restored step {self._patience_best_step} from {self._patience_best_state_path}."
+            )
+            self.commands.stop()
+
+    def __save_patience_best_state(self, train_progress: TrainProgress) -> str:
+        best_state_dir = os.path.join(self.config.workspace_dir, "backup", "patience-best")
+        os.makedirs(best_state_dir, exist_ok=True)
+        best_state_path = os.path.join(best_state_dir, "parameters.pt")
+        torch.save(
+            {
+                "global_step": train_progress.global_step,
+                "parameters": [parameter.detach().cpu().clone() for parameter in self.parameters],
+            },
+            best_state_path,
+        )
+        return best_state_path
+
+    def __restore_patience_best_state(self):
+        if self._patience_best_state_path is None:
+            raise ValueError("patience best state is missing")
+        state = torch.load(self._patience_best_state_path, weights_only=True)
+        saved_parameters = state["parameters"]
+        if len(saved_parameters) != len(self.parameters):
+            raise ValueError("patience best state parameter count does not match current model")
+        for parameter, saved_parameter in zip(self.parameters, saved_parameters, strict=True):
+            parameter.data.copy_(saved_parameter.to(device=parameter.device, dtype=parameter.dtype))
 
     def __save_backup_config(self, backup_path):
         config_path = os.path.join(backup_path, "onetrainer_config")
@@ -502,6 +632,99 @@ class GenericTrainer(BaseTrainer):
             shutil.copy2(self.config.concept_file_name, concepts_path)
         if os.path.isfile(self.config.sample_definition_file_name):
             shutil.copy2(self.config.sample_definition_file_name, samples_path)
+
+    def __resume_config_fingerprint(self) -> str:
+        concept_fingerprint, concept_count = compute_concept_fingerprint(
+            self.config.concepts,
+            self.config.concept_file_name,
+        )
+        payload = {
+            "config": normalize_config_for_fingerprint(self.config.to_settings_dict(secrets=False)),
+            "concept_count": concept_count,
+            "concept_fingerprint": concept_fingerprint,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def __can_prefetch_next_batch(self) -> bool:
+        return (
+            self.config.prefetch_next_batch
+            and self.config.latent_caching
+            and not self.config.only_cache
+            and not self.config.train_text_encoder_or_embedding()
+        )
+
+    def __stage_accumulator_state(self, train_progress: TrainProgress):
+        if not self._active_has_gradient:
+            self.model.accumulator_state = None
+            return
+
+        gradients = {}
+        for name, parameter in self.model.parameters.iter_named_parameters():
+            if parameter.grad is not None:
+                gradients[name] = parameter.grad.detach().cpu().clone()
+
+        if not gradients:
+            self.model.accumulator_state = None
+            return
+
+        self.model.accumulator_state = {
+            "accumulated_loss": float(self._active_accumulated_loss.detach().cpu().item())
+            if self._active_accumulated_loss is not None
+            else 0.0,
+            "config_fingerprint": self.__resume_config_fingerprint(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "global_step": train_progress.global_step,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+            "gradients": gradients,
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+            "scaler_state": self._active_scaler.state_dict() if self._active_scaler is not None else None,
+            "torch_rng_state": torch.get_rng_state(),
+        }
+
+    def __restore_accumulator_state(
+        self,
+        accumulated_loss: Tensor,
+        train_device: torch.device,
+        scaler,
+        train_progress: TrainProgress,
+    ) -> tuple[Tensor, bool]:
+        state = self.model.accumulator_state
+        if state is None:
+            return accumulated_loss, False
+
+        if state["gradient_accumulation_steps"] != self.config.gradient_accumulation_steps:
+            raise ValueError("saved accumulator state does not match gradient_accumulation_steps")
+        if state["config_fingerprint"] != self.__resume_config_fingerprint():
+            raise ValueError("saved accumulator state does not match the current dataset/config fingerprint")
+        if state["global_step"] != train_progress.global_step:
+            raise ValueError("saved accumulator state does not match the current global_step")
+
+        saved_scaler_state = state["scaler_state"]
+        if saved_scaler_state is not None:
+            if scaler is None:
+                raise ValueError("saved accumulator state requires a gradient scaler, but current training does not use one")
+            scaler.load_state_dict(saved_scaler_state)
+        elif scaler is not None:
+            raise ValueError("saved accumulator state has no gradient scaler, but current training uses one")
+
+        parameters_by_name = dict(self.model.parameters.iter_named_parameters())
+        for name, gradient in state["gradients"].items():
+            if name not in parameters_by_name:
+                raise ValueError(f"saved accumulator gradient has no current parameter: {name}")
+            parameter = parameters_by_name[name]
+            parameter.grad = gradient.to(device=parameter.device, dtype=parameter.dtype)
+
+        random.setstate(state["python_rng_state"])
+        np.random.set_state(state["numpy_rng_state"])
+        torch.set_rng_state(state["torch_rng_state"])
+        if torch.cuda.is_available() and state["cuda_rng_state"]:
+            torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+
+        self.model.accumulator_state = None
+        restored_loss = torch.tensor(float(state["accumulated_loss"]), device=train_device)
+        return restored_loss, True
 
     def __backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
         torch_gc()
@@ -520,6 +743,7 @@ class GenericTrainer(BaseTrainer):
             if print_msg:
                 print_cb("Creating Backup " + backup_path)
 
+            self.__stage_accumulator_state(train_progress)
             self.model_saver.save(
                 self.model,
                 self.config.model_type,
@@ -571,6 +795,7 @@ class GenericTrainer(BaseTrainer):
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.eval()
+            self.__stage_accumulator_state(train_progress)
             self.model_saver.save(
                 model=self.model,
                 model_type=self.config.model_type,
@@ -808,6 +1033,7 @@ class GenericTrainer(BaseTrainer):
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
+        self._active_scaler = scaler
 
         self.__apply_fused_back_pass(scaler)
 
@@ -820,6 +1046,14 @@ class GenericTrainer(BaseTrainer):
         ema_loss = None
         ema_loss_steps = 0
         epochs = range(train_progress.epoch, self.config.epochs, 1)
+        accumulated_loss, has_gradient = self.__restore_accumulator_state(
+            accumulated_loss,
+            train_device,
+            scaler,
+            train_progress,
+        )
+        self._active_has_gradient = has_gradient
+        self._active_accumulated_loss = accumulated_loss if has_gradient else None
 
         for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
             multi.sync_commands(self.commands)
@@ -842,6 +1076,10 @@ class GenericTrainer(BaseTrainer):
 
             if self.config.debug_mode:
                 multi.warn_parameter_divergence(self.parameters, train_device)
+
+            if not any(parameter.requires_grad for parameter in self.parameters):
+                print("All trainable components have reached their stop_training_after limit. Stopping training.")
+                return
 
             # Special case for schedule-free optimizers, which need train()
             # called before training. Can and should move this to a callback
@@ -869,53 +1107,65 @@ class GenericTrainer(BaseTrainer):
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
 
+            prefetch_batches = None
+            batches = self.data_loader.get_data_loader()
+            if self.config.prefetch_next_batch:
+                if not self.__can_prefetch_next_batch():
+                    raise ValueError("prefetch_next_batch requires cached-only training batches")
+                prefetch_batches = PrefetchIterator(batches)
+                batches = prefetch_batches
+
             if multi.is_master():
                 batches = step_tqdm = tqdm(
-                    self.data_loader.get_data_loader(),
+                    batches,
                     desc="step",
                     total=current_epoch_length,
                     initial=train_progress.epoch_step,
                 )
-            else:
-                batches = self.data_loader.get_data_loader()
-            for batch in batches:
-                multi.sync_commands(self.commands)
-                if self.commands.get_stop_command():
-                    multi.warn_parameter_divergence(self.parameters, train_device)
+            try:
+                for batch in batches:
+                    multi.sync_commands(self.commands)
+                    if self.commands.get_stop_command():
+                        multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if (
-                    not self.commands.get_stop_command()
-                    and self.__needs_sample(train_progress)
-                    or self.commands.get_and_reset_sample_default_command()
-                ):
-                    self.__enqueue_sample_during_training(
-                        lambda: self.__sample_during_training(train_progress, train_device)
-                    )
-                if self.__needs_backup(train_progress):
-                    self.commands.backup()
+                    if (
+                        not self.commands.get_stop_command()
+                        and self.__needs_sample(train_progress)
+                        or self.commands.get_and_reset_sample_default_command()
+                    ):
+                        self.__enqueue_sample_during_training(
+                            lambda: self.__sample_during_training(train_progress, train_device)
+                        )
+                    if self.__needs_backup(train_progress):
+                        self.commands.backup()
 
-                if self.__needs_save(train_progress):
-                    self.commands.save()
+                    if self.__needs_save(train_progress):
+                        self.commands.save()
 
-                sample_commands = self.commands.get_and_reset_sample_custom_commands()
-                if sample_commands:
+                    sample_commands = self.commands.get_and_reset_sample_custom_commands()
+                    if sample_commands:
 
-                    def create_sample_commands_fun(sample_commands):
-                        def sample_commands_fun():
-                            self.__sample_during_training(train_progress, train_device, sample_commands)
+                        def create_sample_commands_fun(sample_commands):
+                            def sample_commands_fun():
+                                self.__sample_during_training(train_progress, train_device, sample_commands)
 
-                        return sample_commands_fun
+                            return sample_commands_fun
 
-                    self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
+                        self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
 
-                if self.__needs_gc(train_progress):
-                    torch_gc()
+                    if self.__needs_gc(train_progress):
+                        torch_gc()
 
-                if not has_gradient:
-                    self.__execute_sample_during_training()
                     backup = self.commands.get_and_reset_backup_command()
                     save = self.commands.get_and_reset_save_command()
+
+                    if not has_gradient:
+                        if prefetch_batches is not None:
+                            prefetch_batches.wait_until_idle()
+                        self.__execute_sample_during_training()
                     if multi.is_master() and (backup or save):
+                        if prefetch_batches is not None:
+                            prefetch_batches.wait_until_idle()
                         self.model.to(self.temp_device)
                         if backup:
                             self.__backup(train_progress, True, step_tqdm.write)
@@ -923,156 +1173,169 @@ class GenericTrainer(BaseTrainer):
                             self.__save(train_progress, True, step_tqdm.write)
                         self.model_setup.setup_train_device(self.model, self.config)
 
-                self.callbacks.on_update_status("Training ...")
+                    self.callbacks.on_update_status("Training ...")
 
-                with (
-                    TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
-                    TorchProfiler(enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
-                ):
-                    step_seed = train_progress.global_step
-                    bf16_stochastic_rounding_set_seed(step_seed, train_device)
-
-                    prior_pred_indices = [
-                        i
-                        for i in range(self.config.batch_size)
-                        if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
-                    ]
-                    if (
-                        self.config.masked_training
-                        and self.config.masked_prior_preservation_weight > 0
-                        and self.config.training_method == TrainingMethod.LORA
+                    with (
+                        TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
+                        TorchProfiler(enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
                     ):
-                        raise ValueError(
-                            "SotA masked-gradient hook conflicts with masked prior preservation outside-mask gradients"
-                        )
+                        step_seed = train_progress.global_step
+                        bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
-                    if len(prior_pred_indices) > 0 or (
-                        self.config.masked_training
-                        and self.config.masked_prior_preservation_weight > 0
-                        and self.config.training_method == TrainingMethod.LORA
-                    ):
-                        with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                            # do NOT create a subbatch using the indices, even though it would be more efficient:
-                            # different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                            prior_model_output_data = self.model_setup.predict(
-                                self.model, batch, self.config, train_progress
-                            )
-                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                        prior_model_prediction = prior_model_output_data["predicted"].to(
-                            dtype=model_output_data["target"].dtype
-                        )
-                        model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                        model_output_data["prior_target"] = prior_model_prediction
-                    else:
-                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                    predicted = model_output_data["predicted"]
-                    if self.config.masked_training and predicted.requires_grad:
-                        mask = self.prepare_mask_for_prediction(batch["latent_mask"], predicted)
-                        self.stop_grad_outside_mask(predicted, mask)
-
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
-
-                    if self.config.timestep_distribution == TimestepDistribution.PRIORITY_SAMPLING:
-                        if "loss_per_sample" not in model_output_data:
-                            raise ValueError("priority sampling requires model_output_data['loss_per_sample']")
-                        self.model_setup.update_priorities(
-                            model_output_data["timestep"], model_output_data["loss_per_sample"], self.config
-                        )
-
-                    loss = loss / self.config.gradient_accumulation_steps
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-
-                    has_gradient = True
-                    detached_loss = loss.detach()
-                    multi.reduce_tensor_mean(detached_loss)
-                    accumulated_loss += detached_loss
-
-                    if self.__is_update_step(train_progress):
-                        if self.config.fused_gradient_reduce:
-                            multi.finish_async(self.config.gradient_reduce_precision)
-                        else:
-                            multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
-
-                        grad_norms_by_group = (
-                            self.__grad_norms_by_group() if self.recorder is not None and multi.is_master() else {}
-                        )
-
+                        prior_pred_indices = [
+                            i
+                            for i in range(self.config.batch_size)
+                            if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
+                        ]
                         if (
-                            scaler
-                            and self.config.optimizer.optimizer.supports_fused_back_pass()
-                            and self.config.optimizer.fused_back_pass
+                            self.config.masked_training
+                            and self.config.masked_prior_preservation_weight > 0
+                            and self.config.training_method == TrainingMethod.LORA
                         ):
-                            scaler.step_after_unscale_parameter_(self.model.optimizer)
-                            scaler.update()
-                        elif scaler:
-                            scaler.unscale_(self.model.optimizer)
-                            if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
-                            scaler.step(self.model.optimizer)
-                            scaler.update()
-                        else:
-                            if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
-                            self.model.optimizer.step()
-
-                        if multi.is_master():
-                            self.__record_prodigy_step(train_progress, grad_norms_by_group)
-
-                        lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
-                        self.model.optimizer.zero_grad(set_to_none=True)
-                        has_gradient = False
-
-                        if multi.is_master():
-                            self.model_setup.report_to_tensorboard(
-                                self.model, self.config, lr_scheduler, self.tensorboard
+                            raise ValueError(
+                                "SotA masked-gradient hook conflicts with masked prior preservation outside-mask gradients"
                             )
 
-                            accumulated_loss_cpu = accumulated_loss.item()
-                            if math.isnan(accumulated_loss_cpu):
-                                raise RuntimeError(
-                                    "Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation."
+                        if len(prior_pred_indices) > 0 or (
+                            self.config.masked_training
+                            and self.config.masked_prior_preservation_weight > 0
+                            and self.config.training_method == TrainingMethod.LORA
+                        ):
+                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                # do NOT create a subbatch using the indices, even though it would be more efficient:
+                                # different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
+                                prior_model_output_data = self.model_setup.predict(
+                                    self.model, batch, self.config, train_progress
+                                )
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                            prior_model_prediction = prior_model_output_data["predicted"].to(
+                                dtype=model_output_data["target"].dtype
+                            )
+                            model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+                            model_output_data["prior_target"] = prior_model_prediction
+                        else:
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+                        predicted = model_output_data["predicted"]
+                        if self.config.masked_training and predicted.requires_grad:
+                            mask = self.prepare_mask_for_prediction(batch["latent_mask"], predicted)
+                            self.stop_grad_outside_mask(predicted, mask)
+
+                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+
+                        if self.config.timestep_distribution == TimestepDistribution.PRIORITY_SAMPLING:
+                            if "loss_per_sample" not in model_output_data:
+                                raise ValueError("priority sampling requires model_output_data['loss_per_sample']")
+                            self.model_setup.update_priorities(
+                                model_output_data["timestep"], model_output_data["loss_per_sample"], self.config
+                            )
+
+                        loss = loss / self.config.gradient_accumulation_steps
+                        if loss.requires_grad:
+                            if scaler:
+                                scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
+
+                            has_gradient = True
+                            self._active_has_gradient = True
+
+                        detached_loss = loss.detach()
+                        multi.reduce_tensor_mean(detached_loss)
+                        accumulated_loss += detached_loss
+                        self._active_accumulated_loss = accumulated_loss
+
+                        if self.__is_update_step(train_progress) and has_gradient:
+                            if self.config.fused_gradient_reduce:
+                                multi.finish_async(self.config.gradient_reduce_precision)
+                            else:
+                                multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
+
+                            grad_norms_by_group = (
+                                self.__grad_norms_by_group() if self.recorder is not None and multi.is_master() else {}
+                            )
+
+                            if (
+                                scaler
+                                and self.config.optimizer.optimizer.supports_fused_back_pass()
+                                and self.config.optimizer.fused_back_pass
+                            ):
+                                scaler.step_after_unscale_parameter_(self.model.optimizer)
+                                scaler.update()
+                            elif scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                scaler.step(self.model.optimizer)
+                                scaler.update()
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                self.model.optimizer.step()
+
+                            if multi.is_master():
+                                self.__record_prodigy_step(train_progress, grad_norms_by_group)
+
+                            lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
+                            self.model.optimizer.zero_grad(set_to_none=True)
+                            has_gradient = False
+                            self._active_has_gradient = False
+                            self.model.accumulator_state = None
+
+                            if multi.is_master():
+                                self.model_setup.report_to_tensorboard(
+                                    self.model, self.config, lr_scheduler, self.tensorboard
                                 )
 
-                            self.tensorboard.add_scalar(
-                                "loss/train_step", accumulated_loss_cpu, train_progress.global_step
-                            )
-                            ema_loss = ema_loss or accumulated_loss_cpu
-                            ema_loss_steps += 1
-                            ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
-                            ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss_cpu * (1 - ema_loss_decay))
-                            step_tqdm.set_postfix(
-                                {
-                                    "loss": accumulated_loss_cpu,
-                                    "smooth loss": ema_loss,
-                                }
-                            )
-                            self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                                accumulated_loss_cpu = accumulated_loss.item()
+                                if math.isnan(accumulated_loss_cpu):
+                                    raise RuntimeError(
+                                        "Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation."
+                                    )
 
-                        accumulated_loss = 0.0
-                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                                self.tensorboard.add_scalar(
+                                    "loss/train_step", accumulated_loss_cpu, train_progress.global_step
+                                )
+                                ema_loss = ema_loss or accumulated_loss_cpu
+                                ema_loss_steps += 1
+                                ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
+                                ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss_cpu * (1 - ema_loss_decay))
+                                step_tqdm.set_postfix(
+                                    {
+                                        "loss": accumulated_loss_cpu,
+                                        "smooth loss": ema_loss,
+                                    }
+                                )
+                                self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
 
-                        if self.model.ema:
-                            assert multi.is_master()
-                            update_step = train_progress.global_step // self.config.gradient_accumulation_steps
-                            self.tensorboard.add_scalar(
-                                "ema_decay", self.model.ema.get_current_decay(update_step), train_progress.global_step
-                            )
-                            self.model.ema.step(self.parameters, update_step)
+                            accumulated_loss = torch.tensor(0.0, device=train_device)
+                            self._active_accumulated_loss = None
+                            self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
 
-                        self.one_step_trained = True
+                            if self.model.ema:
+                                assert multi.is_master()
+                                update_step = train_progress.global_step // self.config.gradient_accumulation_steps
+                                self.tensorboard.add_scalar(
+                                    "ema_decay", self.model.ema.get_current_decay(update_step), train_progress.global_step
+                                )
+                                self.model.ema.step(self.parameters, update_step)
 
-                if self.config.validation and multi.is_master():
-                    self.__validate(train_progress)
+                            self.one_step_trained = True
 
-                train_progress.next_step(self.config.batch_size)
-                self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+                    if self.config.validation and multi.is_master():
+                        self.__validate(train_progress)
 
-                if self.commands.get_stop_command():
-                    return
+                    train_progress.next_step(self.config.batch_size)
+                    self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+                    if self.commands.get_stop_command():
+                        if prefetch_batches is not None:
+                            prefetch_batches.close()
+                        return
+
+            finally:
+                if prefetch_batches is not None:
+                    prefetch_batches.close()
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)

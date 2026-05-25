@@ -6,12 +6,14 @@ class TrainProgress:
         epoch_sample: int = 0,
         global_step: int = 0,
         total_steps: int = 0,
+        last_action_epoch: dict[str, int] | None = None,
     ):
         self.epoch = epoch
         self.epoch_step = epoch_step
         self.epoch_sample = epoch_sample
         self.global_step = global_step
         self.total_steps = total_steps
+        self.last_action_epoch = last_action_epoch if last_action_epoch is not None else {}
 
     def next_step(self, batch_size: int):
         self.epoch_step += 1

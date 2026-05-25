@@ -13,6 +13,7 @@ from modules.module.oft_utils import OFTRotationModule
 from modules.module.quantized.LinearSVD import BaseLinearSVD
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import PeftType
+from modules.util.lokr_utils import factorization, make_kron, rebuild_tucker
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
 
@@ -373,6 +374,235 @@ class LoHaModule(PeftBase):
         pass
 
 
+class LoKrModule(PeftBase):
+    dim: int
+    dropout: Dropout
+    decompose_both: bool
+    decompose_factor: int
+    use_tucker: bool
+    weight_decompose: bool
+    dora_on_output: bool
+    full_matrix: bool
+    lokr_vec_trick: bool
+    use_w1: bool
+    use_w2: bool
+    tucker: bool
+    lokr_dora_scale: Parameter | None
+
+    def __init__(
+        self,
+        prefix: str,
+        orig_module: nn.Module | None,
+        dim: int,
+        alpha: float,
+        decompose_both: bool,
+        decompose_factor: int,
+        use_tucker: bool,
+        weight_decompose: bool,
+        dora_on_output: bool,
+        full_matrix: bool,
+        train_device: torch.device,
+        lokr_vec_trick: bool,
+    ):
+        super().__init__(prefix, orig_module)
+        self.dim = dim
+        self.dropout = Dropout(0)
+        self.register_buffer("alpha", torch.tensor(alpha))
+        self.decompose_both = decompose_both
+        self.decompose_factor = int(decompose_factor)
+        self.use_tucker = use_tucker
+        self.weight_decompose = weight_decompose
+        self.dora_on_output = dora_on_output
+        self.full_matrix = full_matrix
+        self.train_device = train_device
+        self.lokr_vec_trick = lokr_vec_trick
+        self.use_w1 = False
+        self.use_w2 = False
+        self.tucker = False
+        self.lokr_dora_scale = None
+        self.in_m = None
+        self.in_n = None
+        self.out_l = None
+        self.out_k = None
+
+        if orig_module is not None:
+            self.initialize_weights()
+            self.alpha = self.alpha.to(orig_module.weight.device)
+        self.alpha.requires_grad_(False)
+
+    def initialize_weights(self):
+        self._initialized = True
+        device = self.orig_module.weight.device
+
+        match self.orig_module:
+            case nn.Linear():
+                in_dim, out_dim = self.orig_module.in_features, self.orig_module.out_features
+                in_m, in_n = factorization(in_dim, self.decompose_factor)
+                out_l, out_k = factorization(out_dim, self.decompose_factor)
+                self.in_m, self.in_n = in_m, in_n
+                self.out_l, self.out_k = out_l, out_k
+
+                if self.decompose_both and self.dim < max(out_l, in_m) / 2:
+                    self.lokr_w1_a = Parameter(torch.empty(out_l, self.dim, device=device))
+                    self.lokr_w1_b = Parameter(torch.empty(self.dim, in_m, device=device))
+                else:
+                    self.use_w1 = True
+                    self.lokr_w1 = Parameter(torch.empty(out_l, in_m, device=device))
+
+                if not self.full_matrix and self.dim < max(out_k, in_n) / 2:
+                    self.lokr_w2_a = Parameter(torch.empty(out_k, self.dim, device=device))
+                    self.lokr_w2_b = Parameter(torch.empty(self.dim, in_n, device=device))
+                else:
+                    if not self.full_matrix:
+                        print(
+                            f"LoKr dim {self.dim} is too large for Linear ({in_dim}, {out_dim}) "
+                            f"and factor {self.decompose_factor}; using full matrix mode."
+                        )
+                    self.use_w2 = True
+                    self.lokr_w2 = Parameter(torch.empty(out_k, in_n, device=device))
+
+            case nn.Conv2d():
+                in_dim, out_dim = self.orig_module.in_channels, self.orig_module.out_channels
+                kernel_size = self.orig_module.kernel_size
+                in_m, in_n = factorization(in_dim, self.decompose_factor)
+                out_l, out_k = factorization(out_dim, self.decompose_factor)
+                self.tucker = self.use_tucker and any(kernel_dim != 1 for kernel_dim in kernel_size)
+
+                if self.decompose_both and self.dim < max(out_l, in_m) / 2:
+                    self.lokr_w1_a = Parameter(torch.empty(out_l, self.dim, device=device))
+                    self.lokr_w1_b = Parameter(torch.empty(self.dim, in_m, device=device))
+                else:
+                    self.use_w1 = True
+                    self.lokr_w1 = Parameter(torch.empty(out_l, in_m, device=device))
+
+                if self.full_matrix or self.dim >= max(out_k, in_n) / 2:
+                    if not self.full_matrix:
+                        print(
+                            f"LoKr dim {self.dim} is too large for Conv2d ({in_dim}, {out_dim}) "
+                            f"and factor {self.decompose_factor}; using full matrix mode."
+                        )
+                    self.use_w2 = True
+                    self.lokr_w2 = Parameter(torch.empty(out_k, in_n, *kernel_size, device=device))
+                elif self.tucker:
+                    self.lokr_t2 = Parameter(torch.empty(self.dim, self.dim, *kernel_size, device=device))
+                    self.lokr_w2_a = Parameter(torch.empty(self.dim, out_k, device=device))
+                    self.lokr_w2_b = Parameter(torch.empty(self.dim, in_n, device=device))
+                else:
+                    kernel_area = math.prod(kernel_size)
+                    self.lokr_w2_a = Parameter(torch.empty(out_k, self.dim, device=device))
+                    self.lokr_w2_b = Parameter(torch.empty(self.dim, in_n * kernel_area, device=device))
+
+            case _:
+                raise NotImplementedError("Only Linear and Conv2d are supported layers.")
+
+        if self.use_w1:
+            nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
+        else:
+            nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
+
+        if self.use_w2:
+            nn.init.constant_(self.lokr_w2, 0)
+        else:
+            if self.tucker:
+                nn.init.kaiming_uniform_(self.lokr_t2, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.lokr_w2_a, a=math.sqrt(5))
+            nn.init.constant_(self.lokr_w2_b, 0)
+
+    def _get_factors(self) -> tuple[Tensor, Tensor]:
+        dropout = (lambda tensor: tensor) if self.weight_decompose else self.dropout
+
+        weight_1 = dropout(self.lokr_w1) if self.use_w1 else dropout(self.lokr_w1_a) @ dropout(self.lokr_w1_b)
+        if self.use_w2:
+            weight_2 = dropout(self.lokr_w2)
+        elif self.tucker:
+            weight_2 = rebuild_tucker(dropout(self.lokr_t2), dropout(self.lokr_w2_a), dropout(self.lokr_w2_b))
+        else:
+            weight_2 = dropout(self.lokr_w2_a) @ dropout(self.lokr_w2_b)
+
+        return weight_1, weight_2
+
+    def get_weight(self) -> Tensor:
+        weight_1, weight_2 = self._get_factors()
+        return make_kron(weight_1, weight_2.to(weight_1.dtype)).view(self.shape)
+
+    def check_initialized(self):
+        super().check_initialized()
+        if self.use_w1:
+            assert self.lokr_w1 is not None
+        else:
+            assert self.lokr_w1_a is not None
+            assert self.lokr_w1_b is not None
+        if self.use_w2:
+            assert self.lokr_w2 is not None
+        elif self.tucker:
+            assert self.lokr_t2 is not None
+            assert self.lokr_w2_a is not None
+            assert self.lokr_w2_b is not None
+        else:
+            assert self.lokr_w2_a is not None
+            assert self.lokr_w2_b is not None
+
+    def forward(self, x, *args, **kwargs):
+        self.check_initialized()
+        scale = self.alpha / self.dim
+
+        if self.weight_decompose:
+            if isinstance(self.orig_module, nn.Linear):
+                orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
+            else:
+                assert isinstance(self.orig_module, nn.Conv2d)
+                orig_weight = self.orig_module.weight.detach().float()
+
+            if self.lokr_dora_scale is None:
+                dora_num_dims = orig_weight.dim() - 1
+                if self.dora_on_output:
+                    dora_scale = torch.norm(orig_weight.reshape(orig_weight.shape[0], -1), dim=1)
+                    dora_scale = dora_scale.reshape(orig_weight.shape[0], *[1] * dora_num_dims)
+                else:
+                    dora_scale = torch.norm(
+                        orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1), dim=1, keepdim=True
+                    )
+                    dora_scale = dora_scale.reshape(orig_weight.shape[1], *[1] * dora_num_dims).transpose(0, 1)
+                self.lokr_dora_scale = Parameter(
+                    dora_scale.to(device=self.orig_module.weight.device, dtype=self.orig_module.weight.dtype)
+                )
+
+            weight = orig_weight + self.get_weight() * scale
+            del orig_weight
+            eps = torch.finfo(weight.dtype).eps
+            if self.dora_on_output:
+                norm = weight.detach().reshape(weight.shape[0], -1).norm(dim=1)
+                norm = norm.reshape(weight.shape[0], *[1] * (weight.dim() - 1)) + eps
+            else:
+                norm = weight.detach().transpose(0, 1).reshape(weight.shape[1], -1).norm(dim=1, keepdim=True)
+                norm = norm.reshape(weight.shape[1], *[1] * (weight.dim() - 1)).transpose(0, 1) + eps
+
+            weight = self.lokr_dora_scale * (weight / norm)
+            return self.op(self.dropout(x), weight.to(x.dtype), self.orig_module.bias, **self.layer_kwargs)
+
+        if self.lokr_vec_trick and isinstance(self.orig_module, nn.Linear):
+            assert self.in_m is not None
+            assert self.in_n is not None
+            weight_1, weight_2 = self._get_factors()
+            x_shape = x.shape
+            x_reshaped = x.reshape(-1, self.in_m, self.in_n)
+            delta_output = torch.einsum("bmn, lm, kn -> blk", x_reshaped, weight_1.to(x.dtype), weight_2.to(x.dtype))
+            delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale
+            return self.orig_forward(x) + delta_output
+
+        weight = self.get_weight() * scale
+        return self.orig_forward(x) + self.op(x, weight.to(x.dtype), bias=None, **self.layer_kwargs)
+
+    def apply_to_module(self):
+        # TODO
+        pass
+
+    def extract_from_module(self, base_module: nn.Module):
+        # TODO
+        pass
+
+
 class LoRAModule(PeftBase):
     lora_down: nn.Module | None
     lora_up: nn.Module | None
@@ -430,15 +660,31 @@ class OFTModule(PeftBase):
     oft_R: OFTRotationModule | None
     rank: int
     oft_block_size: int
+    coft: bool
+    coft_eps: float
     block_share: bool
+    scaled_oft: bool
     dropout_probability: float
     adjustment_info: tuple[int, int] | None  # for reporting
 
-    def __init__(self, prefix: str, orig_module: nn.Module | None, oft_block_size: int, block_share: bool, **kwargs):
+    def __init__(
+        self,
+        prefix: str,
+        orig_module: nn.Module | None,
+        oft_block_size: int,
+        coft: bool,
+        coft_eps: float,
+        block_share: bool,
+        scaled_oft: bool,
+        **kwargs,
+    ):
         super().__init__(prefix, orig_module)
         self.oft_block_size = oft_block_size
         self.rank = 0
+        self.coft = coft
+        self.coft_eps = coft_eps
         self.block_share = block_share
+        self.scaled_oft = scaled_oft
         self.dropout_probability = kwargs.pop("dropout_probability", 0.0)
         self.oft_R = None
         self.adjustment_info = None
@@ -504,7 +750,10 @@ class OFTModule(PeftBase):
             n_elements=n_elements,
             block_size=self.oft_block_size,
             in_features=in_features,
+            coft=self.coft,
+            coft_eps=self.coft_eps,
             block_share=self.block_share,
+            scaled_oft=self.scaled_oft,
             use_cayley_neumann=True,
             num_cayley_neumann_terms=5,
             dropout_probability=self.dropout_probability,
@@ -520,9 +769,19 @@ class OFTModule(PeftBase):
             rotated_x = self.oft_R(x)
             return self.orig_forward(rotated_x, *args, **kwargs)
 
+        if self.coft:
+            with torch.no_grad():
+                self.oft_R.weight.copy_(self.oft_R._project_batch(self.oft_R.weight, coft_eps=self.coft_eps))
+
+        scaling_factor = 2 * math.sqrt(self.oft_R.block_size - 1) if self.scaled_oft else 1
+        effective_weight = self.oft_R.weight / scaling_factor
+
         # For Conv2d, we must rotate the weights, not the input, to preserve spatial information.
         orth_rotate = self.oft_R._cayley_batch(
-            self.oft_R.weight, self.oft_R.block_size, self.oft_R.use_cayley_neumann, self.oft_R.num_cayley_neumann_terms
+            effective_weight,
+            self.oft_R.block_size,
+            self.oft_R.use_cayley_neumann,
+            self.oft_R.num_cayley_neumann_terms,
         )
         orth_rotate = self.oft_R.dropout(orth_rotate)
 
@@ -552,6 +811,57 @@ class OFTModule(PeftBase):
     @property
     def dropout(self):
         return self.oft_R.dropout
+
+
+class DoRAOFTModule(OFTModule):
+    dora_scale: nn.Parameter | None
+    initial_norm: Tensor | None
+
+    def __init__(self, *args, **kwargs):
+        self.dora_scale = None
+        self.initial_norm = None
+        super().__init__(*args, **kwargs)
+
+    def initialize_weights(self):
+        super().initialize_weights()
+
+        if isinstance(self.orig_module, nn.Linear):
+            weight = get_unquantized_weight(self.orig_module, torch.float32, self.orig_module.weight.device)
+            norm = torch.norm(weight, dim=1, keepdim=True)
+        elif isinstance(self.orig_module, nn.Conv2d):
+            weight = self.orig_module.weight.detach().float()
+            norm = torch.norm(weight.reshape(weight.shape[0], -1), dim=1).reshape(weight.shape[0], 1, 1, 1)
+        else:
+            raise NotImplementedError("DoRA-OFT only supports Linear and Conv2d")
+
+        self.initial_norm = norm.to(self.orig_module.weight.device).detach()
+        self.dora_scale = nn.Parameter(self.initial_norm.clone())
+
+    def check_initialized(self):
+        super().check_initialized()
+        assert self.dora_scale is not None
+        assert self.initial_norm is not None
+
+    def forward(self, x, *args, **kwargs):
+        self.check_initialized()
+        result = super().forward(x, *args, **kwargs)
+
+        bias = self.orig_module.bias
+        if bias is not None:
+            bias_view = bias.view(1, -1, 1, 1) if isinstance(self.orig_module, nn.Conv2d) else bias
+            result = result - bias_view
+
+        scale = self.dora_scale / self.initial_norm
+        if isinstance(self.orig_module, nn.Linear):
+            scale = scale.view(1, -1)
+        elif isinstance(self.orig_module, nn.Conv2d):
+            scale = scale.view(1, -1, 1, 1)
+
+        result = result * scale
+        if bias is not None:
+            result = result + bias_view
+
+        return result
 
 
 class DoRAModule(LoRAModule):
@@ -649,7 +959,9 @@ class DoRAModule(LoRAModule):
 DummyLoRAModule = LoRAModule.make_dummy()
 DummyDoRAModule = DoRAModule.make_dummy()
 DummyLoHaModule = LoHaModule.make_dummy()
+DummyLoKrModule = LoKrModule.make_dummy()
 DummyOFTModule = OFTModule.make_dummy()
+DummyDoRAOFTModule = DoRAOFTModule.make_dummy()
 
 
 class LoRAModuleWrapper:
@@ -703,15 +1015,36 @@ class LoRAModuleWrapper:
             self.additional_args = [self.rank, self.alpha]
             self.additional_kwargs = {}
         elif self.peft_type == PeftType.OFT_2:
-            self.klass = OFTModule
-            self.dummy_klass = DummyOFTModule
+            self.klass = DoRAOFTModule if config.dora_oft else OFTModule
+            self.dummy_klass = DummyDoRAOFTModule if config.dora_oft else DummyOFTModule
             self.additional_args = [
                 config.oft_block_size,
+                config.oft_coft,
+                config.coft_eps,
                 config.oft_block_share,
+                config.scaled_oft,
             ]
             self.additional_kwargs = {
                 "dropout_probability": config.dropout_probability,
             }
+        elif self.peft_type == PeftType.LOKR:
+            self.klass = LoKrModule
+            self.dummy_klass = DummyLoKrModule
+            self.additional_args = [
+                config.lokr_dim,
+                self.alpha,
+                config.lokr_decompose_both,
+                config.lokr_decompose_factor,
+                config.lokr_use_tucker,
+                config.lokr_weight_decompose,
+                config.lokr_dora_on_output,
+                config.lokr_full_matrix,
+                torch.device(config.train_device),
+                config.lokr_vec_trick,
+            ]
+            self.additional_kwargs = {}
+        else:
+            raise ValueError(f"Unsupported PEFT type: {self.peft_type}")
 
         self.lora_modules = self.__create_modules(orig_module, config)
 
@@ -741,7 +1074,7 @@ class LoRAModuleWrapper:
         return {pattern: value for pattern, value in layer_rules.items() if pattern}
 
     def __args_for_module(self, module_name: str, prefixed_name: str) -> list:
-        if self.peft_type == PeftType.OFT_2:
+        if self.peft_type in (PeftType.OFT_2, PeftType.LOKR):
             return self.additional_args
 
         rank = self.rank

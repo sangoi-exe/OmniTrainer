@@ -93,6 +93,7 @@ class BaseStableDiffusion3Setup(
         quantize_layers(model.text_encoder_3, self.train_device, model.text_encoder_3_train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
+        self._set_attention_mechanism(model.transformer, config.attention_mechanism)
 
     def _setup_embeddings(
         self,
@@ -259,7 +260,10 @@ class BaseStableDiffusion3Setup(
         deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            if deterministic:
+                batch_seed = int(batch.get("__validation_noise_seed__", 0))
+            else:
+                batch_seed = train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -326,6 +330,8 @@ class BaseStableDiffusion3Setup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                validation_index=batch.get("__validation_timestep_index__"),
+                validation_count=batch.get("__validation_timestep_count__"),
             )
 
             scaled_noisy_latent_image, sigma = self._add_noise_discrete(

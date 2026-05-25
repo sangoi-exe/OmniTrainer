@@ -2,10 +2,12 @@ from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 
 import modules.util.multi_gpu_util as multi
+from diffusers.models.attention_dispatch import AttentionBackendName
 from modules.model.BaseModel import BaseModel
 from modules.module.LoRAModule import export_lora_key_manifest
 from modules.sangoi.logFun import logFun
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
@@ -184,6 +186,23 @@ class BaseModelSetup(
 
         manifest_path = export_lora_key_manifest(config.lora_key_export_path, model.adapters(), config.workspace_dir)
         logFun(f"[LoRA] Exported key manifest to {manifest_path}", lvl="info")
+
+    @staticmethod
+    def _set_attention_mechanism(component: torch.nn.Module, mechanism: AttentionMechanism):
+        if mechanism == AttentionMechanism.SDP:
+            backend = AttentionBackendName.NATIVE.value
+        elif mechanism == AttentionMechanism.FLASH:
+            backend = AttentionBackendName.FLASH.value
+        else:
+            raise NotImplementedError(f"attention mechanism {mechanism} is not implemented")
+
+        set_backend = getattr(component, "set_attention_backend", None)
+        if set_backend is None:
+            if mechanism == AttentionMechanism.FLASH:
+                raise ValueError(f"{component.__class__.__name__} does not support FLASH attention")
+            return
+
+        set_backend(backend)
 
     def _create_model_part_parameters(
         self,

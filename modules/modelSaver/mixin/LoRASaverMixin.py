@@ -95,5 +95,7 @@ class LoRASaverMixin(
                     self.__save_legacy_safetensors(model, output_model_destination, dtype)
             case ModelFormat.LEGACY_SAFETENSORS:
                 self.__save_legacy_safetensors(model, output_model_destination, dtype)
+            case ModelFormat.COMFY_LORA:
+                raise NotImplementedError(f"{ModelFormat.COMFY_LORA} is not supported by this LoRA saver")
             case ModelFormat.INTERNAL:
                 self.__save_internal(model, output_model_destination)

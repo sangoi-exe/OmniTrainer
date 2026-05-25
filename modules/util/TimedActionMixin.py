@@ -25,15 +25,20 @@ class TimedActionMixin:
             case TimeUnit.EPOCH:
                 if int(interval) == 0:
                     return False
+                last_action_epoch = train_progress.last_action_epoch.get(name, -1)
                 if start_at_zero:
-                    return train_progress.epoch % int(interval) == 0 and train_progress.epoch_step == 0
+                    action_needed = train_progress.epoch > last_action_epoch and train_progress.epoch % int(interval) == 0
                 else:
                     # should actually be the last step of each epoch, but we don't know how many steps an epoch has
-                    return (
-                        train_progress.epoch % int(interval) == 0
+                    action_needed = (
+                        train_progress.epoch > last_action_epoch
+                        and train_progress.epoch % int(interval) == 0
                         and train_progress.epoch_step == 0
                         and train_progress.epoch > 0
                     )
+                if action_needed:
+                    train_progress.last_action_epoch[name] = train_progress.epoch
+                return action_needed
             case TimeUnit.STEP:
                 if int(interval) == 0:
                     return False

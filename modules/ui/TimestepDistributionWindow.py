@@ -53,6 +53,7 @@ class TimestepGenerator(ModelSetupNoiseMixin):
             generator=generator,
             batch_size=1000000,
             config=config,
+            betas=torch.linspace(0.00085, 0.012, 1000, device=generator.device),
         )
 
 
@@ -109,7 +110,10 @@ class TimestepDistributionWindow(ctk.CTkToplevel):
         timestep_distribution_options = [
             str(x)
             for x in list(TimestepDistribution)
-            if not (self.config.model_type.is_flow_matching() and x == TimestepDistribution.PRIORITY_SAMPLING)
+            if not (
+                self.config.model_type.is_flow_matching()
+                and x in [TimestepDistribution.PRIORITY_SAMPLING, TimestepDistribution.BETA, TimestepDistribution.SPEED]
+            )
         ]
         components.options(frame, 0, 1, timestep_distribution_options, self.ui_state, "timestep_distribution")
 

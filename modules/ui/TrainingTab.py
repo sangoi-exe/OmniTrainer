@@ -4,6 +4,7 @@ from modules.ui.SchedulerParamsWindow import SchedulerParamsWindow
 from modules.ui.TimestepDistributionWindow import TimestepDistributionWindow
 from modules.util import create
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
@@ -125,7 +126,9 @@ class TrainingTab:
 
         self.__create_base2_frame(column_1, 0, supports_circular_padding=True)
         self.__create_unet_frame(column_1, 1)
-        self.__create_noise_frame(column_1, 2, supports_generalized_offset_noise=True)
+        self.__create_noise_frame(
+            column_1, 2, supports_generalized_offset_noise=True, supports_sdxl_conditioning_noise=True
+        )
 
         self.__create_masked_frame(column_2, 1)
         self.__create_loss_frame(column_2, 2)
@@ -534,6 +537,26 @@ class TrainingTab:
         components.switch(frame, row, 1, self.ui_state, "enable_autocast_cache")
         row += 1
 
+        components.label(
+            frame,
+            row,
+            0,
+            "Attention Backend",
+            tooltip="Selects the attention backend. Flash requires the diffusers flash attention backend to be available.",
+        )
+        components.options_kv(
+            frame,
+            row,
+            1,
+            [
+                ("SDP", AttentionMechanism.SDP),
+                ("Flash", AttentionMechanism.FLASH),
+            ],
+            self.ui_state,
+            "attention_mechanism",
+        )
+        row += 1
+
         # resolution
         components.label(
             frame,
@@ -876,43 +899,131 @@ class TrainingTab:
         row,
         supports_generalized_offset_noise: bool = False,
         supports_dynamic_timestep_shifting: bool = False,
+        supports_sdxl_conditioning_noise: bool = False,
     ):
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
         frame.grid_columnconfigure(0, weight=1)
+        row = 0
 
         # offset noise weight
         components.label(
-            frame, 0, 0, "Offset Noise Weight", tooltip="The weight of offset noise added to each training step"
+            frame, row, 0, "Offset Noise Weight", tooltip="The weight of offset noise added to each training step"
         )
-        components.entry(frame, 0, 1, self.ui_state, "offset_noise_weight")
+        components.entry(frame, row, 1, self.ui_state, "offset_noise_weight")
+        row += 1
 
         if supports_generalized_offset_noise:
             # generalized offset noise weight
             generalised_offset_label = components.label(
                 frame,
-                1,
+                row,
                 0,
                 "Generalized Offset Noise",
                 tooltip="Per-timestep 'brightness knob' instead of a fixed offset - steadier training, better starts, and improved very dark/bright images. Compatible with V-pred and Eps-pred. Start with 0.02 and adjust as needed.",
             )
             generalised_offset_label.configure(wraplength=130, justify="left")
-            components.switch(frame, 1, 1, self.ui_state, "generalized_offset_noise")
+            components.switch(frame, row, 1, self.ui_state, "generalized_offset_noise")
+            row += 1
 
         # perturbation noise weight
         components.label(
             frame,
-            2,
+            row,
             0,
             "Perturbation Noise Weight",
             tooltip="The weight of perturbation noise added to each training step",
         )
-        components.entry(frame, 2, 1, self.ui_state, "perturbation_noise_weight")
+        components.entry(frame, row, 1, self.ui_state, "perturbation_noise_weight")
+        row += 1
+
+        components.label(
+            frame,
+            row,
+            0,
+            "Immiscible Noise Samples",
+            tooltip="Number of noise candidates per sample for immiscible diffusion. 1 disables oversampling.",
+        )
+        components.entry(
+            frame,
+            row,
+            1,
+            self.ui_state,
+            "k_noise_sampling",
+            required=True,
+            extra_validate=check_range(lower=1, message="Immiscible noise samples must be at least 1"),
+        )
+        row += 1
+
+        if supports_sdxl_conditioning_noise:
+            components.label(
+                frame,
+                row,
+                0,
+                "CEP",
+                tooltip="Enables SDXL conditional embedding perturbation during training.",
+            )
+            components.switch(frame, row, 1, self.ui_state, "cep_enabled")
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "CEP Gamma",
+                tooltip="Magnitude for SDXL conditional embedding perturbation.",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "cep_gamma",
+                required=True,
+                extra_validate=check_range(lower=0, message="CEP gamma must be non-negative"),
+            )
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "CIOP Noise Weight",
+                tooltip="Noise magnitude for SDXL conditional input-output perturbation.",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "ciop_noise_weight",
+                required=True,
+                extra_validate=check_range(lower=0, message="CIOP noise weight must be non-negative"),
+            )
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "CIOP Probability",
+                tooltip="Probability of applying SDXL conditional input-output perturbation.",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "ciop_p",
+                required=True,
+                extra_validate=check_range(lower=0, upper=1, message="CIOP probability must be between 0 and 1"),
+            )
+            row += 1
 
         # timestep distribution
         components.label(
             frame,
-            3,
+            row,
             0,
             "Timestep Distribution",
             tooltip="Selects the function to sample timesteps during training",
@@ -921,79 +1032,93 @@ class TrainingTab:
         timestep_distributions = [
             str(x)
             for x in list(TimestepDistribution)
-            if not (self.train_config.model_type.is_flow_matching() and x == TimestepDistribution.PRIORITY_SAMPLING)
+            if not (
+                self.train_config.model_type.is_flow_matching()
+                and x
+                in [
+                    TimestepDistribution.PRIORITY_SAMPLING,
+                    TimestepDistribution.BETA,
+                    TimestepDistribution.SPEED,
+                ]
+            )
         ]
         components.options_adv(
             frame,
-            3,
+            row,
             1,
             timestep_distributions,
             self.ui_state,
             "timestep_distribution",
             adv_command=self.__open_timestep_distribution_window,
         )
+        row += 1
 
         # min noising strength
         components.label(
             frame,
-            4,
+            row,
             0,
             "Min Noising Strength",
             tooltip="Specifies the minimum noising strength used during training. This can help to improve composition, but prevents finer details from being trained",
         )
-        components.entry(frame, 4, 1, self.ui_state, "min_noising_strength", required=True)
+        components.entry(frame, row, 1, self.ui_state, "min_noising_strength", required=True)
+        row += 1
 
         # max noising strength
         components.label(
             frame,
-            5,
+            row,
             0,
             "Max Noising Strength",
             tooltip="Specifies the maximum noising strength used during training. This can be useful to reduce overfitting, but also reduces the impact of training samples on the overall image composition",
         )
-        components.entry(frame, 5, 1, self.ui_state, "max_noising_strength", required=True)
+        components.entry(frame, row, 1, self.ui_state, "max_noising_strength", required=True)
+        row += 1
 
         # noising weight
         components.label(
             frame,
-            6,
+            row,
             0,
             "Noising Weight",
             tooltip="Controls the weight parameter of the timestep distribution function. Use the preview to see more details.",
         )
-        components.entry(frame, 6, 1, self.ui_state, "noising_weight", required=True)
+        components.entry(frame, row, 1, self.ui_state, "noising_weight", required=True)
+        row += 1
 
         # noising bias
         components.label(
             frame,
-            7,
+            row,
             0,
             "Noising Bias",
             tooltip="Controls the bias parameter of the timestep distribution function. Use the preview to see more details.",
         )
-        components.entry(frame, 7, 1, self.ui_state, "noising_bias", required=True)
+        components.entry(frame, row, 1, self.ui_state, "noising_bias", required=True)
+        row += 1
 
         # timestep shift
         components.label(
             frame,
-            8,
+            row,
             0,
             "Timestep Shift",
             tooltip="Shift the timestep distribution. Use the preview to see more details.",
         )
-        components.entry(frame, 8, 1, self.ui_state, "timestep_shift", required=True)
+        components.entry(frame, row, 1, self.ui_state, "timestep_shift", required=True)
+        row += 1
 
         if supports_dynamic_timestep_shifting:
             # dynamic timestep shifting
             components.label(
                 frame,
-                9,
+                row,
                 0,
                 "Dynamic Timestep Shifting",
                 tooltip="Dynamically shift the timestep distribution based on resolution. If enabled, the shifting parameters are taken from the model's scheduler configuration and Timestep Shift is ignored. Note: For Z-Image and Flux2, the dynamic shifting parameters are likely wrong and unknown. Use with care or set your own, fixed shift.",
                 wide_tooltip=True,
             )
-            components.switch(frame, 9, 1, self.ui_state, "dynamic_timestep_shifting")
+            components.switch(frame, row, 1, self.ui_state, "dynamic_timestep_shifting")
 
     def __create_masked_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)

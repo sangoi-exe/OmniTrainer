@@ -83,6 +83,7 @@ class BaseFlux2Setup(
         quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
+        self._set_attention_mechanism(model.transformer, config.attention_mechanism)
 
     def predict(
         self,
@@ -94,7 +95,10 @@ class BaseFlux2Setup(
         deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            if deterministic:
+                batch_seed = int(batch.get("__validation_noise_seed__", 0))
+            else:
+                batch_seed = train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -124,6 +128,8 @@ class BaseFlux2Setup(
                 scaled_latent_image.shape[0],
                 config,
                 shift=shift if config.dynamic_timestep_shifting else config.timestep_shift,
+                validation_index=batch.get("__validation_timestep_index__"),
+                validation_count=batch.get("__validation_timestep_count__"),
             )
 
             scaled_noisy_latent_image, sigma = self._add_noise_discrete(
@@ -145,6 +151,16 @@ class BaseFlux2Setup(
             text_ids = model.prepare_text_ids(text_encoder_output)
             image_ids = model.prepare_latent_image_ids(latent_input)
             packed_latent_input = model.pack_latents(latent_input)
+            image_seq_len = packed_latent_input.shape[1]
+
+            if "latent_conditioning_image" in batch:
+                latent_conditioning_image = model.patchify_latents(batch["latent_conditioning_image"].float())
+                scaled_latent_conditioning_image = model.scale_latents(latent_conditioning_image)
+                packed_latent_conditioning_image = model.pack_latents(scaled_latent_conditioning_image)
+                packed_latent_input = torch.cat([packed_latent_input, packed_latent_conditioning_image], dim=1)
+
+                conditioning_image_ids = model.prepare_latent_image_ids(scaled_latent_conditioning_image, index=1)
+                image_ids = torch.cat([image_ids, conditioning_image_ids], dim=1)
 
             packed_predicted_flow = model.transformer(
                 hidden_states=packed_latent_input.to(dtype=model.train_dtype.torch_dtype()),
@@ -155,7 +171,7 @@ class BaseFlux2Setup(
                 img_ids=image_ids,
                 joint_attention_kwargs=None,
                 return_dict=True,
-            ).sample
+            ).sample[:, :image_seq_len, :]
 
             predicted_flow = model.unpack_latents(
                 packed_predicted_flow,

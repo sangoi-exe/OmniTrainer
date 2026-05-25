@@ -26,7 +26,9 @@ class BaseModelLoader(metaclass=ABCMeta):
                 epoch_step=meta["train_progress"]["epoch_step"],
                 epoch_sample=meta["train_progress"]["epoch_sample"],
                 global_step=meta["train_progress"]["global_step"],
+                last_action_epoch=meta.get("last_action_epoch"),
             )
+            resumed_tensorboard_subdir = meta.get("tensorboard_subdir")
 
         # optimizer
         with contextlib.suppress(FileNotFoundError):
@@ -38,8 +40,15 @@ class BaseModelLoader(metaclass=ABCMeta):
         with contextlib.suppress(FileNotFoundError):
             model.ema_state_dict = torch.load(os.path.join(base_model_name, "ema", "ema.pt"), weights_only=True)
 
+        with contextlib.suppress(FileNotFoundError):
+            model.accumulator_state = torch.load(
+                os.path.join(base_model_name, "accumulator", "accumulator.pt"),
+                weights_only=False,
+            )
+
         # meta
         model.train_progress = train_progress
+        model.resumed_tensorboard_subdir = resumed_tensorboard_subdir
 
     @abstractmethod
     def load(

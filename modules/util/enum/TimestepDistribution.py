@@ -9,6 +9,8 @@ class TimestepDistribution(Enum):
     COS_MAP = "COS_MAP"
     INVERTED_PARABOLA = "INVERTED_PARABOLA"
     PRIORITY_SAMPLING = "PRIORITY_SAMPLING"
+    BETA = "BETA"
+    SPEED = "SPEED"
 
     def __str__(self):
         return self.value

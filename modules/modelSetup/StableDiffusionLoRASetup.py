@@ -1,4 +1,5 @@
 from modules.model.StableDiffusionModel import StableDiffusionModel
+from modules.modelLoader.mixin.LoRALoaderMixin import LoRALoaderMixin
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.BaseStableDiffusionSetup import BaseStableDiffusionSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
@@ -81,6 +82,11 @@ class StableDiffusionLoRASetup(
         model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.layer_filter.split(","))
 
         if model.lora_state_dict:
+            model.lora_state_dict = LoRALoaderMixin.scale_lora_state_dict(
+                model.lora_state_dict,
+                text_encoder_scale=config.lora_te_scale,
+                main_scale=config.lora_unet_scale,
+            )
             if create_te:
                 model.text_encoder_lora.load_state_dict(model.lora_state_dict)
             model.unet_lora.load_state_dict(model.lora_state_dict)

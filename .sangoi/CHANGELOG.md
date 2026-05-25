@@ -1,5 +1,14 @@
 # Sangoi Changelog
 
+## 2026-05-25 - Selected upstream PR ports
+
+- Ported selected stale upstream training/runtime improvements manually into `master-update` while preserving Sangoi LoRA rules, TrainGPS/DataRecorder behavior, local uv bootstrap, and WSL CPU validation constraints.
+- Added canonical validation timestep controls, deterministic validation noise seeding, validation metrics for TensorBoard/patience, TensorBoard run resume metadata, validation patience restore, prefetching, target-resolution cache identity, and mid-accumulation resume state.
+- Added configurable attention backend selection, immiscible noise oversampling, BETA/SPEED timestep distributions, and SDXL CEP/CIOP controls.
+- Added LoKr, Scaled OFT, DoRA-OFT, LoRA load scaling controls, Flux 2 edit-conditioning support, HiDream tokenizer fixes, and HunyuanVideo LoRA ComfyUI conversion support.
+- Added `scripts/validate_selected_upstream_pr_ports.py` to verify the new ownership contracts, guarded-file constraints, strict config behavior, Sangoi invariants, and conversion hooks.
+- Validation performed: targeted `py_compile`, runtime CPU smokes, formal selected-PR validator, `git diff --check`, and `git diff HEAD --check`. Full training runs, GPU validation, Docker/cloud execution, and rendered Tk inspection were not run.
+
 ## 2026-05-24 - Sangoi mod cleanup and uv-managed bootstrap
 
 - Cleaned the handmade Sangoi mod surface on `master-update` by removing stale config/UI/debug fields and unsupported orphan modules while preserving supported SDXL training behavior.

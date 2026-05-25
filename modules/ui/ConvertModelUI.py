@@ -27,6 +27,8 @@ class ConvertModelUI(ctk.CTkToplevel):
         self.convert_model_args = ConvertModelArgs.default_values()
         self.ui_state = UIState(self, self.convert_model_args)
         self.button = None
+        self.output_model_format_component = None
+        self.output_model_format_options = []
 
         self.title("Convert models")
         self.geometry("550x350")
@@ -75,6 +77,7 @@ class ConvertModelUI(ctk.CTkToplevel):
             ],
             self.ui_state,
             "model_type",
+            command=lambda _value: self.__refresh_output_model_format_options(),
         )
 
         # training method
@@ -90,6 +93,7 @@ class ConvertModelUI(ctk.CTkToplevel):
             ],
             self.ui_state,
             "training_method",
+            command=lambda _value: self.__refresh_output_model_format_options(),
         )
 
         # input name
@@ -117,17 +121,16 @@ class ConvertModelUI(ctk.CTkToplevel):
 
         # output format
         components.label(master, 4, 0, "Output Format", tooltip="Format to use when saving the output model")
-        components.options_kv(
+        self.output_model_format_component = ctk.CTkOptionMenu(
             master,
-            4,
-            1,
-            [
-                ("Safetensors", ModelFormat.SAFETENSORS),
-                ("Diffusers", ModelFormat.DIFFUSERS),
-            ],
-            self.ui_state,
-            "output_model_format",
+            values=[],
+            command=self.__set_output_model_format,
         )
+        self.output_model_format_component.grid(row=4, column=1, padx=10, pady=(10, 10), sticky="new")
+        self.ui_state.get_var("output_model_format").trace_add(
+            "write", lambda _0, _1, _2: self.__sync_output_model_format_label()
+        )
+        self.__refresh_output_model_format_options()
 
         # output model destination
         components.label(
@@ -144,6 +147,51 @@ class ConvertModelUI(ctk.CTkToplevel):
         )
 
         self.button = components.button(master, 6, 1, "Convert", self.convert_model)
+
+    def __output_model_format_options(self):
+        options = [
+            ("Safetensors", ModelFormat.SAFETENSORS),
+            ("Diffusers", ModelFormat.DIFFUSERS),
+        ]
+
+        if (
+            self.convert_model_args.model_type == ModelType.HUNYUAN_VIDEO
+            and self.convert_model_args.training_method == TrainingMethod.LORA
+        ):
+            options.append(("ComfyUI LoRA", ModelFormat.COMFY_LORA))
+
+        return options
+
+    def __set_output_model_format(self, label):
+        for option_label, option_value in self.output_model_format_options:
+            if label == option_label:
+                self.ui_state.get_var("output_model_format").set(option_value)
+                return
+
+    def __sync_output_model_format_label(self):
+        if self.output_model_format_component is None:
+            return
+
+        current_value = self.ui_state.get_var("output_model_format").get()
+        for option_label, option_value in self.output_model_format_options:
+            if current_value == str(option_value):
+                self.output_model_format_component.set(option_label)
+                return
+
+    def __refresh_output_model_format_options(self):
+        if self.output_model_format_component is None:
+            return
+
+        self.output_model_format_options = self.__output_model_format_options()
+        labels = [option_label for option_label, _option_value in self.output_model_format_options]
+        self.output_model_format_component.configure(values=labels)
+
+        allowed_values = [str(option_value) for _option_label, option_value in self.output_model_format_options]
+        output_model_format_var = self.ui_state.get_var("output_model_format")
+        if output_model_format_var.get() not in allowed_values:
+            output_model_format_var.set(self.output_model_format_options[0][1])
+        else:
+            self.__sync_output_model_format_label()
 
     def convert_model(self):
         try:

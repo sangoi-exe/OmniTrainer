@@ -88,6 +88,7 @@ class BaseStableDiffusionXLSetup(
         quantize_layers(model.text_encoder_2, self.train_device, model.train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.vae_train_dtype, config)
         quantize_layers(model.unet, self.train_device, model.train_dtype, config)
+        self._set_attention_mechanism(model.unet, config.attention_mechanism)
 
     def _setup_embeddings(
         self,
@@ -204,7 +205,10 @@ class BaseStableDiffusionXLSetup(
         deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            if deterministic:
+                batch_seed = int(batch.get("__validation_noise_seed__", 0))
+            else:
+                batch_seed = train_progress.global_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -237,6 +241,17 @@ class BaseStableDiffusionXLSetup(
                     else None,
                 )
             )
+            if config.cep_enabled and not deterministic:
+                text_encoder_output = self._apply_conditional_embedding_perturbation(
+                    text_encoder_output,
+                    config.cep_gamma,
+                    generator,
+                )
+                pooled_text_encoder_2_output = self._apply_conditional_embedding_perturbation(
+                    pooled_text_encoder_2_output,
+                    config.cep_gamma,
+                    generator,
+                )
 
             latent_image = batch["latent_image"]
             scaled_latent_image = latent_image * vae_scaling_factor
@@ -251,6 +266,9 @@ class BaseStableDiffusionXLSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                betas=model.noise_scheduler.betas,
+                validation_index=batch.get("__validation_timestep_index__"),
+                validation_count=batch.get("__validation_timestep_count__"),
             )
 
             latent_noise = self._create_noise(
@@ -267,6 +285,13 @@ class BaseStableDiffusionXLSetup(
                 timestep,
                 model.noise_scheduler.betas,
             )
+            if not deterministic:
+                scaled_noisy_latent_image, latent_noise = self._apply_ciop(
+                    scaled_noisy_latent_image,
+                    latent_noise,
+                    config,
+                    generator,
+                )
 
             # original size of the image
             original_height = batch["original_resolution"][0]

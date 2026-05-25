@@ -290,6 +290,68 @@ def lora_fuse_mlp_to_qkv_mlp(mlp_up, mlp_down, mlp_alpha):
     raise NotImplementedError
 
 
+def _not_implemented(*_args):
+    raise NotImplementedError
+
+
+def lora_unfuse_qkv(qkv_up, qkv_down, qkv_alpha):
+    if qkv_down.shape[0] % 3 != 0:
+        raise RuntimeError(f"lora_unfuse_qkv: qkv_down row count {qkv_down.shape[0]} is not divisible by 3")
+    if qkv_up.shape[0] % 3 != 0:
+        raise RuntimeError(f"lora_unfuse_qkv: qkv_up row count {qkv_up.shape[0]} is not divisible by 3")
+
+    rank = qkv_down.shape[0] // 3
+    dim = qkv_up.shape[0] // 3
+    alpha = qkv_alpha / 3
+
+    return (
+        qkv_up[0:dim, 0:rank],
+        qkv_down[0:rank],
+        alpha,
+        qkv_up[dim : 2 * dim, rank : 2 * rank],
+        qkv_down[rank : 2 * rank],
+        alpha,
+        qkv_up[2 * dim : 3 * dim, 2 * rank : 3 * rank],
+        qkv_down[2 * rank : 3 * rank],
+        alpha,
+    )
+
+
+def lora_unfuse_qkv_mlp(qkv_up, qkv_down, qkv_alpha):
+    if qkv_down.shape[0] % 4 != 0:
+        raise RuntimeError(f"lora_unfuse_qkv_mlp: qkv_down row count {qkv_down.shape[0]} is not divisible by 4")
+
+    rank = qkv_down.shape[0] // 4
+
+    def row_range(column_start: int) -> tuple[int, int]:
+        block = qkv_up[:, column_start : column_start + rank]
+        nonzero = block.abs().sum(dim=1).nonzero(as_tuple=False).flatten()
+        if nonzero.numel() == 0:
+            return 0, 0
+        return int(nonzero[0].item()), int(nonzero[-1].item()) + 1
+
+    q_start, q_end = row_range(0)
+    k_start, k_end = row_range(rank)
+    v_start, v_end = row_range(2 * rank)
+    mlp_start, mlp_end = row_range(3 * rank)
+    alpha = qkv_alpha / 4
+
+    return (
+        qkv_up[q_start:q_end, 0:rank],
+        qkv_down[0:rank],
+        alpha,
+        qkv_up[k_start:k_end, rank : 2 * rank],
+        qkv_down[rank : 2 * rank],
+        alpha,
+        qkv_up[v_start:v_end, 2 * rank : 3 * rank],
+        qkv_down[2 * rank : 3 * rank],
+        alpha,
+        qkv_up[mlp_start:mlp_end, 3 * rank : 4 * rank],
+        qkv_down[3 * rank : 4 * rank],
+        alpha,
+    )
+
+
 def swap_chunks(input: torch.Tensor, dim: int = 0) -> torch.Tensor:
     chunks = input.chunk(2, dim=dim)
     return torch.cat([chunks[1], chunks[0]], dim=dim)
@@ -311,6 +373,7 @@ def lora_qkv_fusion(q: str, k: str, v: str, qkv: str):
             ],
             [f"{qkv}.lora_up.weight", f"{qkv}.lora_down.weight", f"{qkv}.alpha"],
             lora_fuse_qkv,
+            lora_unfuse_qkv,
         ),
     ]
 
@@ -334,6 +397,7 @@ def lora_qkv_mlp_fusion(q: str, k: str, v: str, mlp: str, qkv_mlp: str, separato
             ],
             [f"{qkv_mlp}.lora_up.weight", f"{qkv_mlp}.lora_down.weight", f"{qkv_mlp}.alpha"],
             lora_fuse_qkv_mlp,
+            lora_unfuse_qkv_mlp,
         ),
         # qkv only, in case there are no mlp layers:
         (
@@ -352,12 +416,14 @@ def lora_qkv_mlp_fusion(q: str, k: str, v: str, mlp: str, qkv_mlp: str, separato
             lambda q_up, q_down, q_alpha, k_up, k_down, k_alpha, v_up, v_down, v_alpha: lora_fuse_qkv_to_qkv_mlp(
                 q_up, q_down, q_alpha, k_up, k_down, k_alpha, v_up, v_down, v_alpha
             ),
+            _not_implemented,
         ),
         # mlp only, in case there are no qkv layers:
         (
             [f"{mlp}.lora_up.weight", f"{mlp}.lora_down.weight", f"{mlp}.alpha"],
             [f"{qkv_mlp}.lora_up.weight", f"{qkv_mlp}.lora_down.weight", f"{qkv_mlp}.alpha"],
             lambda mlp_up, mlp_down, mlp_alpha: lora_fuse_mlp_to_qkv_mlp(mlp_up, mlp_down, mlp_alpha),
+            _not_implemented,
         ),
     ]
 

@@ -397,6 +397,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         if config.model_type.has_conditioning_image_input():
             modules.append(conditioning_image)
             modules.append(select_conditioning_image)
+        elif config.model_type.is_flux_2() and config.custom_conditioning_image:
+            modules.append(SelectFirstInput(in_names=["custom_conditioning_image"], out_name="conditioning_image"))
 
         return modules
 
@@ -514,6 +516,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 "concept.seed",
                 "concept.include_subdirectories",
                 "concept.image",
+                "settings.target_resolution",
             ],
             group_enabled_in_name="concept.enabled",
             before_cache_fun=before_cache_image_fun,

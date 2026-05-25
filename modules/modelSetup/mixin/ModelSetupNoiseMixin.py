@@ -3,8 +3,14 @@ from abc import ABCMeta
 
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.TimestepDistribution import TimestepDistribution
+from modules.util.immiscible_diffusion import immiscible_oversampling
+from modules.util.validation_timestep import (
+    resolve_continuous_validation_timestep,
+    resolve_discrete_validation_timestep,
+)
 
 import torch
+import torch.nn.functional
 from torch import Generator, Tensor
 
 
@@ -13,6 +19,8 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         super().__init__()
 
         self.__weights = None
+        self.__speed_weights: Tensor | None = None
+        self.__speed_meaningful_steps_end: int | None = None
         self._offset_noise_psi_schedule: Tensor | None = None
         self._priority: Tensor | None = None
         self._unseen: Tensor | None = None
@@ -84,9 +92,18 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         timestep: Tensor | None = None,
         betas: Tensor | None = None,
     ) -> Tensor:
-        noise = torch.randn(
-            source_tensor.shape, generator=generator, device=config.train_device, dtype=source_tensor.dtype
-        )
+        if config.k_noise_sampling > 1:
+            noise_candidates = torch.randn(
+                (source_tensor.shape[0], config.k_noise_sampling, *source_tensor.shape[1:]),
+                generator=generator,
+                device=config.train_device,
+                dtype=source_tensor.dtype,
+            )
+            noise = immiscible_oversampling(source_tensor, noise_candidates)
+        else:
+            noise = torch.randn(
+                source_tensor.shape, generator=generator, device=config.train_device, dtype=source_tensor.dtype
+            )
 
         if config.offset_noise_weight > 0:
             offset_noise = torch.randn(
@@ -114,6 +131,124 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
         return noise
 
+    def _apply_conditional_embedding_perturbation(
+        self,
+        embedding: Tensor | list[Tensor],
+        gamma: float,
+        generator: Generator,
+    ) -> Tensor | list[Tensor]:
+        def perturb(tensor: Tensor) -> Tensor:
+            if tensor.shape[-1] <= 0:
+                raise ValueError("embedding dimension must be positive")
+            scale = math.sqrt(gamma / tensor.shape[-1])
+            noise = torch.rand(tensor.shape, generator=generator, device=tensor.device, dtype=tensor.dtype)
+            return tensor + (noise.mul(2.0).sub(1.0) * scale)
+
+        if isinstance(embedding, list):
+            return [perturb(tensor) for tensor in embedding]
+        return perturb(embedding)
+
+    def _apply_ciop(
+        self,
+        noisy_latent: Tensor,
+        target_noise: Tensor,
+        config: TrainConfig,
+        generator: Generator,
+    ) -> tuple[Tensor, Tensor]:
+        if config.ciop_noise_weight == 0:
+            return noisy_latent, target_noise
+
+        apply_mask = torch.rand(1, generator=generator, device=noisy_latent.device) < config.ciop_p
+        if not bool(apply_mask.item()):
+            return noisy_latent, target_noise
+
+        noisy_latent = noisy_latent + torch.randn(
+            noisy_latent.shape,
+            generator=generator,
+            device=noisy_latent.device,
+            dtype=noisy_latent.dtype,
+        ) * config.ciop_noise_weight
+        target_noise = target_noise + torch.randn(
+            target_noise.shape,
+            generator=generator,
+            device=target_noise.device,
+            dtype=target_noise.dtype,
+        ) * config.ciop_noise_weight
+        return noisy_latent, target_noise
+
+    @staticmethod
+    def __sample_gamma_unit(concentration: float, size: int, generator: Generator, device: torch.device) -> Tensor:
+        concentration = max(1e-4, concentration)
+
+        def sample_scalar(shape: float) -> Tensor:
+            if shape < 1.0:
+                uniform = torch.rand((), generator=generator, device=device).clamp_min(1e-12)
+                return sample_scalar(shape + 1.0) * uniform.pow(1.0 / shape)
+
+            d = shape - (1.0 / 3.0)
+            c = 1.0 / math.sqrt(9.0 * d)
+            while True:
+                x = torch.randn((), generator=generator, device=device)
+                v = (1.0 + c * x).pow(3)
+                if v.item() <= 0:
+                    continue
+                uniform = torch.rand((), generator=generator, device=device)
+                if (uniform < 1.0 - 0.0331 * x.pow(4)).item():
+                    return d * v
+                if (torch.log(uniform) < 0.5 * x.pow(2) + d * (1.0 - v + torch.log(v))).item():
+                    return d * v
+
+        return torch.stack([sample_scalar(concentration) for _ in range(size)])
+
+    @staticmethod
+    def __sample_beta_unit(alpha: float, beta: float, size: int, generator: Generator, device: torch.device) -> Tensor:
+        alpha = max(1e-4, alpha)
+        beta = max(1e-4, beta)
+
+        if abs(beta - 1.0) < 1e-6:
+            uniform = torch.rand(size, generator=generator, device=device)
+            return uniform.pow(1.0 / alpha)
+        if abs(alpha - 1.0) < 1e-6:
+            uniform = torch.rand(size, generator=generator, device=device)
+            return 1.0 - uniform.pow(1.0 / beta)
+
+        alpha_sample = ModelSetupNoiseMixin.__sample_gamma_unit(alpha, size, generator, device)
+        beta_sample = ModelSetupNoiseMixin.__sample_gamma_unit(beta, size, generator, device)
+        return alpha_sample / (alpha_sample + beta_sample).clamp_min(1e-12)
+
+    def __get_speed_weights(
+        self,
+        num_train_timesteps: int,
+        generator: Generator,
+        betas: Tensor | None,
+        sigmas: Tensor | None,
+    ) -> Tensor:
+        if self.__speed_weights is not None and self.__speed_weights.shape[0] == num_train_timesteps:
+            return self.__speed_weights
+
+        gradient = None
+        if sigmas is not None:
+            gradient = torch.gradient(sigmas.to(device=generator.device, dtype=torch.float32))[0]
+        elif betas is not None:
+            betas = betas.to(device=generator.device, dtype=torch.float32)
+            alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
+            gradient = torch.gradient(torch.sqrt(1.0 - alphas_cumprod))[0]
+
+        if gradient is None:
+            raise ValueError("SPEED timestep distribution requires betas or sigmas")
+
+        threshold = 1e-4
+        weights = torch.tanh(1e6 * (gradient - threshold)) + 1.5
+        self.__speed_weights = torch.nn.functional.normalize(weights, p=1, dim=0)
+
+        meaningful_end_candidates = (gradient < threshold).nonzero(as_tuple=True)[0]
+        if meaningful_end_candidates.numel() > 0:
+            self.__speed_meaningful_steps_end = int(meaningful_end_candidates[0].item())
+        else:
+            self.__speed_meaningful_steps_end = num_train_timesteps - 1
+
+        return self.__speed_weights
+
     def _get_timestep_discrete(
         self,
         num_train_timesteps: int,
@@ -122,26 +257,52 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         batch_size: int,
         config: TrainConfig,
         shift: float = None,
+        betas: Tensor | None = None,
+        sigmas: Tensor | None = None,
+        validation_index=None,
+        validation_count=None,
     ) -> Tensor:
         if shift is None:
             shift = config.timestep_shift
 
         if deterministic:
-            # -1 is for zero-based indexing
-            return torch.tensor(
-                int(num_train_timesteps * 0.5) - 1,
-                dtype=torch.long,
+            return resolve_discrete_validation_timestep(
+                config=config,
+                num_train_timesteps=num_train_timesteps,
+                batch_size=batch_size,
                 device=generator.device,
-            ).unsqueeze(0)
+                shift=shift,
+                validation_index=validation_index,
+                validation_count=validation_count,
+            )
         else:
             min_timestep = int(num_train_timesteps * config.min_noising_strength)
             max_timestep = int(num_train_timesteps * config.max_noising_strength)
             num_timestep = max_timestep - min_timestep
 
+            if config.timestep_distribution == TimestepDistribution.SPEED:
+                speed_weights = self.__get_speed_weights(num_train_timesteps, generator, betas, sigmas)
+                initial_sample_count = (batch_size + 1) // 2
+                initial_samples = torch.multinomial(
+                    speed_weights,
+                    num_samples=initial_sample_count,
+                    replacement=True,
+                    generator=generator,
+                )
+                mirrored_samples = torch.where(
+                    initial_samples < self.__speed_meaningful_steps_end,
+                    self.__speed_meaningful_steps_end - initial_samples,
+                    initial_samples - self.__speed_meaningful_steps_end,
+                )
+                return torch.cat([initial_samples, mirrored_samples], dim=0)[:batch_size].clamp(
+                    min_timestep, max_timestep - 1
+                ).long()
+
             if config.timestep_distribution in [
                 TimestepDistribution.UNIFORM,
                 TimestepDistribution.LOGIT_NORMAL,
                 TimestepDistribution.HEAVY_TAIL,
+                TimestepDistribution.BETA,
             ]:
                 # continuous implementations
                 if config.timestep_distribution == TimestepDistribution.UNIFORM:
@@ -165,8 +326,18 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                     )
                     u = 1.0 - u - scale * (torch.cos(math.pi / 2.0 * u) ** 2.0 - 1.0 + u)
                     timestep = u * num_timestep + min_timestep
+                elif config.timestep_distribution == TimestepDistribution.BETA:
+                    beta_sample = self.__sample_beta_unit(
+                        config.noising_weight,
+                        config.noising_bias,
+                        batch_size,
+                        generator,
+                        generator.device,
+                    )
+                    timestep = beta_sample * num_timestep + min_timestep
 
                 timestep = num_train_timesteps * shift * timestep / ((shift - 1) * timestep + num_train_timesteps)
+                timestep = timestep.clamp(min_timestep, max_timestep - 1)
             else:
                 # Shifting a discrete distribution is done in two steps:
                 # 1. Apply the inverse shift to the linspace.
@@ -261,12 +432,16 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         generator: Generator,
         batch_size: int,
         config: TrainConfig,
+        validation_index=None,
+        validation_count=None,
     ) -> Tensor:
         if deterministic:
-            return torch.full(
-                size=(batch_size,),
-                fill_value=0.5,
+            return resolve_continuous_validation_timestep(
+                config=config,
+                batch_size=batch_size,
                 device=generator.device,
+                validation_index=validation_index,
+                validation_count=validation_count,
             )
         else:
             discrete_timesteps = 10000  # Discretize to 10000 timesteps
