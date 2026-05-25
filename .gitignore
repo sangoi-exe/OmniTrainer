@@ -44,5 +44,4 @@ debug_report.log
 config_diff.txt
 
 /.refs
-.sangoi/reports/
-.sangoi/.tools/
+.sangoi/
