@@ -38,6 +38,7 @@ from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.PathIOType import PathIOType
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.enum.ValidationTimestepMode import ValidationTimestepMode
 from modules.util.torch_util import torch_gc
@@ -809,6 +810,16 @@ class TrainUI(ctk.CTk):
         return frame
 
     def change_model_type(self, model_type: ModelType):
+        if model_type.is_lumina():
+            if self.train_config.base_model_name == TrainConfig.default_values().base_model_name:
+                self.ui_state.get_var("base_model_name").set("")
+            self.ui_state.get_var("training_method").set(str(TrainingMethod.LORA))
+            self.ui_state.get_var("text_encoder_sequence_length").set("256")
+            self.ui_state.get_var("timestep_distribution").set(str(TimestepDistribution.NEXTDIT_SHIFT))
+            self.ui_state.get_var("timestep_shift").set("6.0")
+            self.ui_state.get_var("noising_weight").set("0.0")
+            self.ui_state.get_var("noising_bias").set("0.0")
+
         if self.model_tab:
             self.model_tab.refresh_ui()
 

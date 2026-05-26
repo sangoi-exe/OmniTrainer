@@ -101,6 +101,7 @@ class TopBar:
                 ("Flux Fill Dev", ModelType.FLUX_FILL_DEV_1),
                 ("Flux 2 [Dev, Klein]", ModelType.FLUX_2),
                 ("Sana", ModelType.SANA),
+                ("Lumina 2", ModelType.LUMINA_2),
                 ("Hunyuan Video", ModelType.HUNYUAN_VIDEO),
                 ("HiDream Full", ModelType.HI_DREAM_FULL),
                 ("Chroma1", ModelType.CHROMA_1),
@@ -125,6 +126,10 @@ class TopBar:
                 ("LoRA", TrainingMethod.LORA),
                 ("Embedding", TrainingMethod.EMBEDDING),
                 ("Fine Tune VAE", TrainingMethod.FINE_TUNE_VAE),
+            ]
+        elif self.train_config.model_type.is_lumina():
+            values = [
+                ("LoRA", TrainingMethod.LORA),
             ]
         elif (
             self.train_config.model_type.is_stable_diffusion_3()

@@ -81,6 +81,8 @@ class TrainingTab:
             self.__setup_qwen_ui(column_0, column_1, column_2)
         elif self.train_config.model_type.is_sana():
             self.__setup_sana_ui(column_0, column_1, column_2)
+        elif self.train_config.model_type.is_lumina():
+            self.__setup_lumina_ui(column_0, column_1, column_2)
         elif self.train_config.model_type.is_hunyuan_video():
             self.__setup_hunyuan_video_ui(column_0, column_1, column_2)
         elif self.train_config.model_type.is_hi_dream():
@@ -244,6 +246,18 @@ class TrainingTab:
 
         self.__create_base2_frame(column_1, 0)
         self.__create_transformer_frame(column_1, 1)
+        self.__create_noise_frame(column_1, 2)
+
+        self.__create_masked_frame(column_2, 1)
+        self.__create_loss_frame(column_2, 2)
+        self.__create_layer_frame(column_2, 3)
+
+    def __setup_lumina_ui(self, column_0, column_1, column_2):
+        self.__create_base_frame(column_0, 0)
+        self.__create_text_encoder_frame(column_0, 1, supports_clip_skip=False, supports_sequence_length=True)
+
+        self.__create_base2_frame(column_1, 0)
+        self.__create_transformer_frame(column_1, 1, supports_guidance_scale=False, supports_force_attention_mask=False)
         self.__create_noise_frame(column_1, 2)
 
         self.__create_masked_frame(column_2, 1)
@@ -593,56 +607,65 @@ class TrainingTab:
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
         frame.grid_columnconfigure(0, weight=1)
+        frame_row = 0
 
         if supports_training:
             components.label(frame, 0, 0, "Train Text Encoder", tooltip="Enables training the text encoder model")
             components.switch(frame, 0, 1, self.ui_state, "text_encoder.train")
+            frame_row += 1
 
         # dropout
         components.label(
             frame,
-            1,
+            frame_row,
             0,
             "Caption Dropout Probability",
             tooltip="The Probability for dropping the text encoder conditioning",
         )
-        components.entry(frame, 1, 1, self.ui_state, "text_encoder.dropout_probability")
+        components.entry(frame, frame_row, 1, self.ui_state, "text_encoder.dropout_probability")
+        frame_row += 1
 
         if supports_training:
             # train text encoder epochs
-            components.label(frame, 2, 0, "Stop Training After", tooltip="When to stop training the text encoder")
+            components.label(frame, frame_row, 0, "Stop Training After", tooltip="When to stop training the text encoder")
             components.time_entry(
                 frame,
-                2,
+                frame_row,
                 1,
                 self.ui_state,
                 "text_encoder.stop_training_after",
                 "text_encoder.stop_training_after_unit",
                 supports_time_units=False,
             )
+            frame_row += 1
 
             # text encoder learning rate
             components.label(
                 frame,
-                3,
+                frame_row,
                 0,
                 "Text Encoder Learning Rate",
                 tooltip="The learning rate of the text encoder. Overrides the base learning rate",
             )
-            components.entry(frame, 3, 1, self.ui_state, "text_encoder.learning_rate")
+            components.entry(frame, frame_row, 1, self.ui_state, "text_encoder.learning_rate")
+            frame_row += 1
 
         if supports_clip_skip:
             # text encoder layer skip (clip skip)
             components.label(
-                frame, 4, 0, "Clip Skip", tooltip="The number of additional clip layers to skip. 0 = the model default"
+                frame,
+                frame_row,
+                0,
+                "Clip Skip",
+                tooltip="The number of additional clip layers to skip. 0 = the model default",
             )
-            components.entry(frame, 4, 1, self.ui_state, "text_encoder_layer_skip")
+            components.entry(frame, frame_row, 1, self.ui_state, "text_encoder_layer_skip")
+            frame_row += 1
 
         if supports_sequence_length:
             # text encoder sequence length
-            components.label(frame, row, 0, "Text Encoder Sequence Length", tooltip="Number of tokens for captions")
-            components.entry(frame, row, 1, self.ui_state, "text_encoder_sequence_length")
-            row += 1
+            components.label(frame, frame_row, 0, "Text Encoder Sequence Length", tooltip="Number of tokens for captions")
+            components.entry(frame, frame_row, 1, self.ui_state, "text_encoder_sequence_length")
 
     def __create_text_encoder_n_frame(
         self,
@@ -1040,6 +1063,7 @@ class TrainingTab:
                     TimestepDistribution.BETA,
                     TimestepDistribution.SPEED,
                 ]
+                or (x == TimestepDistribution.NEXTDIT_SHIFT and not self.train_config.model_type.is_lumina())
             )
         ]
         components.options_adv(

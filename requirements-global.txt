@@ -21,6 +21,7 @@ tensorboard==2.20.0
 
 # diffusion models
 diffusers @ git+https://github.com/huggingface/diffusers.git@0f1abc4
+einops==0.7.0
 gguf==0.17.1
 transformers==4.57.6
 sentencepiece==0.2.1 # transitive dependency of transformers for tokenizer loading

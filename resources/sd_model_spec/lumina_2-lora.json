@@ -1,0 +1,6 @@
+{
+    "modelspec.sai_model_spec": "1.0.0",
+    "modelspec.architecture": "lumina2/lora",
+    "modelspec.implementation": "https://github.com/Alpha-VLLM/Lumina-Image-2.0",
+    "modelspec.title": "Lumina 2 LoRA"
+}

@@ -29,6 +29,8 @@ class ModelType(Enum):
 
     SANA = "SANA"
 
+    LUMINA_2 = "LUMINA_2"
+
     HUNYUAN_VIDEO = "HUNYUAN_VIDEO"
 
     HI_DREAM_FULL = "HI_DREAM_FULL"
@@ -94,6 +96,9 @@ class ModelType(Enum):
 
     def is_sana(self):
         return self == ModelType.SANA
+
+    def is_lumina(self):
+        return self == ModelType.LUMINA_2
 
     def is_hunyuan_video(self):
         return self == ModelType.HUNYUAN_VIDEO
@@ -161,6 +166,7 @@ class ModelType(Enum):
             or self.is_chroma()
             or self.is_qwen()
             or self.is_sana()
+            or self.is_lumina()
             or self.is_hunyuan_video()
             or self.is_hi_dream()
             or self.is_z_image()

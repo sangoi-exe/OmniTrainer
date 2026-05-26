@@ -394,6 +394,7 @@ class TrainConfig(BaseConfig):
     layer_offload_fraction: float
     force_circular_padding: bool
     compile: bool
+    lumina_system_prompt: str
 
     # Sangoi settings
     lora_layers_blacklist: list[str]
@@ -512,6 +513,7 @@ class TrainConfig(BaseConfig):
     # text encoder
     text_encoder: TrainModelPartConfig
     text_encoder_layer_skip: int
+    text_encoder_sequence_length: int
 
     # text encoder 2
     text_encoder_2: TrainModelPartConfig
@@ -1019,6 +1021,17 @@ class TrainConfig(BaseConfig):
         if self.model_type == ModelType.FLUX_2 and self.text_encoder.dropout_probability > 0:
             raise ValueError("Flux2 text_encoder.dropout_probability is not supported")
 
+        if self.timestep_distribution == TimestepDistribution.NEXTDIT_SHIFT and not self.model_type.is_lumina():
+            raise ValueError("NEXTDIT_SHIFT timestep distribution is only supported for Lumina 2")
+
+        if self.model_type.is_lumina():
+            if self.training_method != TrainingMethod.LORA:
+                raise ValueError("Lumina 2 supports only LoRA training")
+            if self.peft_type != PeftType.LORA:
+                raise ValueError("Lumina 2 supports only LoRA PEFT")
+            if self.force_epsilon_prediction or self.force_v_prediction:
+                raise ValueError("Lumina 2 uses raw flow prediction")
+
         if self.model_type.is_flow_matching() and self.timestep_distribution in [
             TimestepDistribution.BETA,
             TimestepDistribution.SPEED,
@@ -1052,6 +1065,7 @@ class TrainConfig(BaseConfig):
             transformer_model=self.transformer.model_name,
             effnet_encoder_model=self.effnet_encoder.model_name,
             decoder_model=self.decoder.model_name,
+            text_encoder_model=self.text_encoder.model_name,
             text_encoder_4=self.text_encoder_4.model_name,
             vae_model=self.vae.model_name,
             lora=self.lora_model_name,
@@ -1228,6 +1242,7 @@ class TrainConfig(BaseConfig):
         data.append(("layer_offload_fraction", 0.0, float, False))
         data.append(("force_circular_padding", False, bool, False))
         data.append(("compile", False, bool, False))
+        data.append(("lumina_system_prompt", "", str, False))
 
         # Sangoi settings
         data.append(("lora_modules_rank_rules", [], list[dict[str, int]], False))

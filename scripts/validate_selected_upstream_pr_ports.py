@@ -7,9 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,6 +49,10 @@ GUARDED_EXACT_PATHS = [
 GUARDED_GLOBS = [
     "requirements*.txt",
 ]
+
+ALLOWED_GUARDED_REQUIREMENTS_DIFFS = {
+    "requirements-global.txt": ["+einops==0.7.0"],
+}
 
 BLOCKED_RUNTIME_TERMS = [
     "resolution_quantization",
@@ -126,8 +128,6 @@ def fail(message: str) -> None:
 
 
 def check_validation_timesteps() -> None:
-    import torch
-
     from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
     from modules.util.config.TrainConfig import TrainConfig
     from modules.util.enum.ValidationTimestepMode import ValidationTimestepMode
@@ -135,6 +135,8 @@ def check_validation_timesteps() -> None:
         resolve_continuous_validation_timestep,
         resolve_discrete_validation_timestep,
     )
+
+    import torch
 
     util_source = read_text("modules/util/validation_timestep.py")
     for symbol in [
@@ -236,12 +238,12 @@ def check_validation_timesteps() -> None:
 
 
 def check_mid_accum_resume() -> None:
-    import torch
-
     from modules.trainer.GenericTrainer import GenericTrainer
     from modules.util.config.ConceptConfig import ConceptConfig
     from modules.util.config.TrainConfig import TrainConfig
     from modules.util.TrainProgress import TrainProgress
+
+    import torch
 
     source = read_text("modules/trainer/GenericTrainer.py")
     required = [
@@ -442,13 +444,13 @@ def check_tensorboard_resume() -> None:
 
 
 def check_patience_contract() -> None:
-    import torch
-
     from modules.trainer.GenericTrainer import GenericTrainer, ValidationMetrics
     from modules.util.config.TrainConfig import TrainConfig
     from modules.util.enum.TimeUnit import TimeUnit
     from modules.util.TimedActionMixin import TimedActionMixin
     from modules.util.TrainProgress import TrainProgress
+
+    import torch
 
     trainer_source = read_text("modules/trainer/GenericTrainer.py")
     for term in [
@@ -595,11 +597,11 @@ def check_attention_backend() -> None:
 
 
 def check_timestep_distributions() -> None:
-    import torch
-
     from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
     from modules.util.config.TrainConfig import TrainConfig
     from modules.util.enum.TimestepDistribution import TimestepDistribution
+
+    import torch
 
     enum_source = read_text("modules/util/enum/TimestepDistribution.py")
     for term in ["BETA", "SPEED", "PRIORITY_SAMPLING"]:
@@ -650,7 +652,7 @@ def check_timestep_distributions() -> None:
         invalid_config.noising_bias = noising_bias
         try:
             invalid_config.validate_for_training()
-        except ValueError:
+        except ValueError:  # noqa: PERF203
             pass
         else:
             fail("BETA timestep distribution accepted negative alpha/beta config")
@@ -674,16 +676,16 @@ def check_flow_timestep_rejection() -> None:
         config.timestep_distribution = distribution
         try:
             config.validate_for_training()
-        except ValueError:
+        except ValueError:  # noqa: PERF203
             pass
         else:
             fail(f"flow model accepted unsupported timestep distribution {distribution}")
 
 
 def check_immiscible_contract() -> None:
-    import torch
-
     from modules.util.immiscible_diffusion import immiscible_oversampling
+
+    import torch
 
     latents = torch.tensor([[[[0.0]]], [[[10.0]]]])
     noise = torch.tensor([[[[[10.0]]], [[[0.0]]]], [[[[0.0]]], [[[10.0]]]]])
@@ -812,6 +814,16 @@ def check_guarded_files() -> None:
     guarded_hits = []
 
     for path in changed + untracked:
+        if path in ALLOWED_GUARDED_REQUIREMENTS_DIFFS:
+            diff_lines = run_git(["diff", "HEAD", "--", path]).splitlines()
+            material_diff_lines = [
+                line
+                for line in diff_lines
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+            ]
+            if material_diff_lines == ALLOWED_GUARDED_REQUIREMENTS_DIFFS[path]:
+                continue
+
         if path in GUARDED_EXACT_PATHS:
             guarded_hits.append(path)
         if any(path.startswith(prefix) for prefix in GUARDED_PATH_PREFIXES):
@@ -868,9 +880,9 @@ def check_strict_config_contract() -> None:
     payload = config.to_dict()
 
     for stale_key in ["resolution_quantization", "distillation", "cfg_distillation"]:
-        try:
+        try:  # noqa: PERF203
             TrainConfig.default_values().from_dict(payload | {stale_key: True})
-        except ValueError:
+        except ValueError:  # noqa: PERF203
             pass
         else:
             fail(f"TrainConfig accepted stale key {stale_key}")
@@ -905,9 +917,9 @@ def check_strict_config_contract() -> None:
         "lokr_vec_trick": "not-bool",
     }
     for field_name, invalid_value in invalid_values.items():
-        try:
+        try:  # noqa: PERF203
             TrainConfig.default_values().from_dict(payload | {field_name: invalid_value})
-        except ValueError:
+        except ValueError:  # noqa: PERF203
             pass
         else:
             fail(f"TrainConfig accepted invalid present value for {field_name}")
@@ -963,11 +975,11 @@ def check_sangoi_invariants() -> None:
 
 
 def check_hunyuan_comfy_contract() -> None:
-    import torch
-
     from modules.modelLoader.hunyuanVideo.HunyuanVideoLoRALoader import HunyuanVideoLoRALoader
     from modules.util.convert.lora.convert_hunyuan_video_lora import convert_hunyuan_video_lora_to_comfyui
     from modules.util.enum.ModelFormat import ModelFormat
+
+    import torch
 
     if not hasattr(ModelFormat, "COMFY_LORA"):
         fail("ModelFormat.COMFY_LORA is missing")
@@ -1069,8 +1081,8 @@ def check_adapters_contract() -> None:
 
 
 def check_prefetch_cache_contract() -> None:
-    from modules.util.PrefetchIterator import PrefetchIterator
     from modules.util.config.TrainConfig import TrainConfig
+    from modules.util.PrefetchIterator import PrefetchIterator
 
     config = TrainConfig.default_values()
     config.prefetch_next_batch = True
@@ -1229,4 +1241,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except AssertionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

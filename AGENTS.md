@@ -1,10 +1,10 @@
-# OneTrainerSangoi Instructions
+# OmniTrainer Instructions
 
-Scope: `/home/lucas/work/OneTrainerSangoi` unless a deeper `AGENTS.md` overrides it.
+Scope: `/home/lucas/work/OmniTrainer` unless a deeper `AGENTS.md` overrides it.
 
 ## Purpose
 
-This checkout is the Sangoi-modified OneTrainer workspace. Prefer preserving the local SDXL training behavior while integrating upstream OneTrainer changes cleanly.
+This checkout is the OmniTrainer fork of OneTrainer. Prefer preserving the local Sangoi/SDXL training behavior while integrating new training families and upstream-quality training improvements as native OmniTrainer features.
 
 ## Local Toolchain Law
 
@@ -32,13 +32,16 @@ This WSL checkout's torch environment is CPU-only for local validation.
 - Bootstrap owner: `lib.include.sh`, `install.sh`, `run-cmd.sh`, `start-ui.sh`, `update.sh`, `.dockerignore`.
 - Dependency owners: `requirements.txt`, `requirements-global.txt`, `requirements-cuda.txt`, `requirements-rocm.txt`, `requirements-default.txt`, `pyproject.toml`, `.python-version`.
 - Sangoi training mods: `modules/sangoi/`, `modules/modelSetup/StableDiffusionXLLoRASetup.py`, `modules/modelSetup/mixin/`, `modules/trainer/GenericTrainer.py`.
+- New model-family work: `modules/model/`, `modules/modelSetup/`, `modules/modelLoader/`, `modules/dataLoader/`, `modules/modelSampler/`, `modules/modelSaver/`, `resources/sd_model_spec/`.
 - Tk UI config surfaces: `modules/ui/`, `modules/sangoi/SangoiTab.py`, `modules/util/config/TrainConfig.py`.
-- Task context: `.sangoi/`.
+- Task context: `.sangoi/` is local-only and intentionally ignored.
+- Reference snapshots: `.refs/` is local-only and intentionally ignored.
 
 ## Durable Notes
 
 - Do not reintroduce compatibility aliases or stale config fields for removed Sangoi options.
 - Keep documentation and examples describing current behavior only.
-- `training_presets/*` may be allowed to return to upstream behavior for the current master-update cleanup work.
+- Do not expose Kohya-style generic `network_args` or `network_module` compatibility surfaces unless the user explicitly asks for compatibility preservation.
+- For the current Lumina-first port, deferred families/features such as Hunyuan Image, Anima, ControlNet-LLLite, LyCORIS adapter registry, broader dataset/caption controls, runtime/distributed work, and adapter tooling require separate gated plans.
 
-Last reviewed: 2026-05-24.
+Last reviewed: 2026-05-25.

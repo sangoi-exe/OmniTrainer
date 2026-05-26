@@ -1,3 +1,6 @@
+import math
+import re
+
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import (
     ModelSetupNoiseMixin,
 )
@@ -25,6 +28,7 @@ class TimestepGenerator(ModelSetupNoiseMixin):
         noising_weight: float,
         noising_bias: float,
         timestep_shift: float,
+        resolution: str,
     ):
         super().__init__()
 
@@ -34,10 +38,36 @@ class TimestepGenerator(ModelSetupNoiseMixin):
         self.noising_weight = noising_weight
         self.noising_bias = noising_bias
         self.timestep_shift = timestep_shift
+        self.resolution = resolution
+
+    def __parse_preview_resolution(self) -> tuple[int, int]:
+        resolution = self.resolution.strip().lower().split(",", maxsplit=1)[0].strip()
+        if "x" in resolution:
+            width_text, height_text = [part.strip() for part in resolution.split("x", maxsplit=1)]
+            return int(width_text), int(height_text)
+
+        square_resolution = int(re.split(r"\D+", resolution, maxsplit=1)[0])
+        return square_resolution, square_resolution
+
+    def __sample_nextdit_shift(self, batch_size: int, generator: torch.Generator) -> Tensor:
+        width, height = self.__parse_preview_resolution()
+        latent_width = width // 8
+        latent_height = height // 8
+        image_seq_len = (latent_height // 2) * (latent_width // 2)
+        mu = 0.5 + (1.15 - 0.5) * (image_seq_len - 256) / (4096 - 256)
+
+        sigmas = torch.rand(batch_size, generator=generator, device=generator.device).clamp_min(1e-7)
+        exp_mu = math.exp(mu)
+        shifted_sigmas = exp_mu / (exp_mu + (1.0 / sigmas - 1.0))
+        return (shifted_sigmas.clamp(1e-7, 1.0) * 1000).int()
 
     def generate(self) -> Tensor:
         generator = torch.Generator()
         generator.seed()
+
+        batch_size = 1000000
+        if self.timestep_distribution == TimestepDistribution.NEXTDIT_SHIFT:
+            return self.__sample_nextdit_shift(batch_size, generator)
 
         config = TrainConfig.default_values()
         config.timestep_distribution = self.timestep_distribution
@@ -51,7 +81,7 @@ class TimestepGenerator(ModelSetupNoiseMixin):
             num_train_timesteps=1000,
             deterministic=False,
             generator=generator,
-            batch_size=1000000,
+            batch_size=batch_size,
             config=config,
             betas=torch.linspace(0.00085, 0.012, 1000, device=generator.device),
         )
@@ -113,6 +143,7 @@ class TimestepDistributionWindow(ctk.CTkToplevel):
             if not (
                 self.config.model_type.is_flow_matching()
                 and x in [TimestepDistribution.PRIORITY_SAMPLING, TimestepDistribution.BETA, TimestepDistribution.SPEED]
+                or (x == TimestepDistribution.NEXTDIT_SHIFT and not self.config.model_type.is_lumina())
             )
         ]
         components.options(frame, 0, 1, timestep_distribution_options, self.ui_state, "timestep_distribution")
@@ -219,6 +250,7 @@ class TimestepDistributionWindow(ctk.CTkToplevel):
             noising_weight=self.config.noising_weight,
             noising_bias=self.config.noising_bias,
             timestep_shift=self.config.timestep_shift,
+            resolution=self.config.resolution,
         )
 
         self.ax.cla()

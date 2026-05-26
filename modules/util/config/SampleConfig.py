@@ -129,6 +129,15 @@ def _get_model_defaults(model_type) -> dict:
                 "cfg_scale": 4.5,
             }
         )
+    elif model_type.is_lumina():
+        defaults.update(
+            {
+                "width": 1024,
+                "height": 1024,
+                "diffusion_steps": 30,
+                "cfg_scale": 4.0,
+            }
+        )
     elif model_type.is_hi_dream():
         defaults.update(
             {

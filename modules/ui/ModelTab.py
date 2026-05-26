@@ -65,6 +65,8 @@ class ModelTab:
             self.__setup_qwen_ui(base_frame)
         elif self.train_config.model_type.is_sana():
             self.__setup_sana_ui(base_frame)
+        elif self.train_config.model_type.is_lumina():
+            self.__setup_lumina_ui(base_frame)
         elif self.train_config.model_type.is_hunyuan_video():
             self.__setup_hunyuan_video_ui(base_frame)
         elif self.train_config.model_type.is_hi_dream():
@@ -305,6 +307,37 @@ class ModelTab:
             allow_legacy_safetensors=self.train_config.training_method == TrainingMethod.LORA,
         )
 
+    def __setup_lumina_ui(self, frame):
+        row = 0
+        row = self.__create_base_dtype_components(
+            frame,
+            row,
+            base_model_label="NextDiT Checkpoint",
+            base_model_tooltip="Lumina NextDiT .safetensors checkpoint. Directory and Hugging Face repository inputs are not supported for Lumina.",
+        )
+        row = self.__create_base_components(
+            frame,
+            row,
+            has_transformer=True,
+            has_text_encoder=True,
+            allow_override_text_encoder=True,
+            has_vae=True,
+            vae_label="Lumina AE",
+            vae_tooltip="Safetensors checkpoint for the Lumina AutoEncoder used with the selected NextDiT checkpoint.",
+            text_encoder_label="Gemma2 Checkpoint",
+            text_encoder_tooltip="Gemma2 .safetensors checkpoint. Directory and Hugging Face repository inputs are not supported for Lumina.",
+            transformer_include_gguf=False,
+            transformer_include_a8=True,
+        )
+        row = self.__create_lumina_components(frame, row)
+        row = self.__create_output_components(
+            frame,
+            row,
+            allow_safetensors=True,
+            allow_diffusers=False,
+            allow_legacy_safetensors=self.train_config.training_method == TrainingMethod.LORA,
+        )
+
     def __setup_hunyuan_video_ui(self, frame):
         row = 0
         row = self.__create_base_dtype_components(frame, row)
@@ -374,7 +407,13 @@ class ModelTab:
 
         return options
 
-    def __create_base_dtype_components(self, frame, row: int) -> int:
+    def __create_base_dtype_components(
+        self,
+        frame,
+        row: int,
+        base_model_label: str = "Base Model",
+        base_model_tooltip: str = "Filename, directory or Hugging Face repository of the base model",
+    ) -> int:
         # huggingface token
         components.label(
             frame,
@@ -390,9 +429,7 @@ class ModelTab:
         row += 1
 
         # base model
-        components.label(
-            frame, row, 0, "Base Model", tooltip="Filename, directory or Hugging Face repository of the base model"
-        )
+        components.label(frame, row, 0, base_model_label, tooltip=base_model_tooltip)
         components.path_entry(
             frame, row, 1, self.ui_state, "base_model_name", mode="file", path_modifier=components.json_path_modifier
         )
@@ -420,6 +457,7 @@ class ModelTab:
         allow_override_prior: bool = False,
         has_transformer: bool = False,
         allow_override_transformer: bool = False,
+        allow_override_text_encoder: bool = False,
         allow_override_text_encoder_4: bool = False,
         has_text_encoder: bool = False,
         has_text_encoder_1: bool = False,
@@ -427,6 +465,12 @@ class ModelTab:
         has_text_encoder_3: bool = False,
         has_text_encoder_4: bool = False,
         has_vae: bool = False,
+        vae_label: str = "VAE Override",
+        vae_tooltip: str | None = None,
+        text_encoder_label: str = "Text Encoder",
+        text_encoder_tooltip: str | None = None,
+        transformer_include_gguf: bool = True,
+        transformer_include_a8: bool = True,
     ) -> int:
         if has_unet:
             # unet weight dtype
@@ -489,7 +533,7 @@ class ModelTab:
                 frame,
                 row,
                 4,
-                self.__create_dtype_options(include_gguf=True, include_a8=True),
+                self.__create_dtype_options(include_gguf=transformer_include_gguf, include_a8=transformer_include_a8),
                 self.ui_state,
                 "transformer.weight_dtype",
             )
@@ -537,6 +581,25 @@ class ModelTab:
         row += 1
 
         if has_text_encoder:
+            if allow_override_text_encoder:
+                components.label(
+                    frame,
+                    row,
+                    0,
+                    text_encoder_label,
+                    tooltip=text_encoder_tooltip
+                    or "Filename, directory or Hugging Face repository of the text encoder model",
+                )
+                components.path_entry(
+                    frame,
+                    row,
+                    1,
+                    self.ui_state,
+                    "text_encoder.model_name",
+                    mode="file",
+                    path_modifier=components.json_path_modifier,
+                )
+
             # text encoder weight dtype
             components.label(frame, row, 3, "Text Encoder Data Type", tooltip="The text encoder weight data type")
             components.options_kv(
@@ -606,8 +669,9 @@ class ModelTab:
                 frame,
                 row,
                 0,
-                "VAE Override",
-                tooltip="Directory or Hugging Face repository of a VAE model in diffusers format. Can be used to override the VAE included in the base model. Using a safetensor VAE file will cause an error that the model cannot be loaded.",
+                vae_label,
+                tooltip=vae_tooltip
+                or "Directory or Hugging Face repository of a VAE model in diffusers format. Can be used to override the VAE included in the base model. Using a safetensor VAE file will cause an error that the model cannot be loaded.",
             )
             components.path_entry(
                 frame, row, 1, self.ui_state, "vae.model_name", mode="file", path_modifier=components.json_path_modifier
@@ -619,6 +683,18 @@ class ModelTab:
 
             row += 1
 
+        return row
+
+    def __create_lumina_components(self, frame, row: int) -> int:
+        components.label(
+            frame,
+            row,
+            0,
+            "Lumina System Prompt",
+            tooltip="System prompt prepended to Lumina training prompts before the <Prompt Start> marker.",
+        )
+        components.entry(frame, row, 1, self.ui_state, "lumina_system_prompt")
+        row += 1
         return row
 
     def __create_effnet_encoder_components(self, frame, row: int):

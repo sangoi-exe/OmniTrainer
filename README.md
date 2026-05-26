@@ -6,7 +6,7 @@ OneTrainer is a one-stop solution for all your Diffusion training needs.
 
 ## Features
 
--   **Supported models**: Ernie Image, Z-Image, Qwen Image, FLUX.1, Flux.2 Dev and Klein, Chroma, Stable Diffusion 1.5, 2.0, 2.1, 3.0, 3.5, SDXL, Würstchen-v2, Stable Cascade,
+-   **Supported models**: Ernie Image, Z-Image, Qwen Image, Lumina 2, FLUX.1, Flux.2 Dev and Klein, Chroma, Stable Diffusion 1.5, 2.0, 2.1, 3.0, 3.5, SDXL, Würstchen-v2, Stable Cascade,
     PixArt-Alpha, PixArt-Sigma, Sana, Hunyuan Video and inpainting models
 -   **Model formats**: diffusers and ckpt models
 -   **Training methods**: Full fine-tuning, LoRA, embeddings
@@ -78,7 +78,7 @@ OneTrainer is a one-stop solution for all your Diffusion training needs.
 
 OneTrainer can be used in **two primary modes**: a graphical user interface (GUI) and a **command-line interface (CLI)** for finer control.
 
-For a technically focused quick start, see the [Quick Start Guide](docs/QuickStartGuide.md) and for a broader overview, see the [Overview documentation](docs/Overview.md). Otherwise visit [our wiki!](https://github.com/Nerogar/OneTrainer)
+For a technically focused quick start, see the [Quick Start Guide](docs/QuickStartGuide.md), the [Lumina 2 training notes](docs/LuminaTraining.md), and the [Overview documentation](docs/Overview.md). Otherwise visit [our wiki!](https://github.com/Nerogar/OneTrainer)
 
 ### GUI Mode
 

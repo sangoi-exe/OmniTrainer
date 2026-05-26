@@ -1,6 +1,5 @@
 import modules.util.multi_gpu_util as multi
 from modules.model.BaseModel import BaseModel
-from modules.util import create
 from modules.util.config.TrainConfig import TrainConfig, TrainOptimizerConfig
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.NamedParameterGroup import NamedParameterGroupCollection
@@ -54,6 +53,8 @@ def init_model_parameters(
     parameters: NamedParameterGroupCollection,
     train_device: torch.device,
 ):
+    from modules.util import create
+
     model.parameters = parameters
     # random (LoRA) initialisation can differ, broadcast from GPU #0 to all others
     # to be safe, do that before the optimizer is created because the optimizer could take copies
